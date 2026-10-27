@@ -26,7 +26,9 @@ path = "src/main.rs"
 # Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
 # A path alongside the version so an in-workspace build uses the local crate and
 # crates.io resolves the published one.
-dorm-core = { path = "../dorm-core", version = "0.1.0" }
+dorm-core = { path = "../dorm-core", version = "0.2.0" }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
+# Only to render the ledger's `applied_unix` as a readable UTC timestamp.
+chrono = { workspace = true, features = ["alloc"] }

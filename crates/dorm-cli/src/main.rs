@@ -75,6 +75,11 @@ enum DbAction {
         /// The table name.
         table: String,
     },
+    /// Count the rows in a table.
+    Count {
+        /// The table name.
+        table: String,
+    },
     /// Print rows from a table (read-only), to a limit.
     Rows {
         /// The table name.
@@ -82,6 +87,10 @@ enum DbAction {
         /// How many rows at most.
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: i64,
+        /// Keep only rows where a column equals a value, compared as text:
+        /// `--where slug=acme`.
+        #[arg(long = "where", value_name = "COL=VALUE")]
+        filter: Option<String>,
     },
 }
 
@@ -166,16 +175,30 @@ async fn migrate_status() -> CliResult {
         let version: i64 = row.get(0);
         let name: String = row.get(1);
         let applied_unix: i64 = row.get(2);
-        println!("  v{version:<4} {name:<24} (applied_unix={applied_unix})");
+        println!("  v{version:<4} {name:<24} {}", applied_at(applied_unix));
     }
     Ok(())
+}
+
+/// Render the ledger's Unix seconds as a readable UTC stamp, falling back to the
+/// raw number if it is somehow out of range.
+fn applied_at(unix: i64) -> String {
+    match chrono::DateTime::from_timestamp(unix, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => format!("applied_unix={unix}"),
+    }
 }
 
 async fn run_db(action: DbAction) -> CliResult {
     match action {
         DbAction::Tables => db_tables().await,
         DbAction::Show { table } => db_show(&table).await,
-        DbAction::Rows { table, limit } => db_rows(&table, limit).await,
+        DbAction::Count { table } => db_count(&table).await,
+        DbAction::Rows {
+            table,
+            limit,
+            filter,
+        } => db_rows(&table, limit, filter.as_deref()).await,
     }
 }
 
@@ -210,20 +233,93 @@ async fn db_show(table: &str) -> CliResult {
         return Err(format!("no table `{table}` in the `public` schema").into());
     }
     println!("{table}");
-    for row in &rows {
-        let col: String = row.get(0);
-        let ty: String = row.get(1);
-        let nullable: String = row.get(2);
-        let null = if nullable == "YES" { "  null" } else { "" };
-        println!("  {col:<20} {ty}{null}");
-    }
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let col: String = row.get(0);
+            let ty: String = row.get(1);
+            let nullable: String = row.get(2);
+            let null = if nullable == "YES" {
+                "null"
+            } else {
+                "not null"
+            };
+            vec![col, ty, null.to_string()]
+        })
+        .collect();
+    print_table(
+        &["column".into(), "type".into(), String::new()],
+        &table_rows,
+    );
     Ok(())
 }
 
-async fn db_rows(table: &str, limit: i64) -> CliResult {
-    // The table name cannot be a bound parameter, so it is validated against the
-    // catalogue first and only a name that is really a table is quoted into the
-    // statement. Every *value* still comes back as a bound-free `::text` cast.
+async fn db_count(table: &str) -> CliResult {
+    validate_table(table).await?;
+    let sql = format!("SELECT count(*) FROM {}", quote_ident(table));
+    let rows = db::query(&sql, &[]).await?;
+    let n: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
+    println!("{n}");
+    Ok(())
+}
+
+async fn db_rows(table: &str, limit: i64, filter: Option<&str>) -> CliResult {
+    // Table and column names cannot be bound parameters, so they are validated
+    // against the catalogue first and only names that are really there are quoted
+    // in. Every *value* — the projected cells and the `--where` operand — is a
+    // bound parameter or a `::text` cast, never spliced into the statement.
+    let names = table_columns(table).await?;
+    let select_list = names
+        .iter()
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut sql = format!("SELECT {select_list} FROM {}", quote_ident(table));
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let where_value: String;
+    if let Some(f) = filter {
+        let (col, val) = f
+            .split_once('=')
+            .ok_or_else(|| format!("`--where {f}` is not `col=value`"))?;
+        if !names.iter().any(|n| n == col) {
+            return Err(format!("no column `{col}` on `{table}`").into());
+        }
+        where_value = val.to_string();
+        sql.push_str(&format!(" WHERE {}::text = $1", quote_ident(col)));
+        params.push(&where_value);
+    }
+    sql.push_str(&format!(" LIMIT ${}", params.len() + 1));
+    params.push(&limit);
+
+    let rows = db::query(&sql, &params).await?;
+    if rows.is_empty() {
+        println!("(0 rows)");
+        return Ok(());
+    }
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            (0..names.len())
+                .map(|i| {
+                    row.get::<_, Option<String>>(i)
+                        .unwrap_or_else(|| "NULL".into())
+                })
+                .collect()
+        })
+        .collect();
+    print_table(&names, &table_rows);
+    println!(
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+/// The column names of a table, in declaration order; errors if the table does
+/// not exist (which is also what validates the name before it is quoted in).
+async fn table_columns(table: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let cols = db::query(
         "SELECT column_name FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = $1 \
@@ -234,35 +330,40 @@ async fn db_rows(table: &str, limit: i64) -> CliResult {
     if cols.is_empty() {
         return Err(format!("no table `{table}` in the `public` schema").into());
     }
-    let names: Vec<String> = cols.iter().map(|r| r.get::<_, String>(0)).collect();
-    let select_list = names
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT {select_list} FROM {} LIMIT $1", quote_ident(table));
-    let rows = db::query(&sql, &[&limit]).await?;
-    if rows.is_empty() {
-        println!("(0 rows)");
-        return Ok(());
+    Ok(cols.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+async fn validate_table(table: &str) -> CliResult {
+    table_columns(table).await.map(|_| ())
+}
+
+/// Print a left-aligned table: each column as wide as its widest cell (header
+/// included), two spaces between columns. An all-empty header row is omitted.
+fn print_table(headers: &[String], rows: &[Vec<String>]) {
+    let ncols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(ncols) {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
     }
-    for row in &rows {
-        let cells: Vec<String> = names
+    let line = |cells: &[String]| {
+        cells
             .iter()
             .enumerate()
-            .map(|(i, name)| {
-                let v: Option<String> = row.get(i);
-                format!("{name}={}", v.as_deref().unwrap_or("NULL"))
-            })
-            .collect();
-        println!("  {}", cells.join("  "));
+            .take(ncols)
+            .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    if headers.iter().any(|h| !h.is_empty()) {
+        println!("  {}", line(headers));
     }
-    println!(
-        "({} row{})",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" }
-    );
-    Ok(())
+    for row in rows {
+        println!("  {}", line(row));
+    }
 }
 
 /// Quote a PostgreSQL identifier. Reached only with a name already verified to be

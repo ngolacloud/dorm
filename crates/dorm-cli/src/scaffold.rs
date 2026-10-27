@@ -72,9 +72,9 @@ edition = "2021"
 default-run = "__APP_NAME__"
 
 [dependencies]
-dorm-core = "0.1"
-dorm-derive = "0.1"
-dorm-migrations = "0.1"
+dorm-core = "0.2"
+dorm-derive = "0.2"
+dorm-migrations = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["clock"] }
 "#;

@@ -341,8 +341,9 @@ dependencies = [
 
 [[package]]
 name = "dorm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "chrono",
  "clap",
  "dorm-core",
  "tokio",
@@ -351,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
@@ -368,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -377,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-example"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dorm-core",
@@ -387,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-migrations"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dorm-core",
  "insta",
@@ -398,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dorm-core",
@@ -412,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dorm-core",
  "dorm-models",

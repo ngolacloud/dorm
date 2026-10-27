@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Open-sourced per ADR 0073, dual-licensed as the Rust ecosystem is by
 # convention, so a downstream crate can pick whichever fits its own licensing.

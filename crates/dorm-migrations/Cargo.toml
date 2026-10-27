@@ -27,7 +27,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # Both a path (for in-workspace builds) and a version (required by crates.io,
 # which resolves it to the published `dorm-core`). They must be kept in step.
-dorm-core = { path = "../dorm-core", version = "0.1.0" }
+dorm-core = { path = "../dorm-core", version = "0.2.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
