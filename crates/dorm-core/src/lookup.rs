@@ -22,6 +22,10 @@ pub enum Lookup {
     Lt,
     Lte,
     StartsWith,
+    EndsWith,
+    IEndsWith,
+    Regex,
+    IRegex,
     IsNull,
     Range,
 }
@@ -54,6 +58,10 @@ impl Lookup {
             "lt" => Lookup::Lt,
             "lte" => Lookup::Lte,
             "startswith" => Lookup::StartsWith,
+            "endswith" => Lookup::EndsWith,
+            "iendswith" => Lookup::IEndsWith,
+            "regex" => Lookup::Regex,
+            "iregex" => Lookup::IRegex,
             "isnull" => Lookup::IsNull,
             "range" => Lookup::Range,
             _ => return None,
@@ -73,6 +81,10 @@ impl Lookup {
             Lookup::Lt => "lt",
             Lookup::Lte => "lte",
             Lookup::StartsWith => "startswith",
+            Lookup::EndsWith => "endswith",
+            Lookup::IEndsWith => "iendswith",
+            Lookup::Regex => "regex",
+            Lookup::IRegex => "iregex",
             Lookup::IsNull => "isnull",
             Lookup::Range => "range",
         }
@@ -87,11 +99,20 @@ impl Lookup {
     }
 
     /// Whether the comparison is a text pattern match, and therefore only
-    /// meaningful on a text column.
+    /// meaningful on a text column. The regex lookups count: `~`/`~*` apply to a
+    /// text operand, and a regex against a number is the same caller mistake a
+    /// `LIKE` against a number is.
     pub fn is_textual(self) -> bool {
         matches!(
             self,
-            Lookup::Contains | Lookup::IContains | Lookup::StartsWith | Lookup::IExact
+            Lookup::Contains
+                | Lookup::IContains
+                | Lookup::StartsWith
+                | Lookup::EndsWith
+                | Lookup::IEndsWith
+                | Lookup::Regex
+                | Lookup::IRegex
+                | Lookup::IExact
         )
     }
 
@@ -159,6 +180,10 @@ mod tests {
             Lookup::Lt,
             Lookup::Lte,
             Lookup::StartsWith,
+            Lookup::EndsWith,
+            Lookup::IEndsWith,
+            Lookup::Regex,
+            Lookup::IRegex,
             Lookup::IsNull,
             Lookup::Range,
         ] {
@@ -185,6 +210,22 @@ mod tests {
             .validate(FieldType::Text, "name", &v)
             .is_ok());
         assert!(Lookup::IContains
+            .validate(FieldType::I64, "replicas", &v)
+            .is_err());
+    }
+
+    #[test]
+    fn the_text_lookups_added_for_the_shell_parse_and_guard_their_column() {
+        // `endswith`/`regex` arrive as strings from the shell; they parse, and —
+        // like every pattern lookup — are refused on a non-text column before any
+        // SQL is built.
+        assert_eq!(Lookup::parse("endswith"), Some(Lookup::EndsWith));
+        assert_eq!(Lookup::parse("regex"), Some(Lookup::Regex));
+        let v = [Value::Text("ac$".into())];
+        assert!(Lookup::EndsWith
+            .validate(FieldType::Text, "name", &v)
+            .is_ok());
+        assert!(Lookup::Regex
             .validate(FieldType::I64, "replicas", &v)
             .is_err());
     }

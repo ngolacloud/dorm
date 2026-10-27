@@ -305,6 +305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dorm-shell"
+version = "0.1.0"
+dependencies = [
+ "dorm-core",
+ "dorm-models",
+ "tokio",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

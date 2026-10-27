@@ -18,6 +18,9 @@ members = [
     "crates/dorm-models",
     # A standalone ~40-line blog using only `dorm-*`: the independence proof.
     "crates/dorm-example",
+    # The dynamic front end: a REPL that enumerates the linked models and runs
+    # string-typed queries live. The second independence proof.
+    "crates/dorm-shell",
 ]
 
 [workspace.package]

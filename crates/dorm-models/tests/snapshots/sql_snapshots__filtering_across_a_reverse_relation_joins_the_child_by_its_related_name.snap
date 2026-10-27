@@ -1,0 +1,13 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Tenant::objects().filter_str(\"apps__name__icontains\", \"api\"))"
+---
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" LEFT JOIN "applications" AS "j_apps" ON "tenants"."id" = "j_apps"."tenant" WHERE "j_apps"."name" ILIKE $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("%api%")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

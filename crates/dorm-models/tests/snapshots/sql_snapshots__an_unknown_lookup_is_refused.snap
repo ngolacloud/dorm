@@ -2,4 +2,4 @@
 source: crates/dorm-models/tests/sql_snapshots.rs
 expression: err.to_string()
 ---
-`slug__regex`: `slug` is not a relation, so the path cannot continue through it
+`slug__matches`: `slug` is not a relation, so the path cannot continue through it

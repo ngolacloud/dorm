@@ -275,6 +275,24 @@ fn compile_comparison(
             let v = pattern(&values[0], ty, PatternShape::Prefix)?;
             format!("{operand} LIKE {}", binder.bind(v))
         }
+        // `endswith` concatenates the wildcard in SQL rather than baking it into
+        // the value: the parameter is the escaped suffix and the `%` is a literal
+        // in the statement. `… LIKE '%' || $1` reads as "ends with", and the
+        // escaping still happens so a suffix containing `%` or `_` is matched
+        // literally, not as a wildcard.
+        Lookup::EndsWith => {
+            let v = pattern(&values[0], ty, PatternShape::Exact)?;
+            format!("{operand} LIKE '%' || {}", binder.bind(v))
+        }
+        Lookup::IEndsWith => {
+            let v = pattern(&values[0], ty, PatternShape::Exact)?;
+            format!("{operand} ILIKE '%' || {}", binder.bind(v))
+        }
+        // The regex operators take a POSIX pattern, so the value is bound raw —
+        // its metacharacters are the point, and escaping them as a `LIKE` pattern
+        // would defeat the lookup. `~` is case-sensitive, `~*` case-insensitive.
+        Lookup::Regex => format!("{operand} ~ {}", binder.bind(first())),
+        Lookup::IRegex => format!("{operand} ~* {}", binder.bind(first())),
         Lookup::Gt => format!("{operand} > {}", binder.bind(first())),
         Lookup::Gte => format!("{operand} >= {}", binder.bind(first())),
         Lookup::Lt => format!("{operand} < {}", binder.bind(first())),

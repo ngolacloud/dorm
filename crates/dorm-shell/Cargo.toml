@@ -1,0 +1,25 @@
+[package]
+name = "dorm-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The dynamic front end of ADR 0073: a REPL that enumerates the linked models
+# and runs queries typed as strings — `filter_str` — against a live PostgreSQL.
+# It depends only on the ORM crates and a model set (`dorm-models` here, which
+# any application would swap for its own), so it is also a second independence
+# proof: the shell never names a column or a table, only reads them back from the
+# registry the derive macro populated.
+
+[[bin]]
+name = "dorm"
+path = "src/main.rs"
+
+[dependencies]
+dorm-core = { path = "../dorm-core" }
+# Linked for its models: the shell has no models of its own. Referencing each
+# model's metadata in `main` is what stops the linker from dropping the crate —
+# and with it the `inventory::submit!` that registers the models.
+dorm-models = { path = "../dorm-models" }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }

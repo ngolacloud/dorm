@@ -448,6 +448,20 @@ impl<T: Model> QuerySet<T> {
     }
 }
 
+/// Run a plan's `SELECT` and return its rows as name-to-value maps.
+///
+/// The model-erased path the dynamic front end comes in through: the `dorm`
+/// shell enumerates models as `&'static ModelMeta` and has no `T` with which to
+/// build a `QuerySet<T>`, yet the compiler and the row decoder need neither — a
+/// `Plan` built straight from a `ModelMeta` compiles and runs identically. Safety
+/// is unchanged: every identifier in the plan still came from the registry, and
+/// every value is still a bound parameter.
+pub async fn fetch_value_rows(plan: &Plan) -> Result<Vec<ValueRow>> {
+    let sql = compiler::compile_select(plan)?;
+    let rows = run_query(&sql).await?;
+    decode(&sql, &rows)
+}
+
 /// Decode rows against the column plan the compiler produced.
 ///
 /// The names and types come from the compiler, not from the server's row

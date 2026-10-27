@@ -147,6 +147,26 @@ impl Field<String> {
     pub fn startswith(&self, v: impl Into<String>) -> Q {
         Q::new(self.keyed("startswith"), v.into())
     }
+
+    /// `LIKE '%v'`.
+    pub fn endswith(&self, v: impl Into<String>) -> Q {
+        Q::new(self.keyed("endswith"), v.into())
+    }
+
+    /// `ILIKE '%v'`.
+    pub fn iendswith(&self, v: impl Into<String>) -> Q {
+        Q::new(self.keyed("iendswith"), v.into())
+    }
+
+    /// `~ v` — a case-sensitive POSIX regular expression.
+    pub fn regex(&self, v: impl Into<String>) -> Q {
+        Q::new(self.keyed("regex"), v.into())
+    }
+
+    /// `~* v` — a case-insensitive POSIX regular expression.
+    pub fn iregex(&self, v: impl Into<String>) -> Q {
+        Q::new(self.keyed("iregex"), v.into())
+    }
 }
 
 // A bare value used where an expression is wanted, so `.set(3)` reads as well as

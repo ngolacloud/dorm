@@ -94,6 +94,10 @@ fn every_lookup_in_turn() {
         ("contains", tenant::name.contains("CM")),
         ("icontains", tenant::name.icontains("cm")),
         ("startswith", tenant::slug.startswith("ac")),
+        ("endswith", tenant::slug.endswith("me")),
+        ("iendswith", tenant::name.iendswith("lda")),
+        ("regex", tenant::slug.regex("^ac")),
+        ("iregex", tenant::name.iregex("lda$")),
         ("in", tenant::slug.is_in(["acme", "globex"])),
         ("gt", tenant::id.gt(10i64)),
         ("gte", tenant::id.gte(10i64)),
@@ -108,6 +112,26 @@ fn every_lookup_in_turn() {
         let _ = writeln!(out, "### {name}\n{}", render(&sql));
     }
     insta::assert_snapshot!(out);
+}
+
+#[test]
+fn endswith_concatenates_the_wildcard_in_sql_so_the_parameter_is_the_bare_suffix() {
+    // The shape the request pins: `… LIKE '%' || $1`. The `%` is a literal in the
+    // statement, not baked into the value, so the parameter is the escaped suffix
+    // on its own — and `endswith("50%")` still matches a literal percent, not
+    // every row.
+    insta::assert_snapshot!(select(
+        Tenant::objects().filter(tenant::slug.endswith("me"))
+    ));
+}
+
+#[test]
+fn a_regex_binds_its_pattern_raw_so_its_metacharacters_survive() {
+    // Unlike a `LIKE` lookup, the regex operand is not escaped: `^ac` is a regex
+    // anchor, and escaping it would defeat the lookup. `~` is case-sensitive.
+    insta::assert_snapshot!(select(
+        Tenant::objects().filter(tenant::slug.regex("^ac.*e$"))
+    ));
 }
 
 #[test]
@@ -166,6 +190,26 @@ fn the_acceptance_query_from_the_request() {
 fn a_foreign_key_compared_without_traversal_uses_its_own_column() {
     insta::assert_snapshot!(select(
         Deployment::objects().filter(deployment::app.eq(Value::I64(7)))
+    ));
+}
+
+#[test]
+fn filtering_across_a_reverse_relation_joins_the_child_by_its_related_name() {
+    // `Tenant` has no `apps` column; `Application.tenant` declares
+    // `related_name = "apps"`. `apps__name__icontains` must join `applications`
+    // on `applications.tenant = tenants.id` and read `name` from there — the
+    // reverse of `application::tenant.name()`.
+    insta::assert_snapshot!(select(
+        Tenant::objects().filter_str("apps__name__icontains", "api")
+    ));
+}
+
+#[test]
+fn a_reverse_relation_walks_two_hops_through_related_names() {
+    // Tenant → (reverse `apps`) → Application → (reverse `deployments`) →
+    // Deployment: two one-to-many joins reached entirely by `related_name`.
+    insta::assert_snapshot!(select(
+        Tenant::objects().filter_str("apps__deployments__status", "running")
     ));
 }
 
@@ -421,8 +465,8 @@ fn an_empty_in_list_is_refused_rather_than_compiled_to_in_nothing() {
 #[test]
 fn an_unknown_lookup_is_refused() {
     let err = Tenant::objects()
-        .filter_str("slug__regex", "^ac")
+        .filter_str("slug__matches", "^ac")
         .sql()
-        .expect_err("regex is not among the lookups");
+        .expect_err("`matches` is not among the lookups");
     insta::assert_snapshot!(err.to_string());
 }

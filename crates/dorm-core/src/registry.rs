@@ -104,84 +104,131 @@ pub fn resolve(root: &'static ModelMeta, path: &str) -> Result<Resolved> {
     let mut joins: Vec<Join> = Vec::new();
 
     for (i, segment) in segments.iter().enumerate() {
-        let field = current.field(segment).ok_or_else(|| {
-            // Nothing by that name. If it parses as a lookup it is a lookup in
-            // the wrong place (`slug__icontains__gt`); say so precisely.
-            if Lookup::parse(segment).is_some() {
-                Error::UnknownLookup {
-                    lookup: (*segment).to_string(),
-                    path: path.to_string(),
-                }
-            } else {
-                Error::UnknownField {
-                    model: current.name.to_string(),
-                    field: (*segment).to_string(),
-                }
-            }
-        })?;
-
         let rest = &segments[i + 1..];
 
-        // The path ends here: a plain `exact` on this field. For a foreign key
-        // that means comparing against the related row's primary key, which is
-        // what `filter(#{ app: app })` does.
-        if rest.is_empty() {
-            return Ok(Resolved {
-                joins,
-                alias,
-                field,
-                lookup: Lookup::Exact,
-            });
-        }
-
-        // Exactly one segment left, and it names a lookup: the path ends on this
-        // field. A relation is the one case needing care — `tenant__in` is a
-        // lookup on the foreign key, but if the target model happens to have a
-        // field with that name, the field wins and we traverse instead.
-        if let ([tail], Some(lookup)) = (rest, Lookup::parse(rest[rest.len() - 1])) {
-            let shadowed = field
-                .relation
-                .and_then(|r| model(r.model).ok())
-                .is_some_and(|target| target.field(tail).is_some());
-            if !shadowed {
+        // A forward field of the current model: a column to compare, or a foreign
+        // key to traverse.
+        if let Some(field) = current.field(segment) {
+            // The path ends here: a plain `exact` on this field. For a foreign
+            // key that means comparing against the related row's primary key,
+            // which is what `filter(#{ app: app })` does.
+            if rest.is_empty() {
                 return Ok(Resolved {
                     joins,
                     alias,
                     field,
-                    lookup,
+                    lookup: Lookup::Exact,
                 });
             }
+
+            // Exactly one segment left, and it names a lookup: the path ends on
+            // this field. A relation is the one case needing care — `tenant__in`
+            // is a lookup on the foreign key, but if the target model happens to
+            // have a field with that name, the field wins and we traverse instead.
+            if let ([tail], Some(lookup)) = (rest, Lookup::parse(rest[rest.len() - 1])) {
+                let shadowed = field
+                    .relation
+                    .and_then(|r| model(r.model).ok())
+                    .is_some_and(|target| target.field(tail).is_some());
+                if !shadowed {
+                    return Ok(Resolved {
+                        joins,
+                        alias,
+                        field,
+                        lookup,
+                    });
+                }
+            }
+
+            // More path to walk, so this field had better be a relation.
+            let relation = field.relation.ok_or_else(|| Error::NotARelation {
+                path: path.to_string(),
+                segment: (*segment).to_string(),
+            })?;
+            let target = model(relation.model)?;
+            let to = target.primary_key().ok_or_else(|| {
+                Error::Config(format!(
+                    "model `{}` is the target of a foreign key but declares no primary key",
+                    target.name
+                ))
+            })?;
+
+            let next_alias = join_alias(&segments[..=i]);
+            // Deduplicated by alias: two filters through the same relation share
+            // one join. Without this, `tenant__slug` and `tenant__name` in the
+            // same query would join `tenants` twice.
+            if !joins.iter().any(|j| j.alias == next_alias) {
+                joins.push(Join {
+                    table: target.table,
+                    alias: next_alias.clone(),
+                    from_alias: alias.clone(),
+                    from_column: field.column,
+                    to_column: to.column,
+                    nullable: field.nullable,
+                });
+            }
+            current = target;
+            alias = next_alias;
+            continue;
         }
 
-        // More path to walk, so this field had better be a relation.
-        let relation = field.relation.ok_or_else(|| Error::NotARelation {
-            path: path.to_string(),
-            segment: (*segment).to_string(),
-        })?;
-        let target = model(relation.model)?;
-        let to = target.primary_key().ok_or_else(|| {
-            Error::Config(format!(
-                "model `{}` is the target of a foreign key but declares no primary key",
-                target.name
-            ))
-        })?;
+        // Not a field here. It may be a *reverse* relation: a `related_name` that
+        // some other model's foreign key points back at `current` with. `Tenant`
+        // has no `apps` column, but `Application.tenant` declares
+        // `related_name = "apps"`, so `apps__name` joins `applications` on
+        // `applications.tenant = tenants.id` and reads `name` from there. This is
+        // Django's reverse-relation filter.
+        if let Some((child, fk)) = reverse_relation(current.name, segment) {
+            // A reverse relation is a join, never a terminal and never a lookup
+            // target: the set has no single value for `filter(apps=…)` to compare,
+            // so a field of the child must follow.
+            if rest.is_empty() {
+                return Err(Error::DanglingRelation {
+                    path: path.to_string(),
+                    model: child.name.to_string(),
+                });
+            }
+            let from = current.primary_key().ok_or_else(|| {
+                Error::Config(format!(
+                    "model `{}` is pointed at by a foreign key but declares no primary key",
+                    current.name
+                ))
+            })?;
 
-        let next_alias = join_alias(&segments[..=i]);
-        // Deduplicated by alias: two filters through the same relation share one
-        // join. Without this, `tenant__slug` and `tenant__name` in the same
-        // query would join `tenants` twice.
-        if !joins.iter().any(|j| j.alias == next_alias) {
-            joins.push(Join {
-                table: target.table,
-                alias: next_alias.clone(),
-                from_alias: alias.clone(),
-                from_column: field.column,
-                to_column: to.column,
-                nullable: field.nullable,
-            });
+            let next_alias = join_alias(&segments[..=i]);
+            if !joins.iter().any(|j| j.alias == next_alias) {
+                joins.push(Join {
+                    table: child.table,
+                    alias: next_alias.clone(),
+                    from_alias: alias.clone(),
+                    from_column: from.column,
+                    to_column: fk.column,
+                    // One parent, many children. The join is LEFT like every
+                    // other so a childless parent still reaches the WHERE, and it
+                    // can multiply parent rows — `distinct()` is the caller's to
+                    // add, exactly as in Django.
+                    nullable: true,
+                });
+            }
+            current = child;
+            alias = next_alias;
+            continue;
         }
-        current = target;
-        alias = next_alias;
+
+        // Nothing by that name, forwards or backwards. If it parses as a lookup
+        // it is a lookup in the wrong place (`slug__icontains__gt`); say so
+        // precisely.
+        return Err(if Lookup::parse(segment).is_some() {
+            Error::UnknownLookup {
+                lookup: (*segment).to_string(),
+                path: path.to_string(),
+            }
+        } else {
+            Error::UnknownField {
+                model: current.name.to_string(),
+                field: (*segment).to_string(),
+            }
+        });
     }
 
     // Only reachable when the path ended on a relation with nothing after it,
