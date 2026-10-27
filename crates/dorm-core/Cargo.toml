@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["orm", "postgres", "postgresql", "database", "sql"]
 categories = ["database"]
 
+# docs.rs builds with all features and sets the `docsrs` cfg, so any future
+# `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations render on the hosted docs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }

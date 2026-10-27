@@ -1,0 +1,32 @@
+[package]
+name = "dorm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The DORM project manager (binary `dorm`): scaffold a project and manage a live PostgreSQL — migrations, schema, and a Studio-style row browser, Prisma-CLI-style."
+readme = "README.md"
+keywords = ["orm", "postgres", "cli", "migrations", "database"]
+categories = ["command-line-utilities", "database"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The crate is `dorm-cli` (the name `dorm` is taken on crates.io), but the
+# installed binary is `dorm`: `cargo install dorm-cli` puts `dorm` on the PATH.
+[[bin]]
+name = "dorm"
+path = "src/main.rs"
+
+[dependencies]
+# Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
+# A path alongside the version so an in-workspace build uses the local crate and
+# crates.io resolves the published one.
+dorm-core = { path = "../dorm-core", version = "0.1.0" }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio-postgres = { workspace = true }

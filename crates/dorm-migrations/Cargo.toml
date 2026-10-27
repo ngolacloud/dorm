@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["orm", "postgres", "migrations", "ddl", "database"]
 categories = ["database"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 # The migration autodetector that ADR 0072 presupposes and that the ORM's own
 # `dorm-models` comment promises ("The autodetector in
 # `dorm-migrations` will generate the equivalent from the same

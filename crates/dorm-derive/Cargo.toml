@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["orm", "postgres", "derive", "macro", "database"]
 categories = ["database", "development-tools::procedural-macro-helpers"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 proc-macro = true
 

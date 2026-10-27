@@ -21,6 +21,9 @@ members = [
     # The dynamic front end: a REPL that enumerates the linked models and runs
     # string-typed queries live. The second independence proof.
     "crates/dorm-shell",
+    # The installable project manager (`cargo install dorm-cli`, binary `dorm`):
+    # scaffolds a project and manages a live database, Prisma-CLI-style.
+    "crates/dorm-cli",
 ]
 
 [workspace.package]
@@ -46,3 +49,4 @@ deadpool-postgres = { version = "0.14", default-features = false, features = ["r
 inventory = { version = "0.3" }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 insta = { version = "1" }
+clap = { version = "4", features = ["derive"] }
