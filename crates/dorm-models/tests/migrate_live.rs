@@ -33,11 +33,18 @@ fn migrate_creates_the_schema_then_is_idempotent() {
         ];
         let initial = mig::initial(&models).expect("build the initial migration");
 
-        let applied = mig::migrate(&[initial.clone()]).await.expect("first migrate");
+        let applied = mig::migrate(std::slice::from_ref(&initial))
+            .await
+            .expect("first migrate");
         assert_eq!(applied, vec![1], "the first run applies version 1");
 
-        let again = mig::migrate(&[initial.clone()]).await.expect("second migrate");
-        assert!(again.is_empty(), "the second run is a no-op (idempotent/adopt)");
+        let again = mig::migrate(std::slice::from_ref(&initial))
+            .await
+            .expect("second migrate");
+        assert!(
+            again.is_empty(),
+            "the second run is a no-op (idempotent/adopt)"
+        );
 
         for t in [
             "tenants",

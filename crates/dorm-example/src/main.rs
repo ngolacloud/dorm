@@ -28,7 +28,11 @@ struct Author {
 /// A post, owned by an author. Shows a foreign key, a composite unique, a check,
 /// and an `auto_now_add` timestamp.
 #[derive(Model, Debug, Clone)]
-#[model(table = "posts", unique_together = "author, slug", check = "length(title) > 0")]
+#[model(
+    table = "posts",
+    unique_together = "author, slug",
+    check = "length(title) > 0"
+)]
 struct Post {
     #[field(primary_key)]
     id: i64,

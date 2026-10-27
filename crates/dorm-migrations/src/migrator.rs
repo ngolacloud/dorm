@@ -71,11 +71,12 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
         )
         .await?;
 
-        let done: std::collections::HashSet<i64> = db::query(&format!("SELECT version FROM {LEDGER}"), &[])
-            .await?
-            .iter()
-            .map(|r| r.get::<_, i64>(0))
-            .collect();
+        let done: std::collections::HashSet<i64> =
+            db::query(&format!("SELECT version FROM {LEDGER}"), &[])
+                .await?
+                .iter()
+                .map(|r| r.get::<_, i64>(0))
+                .collect();
 
         let mut just_applied = Vec::new();
         for m in migrations {

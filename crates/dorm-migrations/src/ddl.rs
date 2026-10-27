@@ -36,7 +36,8 @@ pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
 /// composite `UNIQUE` groups, then `CHECK`s — matching the order the
 /// hand-written schemas use.
 pub fn create_table(meta: &ModelMeta) -> Result<String> {
-    let mut parts = Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
+    let mut parts =
+        Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
     for f in meta.fields {
         parts.push(column_def(f)?);
     }
@@ -62,7 +63,8 @@ pub fn create_table(meta: &ModelMeta) -> Result<String> {
 /// path would be wrong here, and the schema must not inherit that conflation.
 fn column_def(f: &FieldMeta) -> Result<String> {
     if f.primary_key {
-        if matches!(f.ty, FieldType::I64) && effective_default(f).is_none() && f.relation.is_none() {
+        if matches!(f.ty, FieldType::I64) && effective_default(f).is_none() && f.relation.is_none()
+        {
             return Ok(format!("{} BIGSERIAL PRIMARY KEY", f.column));
         }
         let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f)?);
@@ -114,8 +116,8 @@ fn effective_default(f: &FieldMeta) -> Option<String> {
 fn column_type(f: &FieldMeta) -> Result<String> {
     match f.relation {
         Some(rel) => {
-            let target = registry::model(rel.model)
-                .map_err(|_| Error::UnknownRelationTarget(rel.model))?;
+            let target =
+                registry::model(rel.model).map_err(|_| Error::UnknownRelationTarget(rel.model))?;
             let pk = target.primary_key().ok_or(Error::NoPrimaryKey(rel.model))?;
             Ok(pk.ty.sql_type().to_string())
         }
@@ -172,7 +174,10 @@ mod tests {
 
     #[test]
     fn an_i64_primary_key_without_a_default_becomes_bigserial() {
-        let f = FieldMeta { primary_key: true, ..field("id", FieldType::I64) };
+        let f = FieldMeta {
+            primary_key: true,
+            ..field("id", FieldType::I64)
+        };
         assert_eq!(column_def(&f).unwrap(), "id BIGSERIAL PRIMARY KEY");
     }
 
@@ -180,32 +185,53 @@ mod tests {
     fn a_text_primary_key_keeps_its_type_and_is_not_made_serial() {
         // This is the DBaaS `tenant_databases.addon_name` case. The insert-path
         // heuristic would call it database-generated; the schema must not.
-        let f = FieldMeta { primary_key: true, ..field("addon_name", FieldType::Text) };
+        let f = FieldMeta {
+            primary_key: true,
+            ..field("addon_name", FieldType::Text)
+        };
         assert_eq!(column_def(&f).unwrap(), "addon_name TEXT PRIMARY KEY");
     }
 
     #[test]
     fn a_not_null_unique_text_column_renders_both_modifiers_in_order() {
-        let f = FieldMeta { unique: true, ..field("slug", FieldType::Text) };
+        let f = FieldMeta {
+            unique: true,
+            ..field("slug", FieldType::Text)
+        };
         assert_eq!(column_def(&f).unwrap(), "slug TEXT NOT NULL UNIQUE");
     }
 
     #[test]
     fn a_default_follows_not_null() {
-        let f = FieldMeta { default: Some("now()"), ..field("created_at", FieldType::Timestamp) };
-        assert_eq!(column_def(&f).unwrap(), "created_at TIMESTAMPTZ NOT NULL DEFAULT now()");
+        let f = FieldMeta {
+            default: Some("now()"),
+            ..field("created_at", FieldType::Timestamp)
+        };
+        assert_eq!(
+            column_def(&f).unwrap(),
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        );
     }
 
     #[test]
     fn a_nullable_column_omits_not_null() {
-        let f = FieldMeta { nullable: true, ..field("note", FieldType::Text) };
+        let f = FieldMeta {
+            nullable: true,
+            ..field("note", FieldType::Text)
+        };
         assert_eq!(column_def(&f).unwrap(), "note TEXT");
     }
 
     #[test]
     fn jsonb_and_bigint_map_from_their_field_types() {
-        assert_eq!(column_def(&field("doc", FieldType::Json)).unwrap(), "doc JSONB NOT NULL");
-        assert_eq!(column_def(&field("n", FieldType::I64)).unwrap(), "n BIGINT NOT NULL");
+        assert_eq!(
+            column_def(&field("doc", FieldType::Json)).unwrap(),
+            "doc JSONB NOT NULL"
+        );
+        assert_eq!(
+            column_def(&field("n", FieldType::I64)).unwrap(),
+            "n BIGINT NOT NULL"
+        );
     }
 
     #[test]
@@ -233,7 +259,10 @@ mod tests {
             unique_together: &[],
             checks: &[],
         };
-        assert_eq!(indexes(&M), vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]);
+        assert_eq!(
+            indexes(&M),
+            vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
+        );
     }
 
     #[test]
@@ -242,24 +271,54 @@ mod tests {
         // CHECKs the metadata cannot yet express (see the orm-models parity test).
         const FS: &[FieldMeta] = &[
             FieldMeta {
-                name: "addon_name", column: "addon_name", ty: FieldType::Text,
-                nullable: false, primary_key: true, unique: false, index: false,
-                max_length: None, default: None, auto_now_add: false, auto_now: false, relation: None,
+                name: "addon_name",
+                column: "addon_name",
+                ty: FieldType::Text,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+                index: false,
+                max_length: None,
+                default: None,
+                auto_now_add: false,
+                auto_now: false,
+                relation: None,
             },
             FieldMeta {
-                name: "token_sha256", column: "token_sha256", ty: FieldType::Text,
-                nullable: false, primary_key: false, unique: true, index: false,
-                max_length: None, default: None, auto_now_add: false, auto_now: false, relation: None,
+                name: "token_sha256",
+                column: "token_sha256",
+                ty: FieldType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: true,
+                index: false,
+                max_length: None,
+                default: None,
+                auto_now_add: false,
+                auto_now: false,
+                relation: None,
             },
             FieldMeta {
-                name: "doc", column: "doc", ty: FieldType::Json,
-                nullable: false, primary_key: false, unique: false, index: false,
-                max_length: None, default: None, auto_now_add: false, auto_now: false, relation: None,
+                name: "doc",
+                column: "doc",
+                ty: FieldType::Json,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                index: false,
+                max_length: None,
+                default: None,
+                auto_now_add: false,
+                auto_now: false,
+                relation: None,
             },
         ];
         const M: ModelMeta = ModelMeta {
-            name: "TenantDatabase", table: "tenant_databases", fields: FS,
-            ordering: &[], tenant_scoped: true,
+            name: "TenantDatabase",
+            table: "tenant_databases",
+            fields: FS,
+            ordering: &[],
+            tenant_scoped: true,
             unique_together: &[&["tenant", "name"]],
             checks: &["token_sha256 ~ '^sha256:[0-9a-f]{64}$'"],
         };
@@ -277,12 +336,25 @@ mod tests {
     #[test]
     fn table_constraints_come_after_the_columns_unique_before_check() {
         const FS: &[FieldMeta] = &[FieldMeta {
-            name: "a", column: "a", ty: FieldType::Text,
-            nullable: false, primary_key: true, unique: false, index: false,
-            max_length: None, default: None, auto_now_add: false, auto_now: false, relation: None,
+            name: "a",
+            column: "a",
+            ty: FieldType::Text,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
         }];
         const M: ModelMeta = ModelMeta {
-            name: "X", table: "x", fields: FS, ordering: &[], tenant_scoped: false,
+            name: "X",
+            table: "x",
+            fields: FS,
+            ordering: &[],
+            tenant_scoped: false,
             unique_together: &[&["a", "b"], &["c"]],
             checks: &["a <> ''"],
         };

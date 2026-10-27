@@ -242,7 +242,10 @@ mod tests {
     fn a_text_primary_key_is_caller_supplied_not_database_generated() {
         // The DBaaS `tenant_databases.addon_name` case: a keyless PK that is NOT
         // an integer is the caller's value and must stay in the INSERT list.
-        let text_pk = FieldMeta { primary_key: true, ..FIELDS[1] };
+        let text_pk = FieldMeta {
+            primary_key: true,
+            ..FIELDS[1]
+        };
         assert!(text_pk.primary_key && !text_pk.is_database_generated());
     }
 

@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # The Cargo workspace. Patch/minor bumps grouped so related crates move
+  # together and the PR count stays sane.
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      postgres:
+        patterns: ["tokio-postgres", "deadpool-postgres", "postgres-*"]
+      tokio:
+        patterns: ["tokio", "tokio-*"]
+  # The CI actions themselves.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }

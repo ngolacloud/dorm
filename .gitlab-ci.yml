@@ -1,0 +1,41 @@
+# The same gate as GitHub Actions (`.github/workflows/ci.yml`), so a mirror on
+# GitLab enforces identical standards: fmt, clippy with warnings denied, the
+# test suite, and an opt-in live lane against a real PostgreSQL.
+image: rust:1-slim
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+cache:
+  key: $CI_COMMIT_REF_SLUG
+  paths:
+    - .cargo/
+    - target/
+
+stages: [check, live]
+
+check:
+  stage: check
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo test --all-targets
+
+# Opt-in: the ORM against a real PostgreSQL, as a service container. Mirrors the
+# `integration` job on GitHub.
+integration:
+  stage: live
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: orm
+    POSTGRES_PASSWORD: orm
+    POSTGRES_DB: ormtest
+    DELONIX_ORM_DSN: host=postgres port=5432 user=orm password=orm dbname=ormtest
+    DELONIX_ORM_TEST_DSN: host=postgres port=5432 user=orm password=orm dbname=ormtest
+  script:
+    - cargo test -p dorm-models --test migrate_live -- --nocapture
+    - cargo test -p dorm-models --test typed_e2e -- --ignored --nocapture

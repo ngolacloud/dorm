@@ -1,0 +1,76 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One in-flight run per ref: a new push cancels the previous run on the same
+# branch or PR, so the queue never backs up on force-pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The fast lane — no database. `cargo test --all-targets` still compiles and
+  # runs every test; the live ones (`migrate_live`, `typed_e2e`) skip themselves
+  # when no DSN is set, so this lane needs no PostgreSQL.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
+
+  # Documentation builds with intra-doc links treated as errors: a broken
+  # `[`Lookup`]` or a dangling module reference fails here rather than shipping.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the docs
+        run: cargo doc --no-deps --workspace --document-private-items
+
+  # Opt-in live lane: the ORM against a real PostgreSQL. Kept separate so the
+  # fast lane never waits on a database. It runs the two gated suites —
+  # `migrate_live` (applies the generated schema and proves it idempotent) and
+  # `typed_e2e` (the typed API end to end, which is `#[ignore]` besides).
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orm
+          POSTGRES_PASSWORD: orm
+          POSTGRES_DB: ormtest
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U orm -d ormtest"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      # `migrate_live` reads DELONIX_ORM_DSN; `typed_e2e` reads
+      # DELONIX_ORM_TEST_DSN. Both point at the service container above.
+      DELONIX_ORM_DSN: host=127.0.0.1 port=5432 user=orm password=orm dbname=ormtest
+      DELONIX_ORM_TEST_DSN: host=127.0.0.1 port=5432 user=orm password=orm dbname=ormtest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Migrate (create the schema, then prove idempotence)
+        run: cargo test -p dorm-models --test migrate_live -- --nocapture
+      - name: Typed API end to end
+        run: cargo test -p dorm-models --test typed_e2e -- --ignored --nocapture

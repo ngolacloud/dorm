@@ -74,8 +74,7 @@ fn setup(dsn: &str) {
         let rt = runtime();
         rt.block_on(async {
             db::atomic(|_tx| async {
-                dorm_core::db::execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK])
-                    .await?;
+                dorm_core::db::execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK]).await?;
                 for statement in schema_sql().split(";\n") {
                     let s = statement.trim();
                     if s.is_empty() {
