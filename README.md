@@ -111,6 +111,15 @@ and the test suite — and it is exactly what CI runs. See
 
 ## License
 
-Proprietary for now (`LicenseRef-NgolaCloud-Proprietary`); every crate is
-`publish = false`. The ORM is slated to be open-sourced (ADR 0073); the license
-changes when that happens.
+Open-sourced per ADR 0073 and **dual-licensed** under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option — the Rust ecosystem convention. The library crates
+(`dorm-core`, `dorm-derive`, `dorm-migrations`) are published to
+[crates.io](https://crates.io/crates/dorm-core); `dorm-models`, `dorm-example`
+and `dorm-shell` are example/internal and stay unpublished.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit
+for inclusion shall be dual-licensed as above, without any additional terms.

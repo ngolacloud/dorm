@@ -3,7 +3,14 @@ name = "dorm-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "A Django-shaped, compile-time-typed ORM for PostgreSQL on tokio-postgres: QuerySet, a pure query compiler, the model registry, and the connection pool."
+readme = "README.md"
+keywords = ["orm", "postgres", "postgresql", "database", "sql"]
+categories = ["database"]
 
 [dependencies]
 thiserror = { workspace = true }

@@ -3,7 +3,14 @@ name = "dorm-migrations"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Migration generation and the versioned migrator for DORM — reviewable DDL from the same model metadata the queries read."
+readme = "README.md"
+keywords = ["orm", "postgres", "migrations", "ddl", "database"]
+categories = ["database"]
 
 # The migration autodetector that ADR 0072 presupposes and that the ORM's own
 # `dorm-models` comment promises ("The autodetector in
@@ -14,7 +21,9 @@ publish = false
 # from the registry, never from a hand-written list.
 
 [dependencies]
-dorm-core = { path = "../dorm-core" }
+# Both a path (for in-workspace builds) and a version (required by crates.io,
+# which resolves it to the published `dorm-core`). They must be kept in step.
+dorm-core = { path = "../dorm-core", version = "0.1.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }

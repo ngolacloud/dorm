@@ -3,7 +3,14 @@ name = "dorm-derive"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The #[derive(Model)] macro for DORM — turns a struct into a model and emits its typed field handles and metadata."
+readme = "README.md"
+keywords = ["orm", "postgres", "derive", "macro", "database"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
