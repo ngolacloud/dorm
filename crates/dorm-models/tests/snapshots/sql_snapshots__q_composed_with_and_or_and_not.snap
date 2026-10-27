@@ -1,0 +1,15 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Tenant::objects().filter(q))"
+---
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE (("tenants"."slug" = $1 OR "tenants"."slug" = $2) AND NOT ("tenants"."name" ILIKE $3)) ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("acme")
+--   $2 = Text("globex")
+--   $3 = Text("%test%")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

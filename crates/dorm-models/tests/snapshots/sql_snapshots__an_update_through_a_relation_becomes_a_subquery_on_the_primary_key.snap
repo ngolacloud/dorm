@@ -1,0 +1,9 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+UPDATE "deployments" SET "replicas" = $1, "updated_at" = now() WHERE "id" IN (SELECT "deployments"."id" FROM "deployments" LEFT JOIN "applications" AS "j_app" ON "deployments"."app" = "j_app"."id" LEFT JOIN "tenants" AS "j_app__tenant" ON "j_app"."tenant" = "j_app__tenant"."id" WHERE "j_app__tenant"."slug" = $2)
+
+-- parameters, in binding order:
+--   $1 = I64(3)
+--   $2 = Text("acme")

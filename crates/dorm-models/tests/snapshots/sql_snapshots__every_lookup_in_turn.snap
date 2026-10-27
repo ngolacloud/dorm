@@ -1,0 +1,146 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: out
+---
+### exact
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."slug" = $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("acme")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### iexact
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."slug" ILIKE $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("ACME")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### contains
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."name" LIKE $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("%CM%")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### icontains
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."name" ILIKE $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("%cm%")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### startswith
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."slug" LIKE $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("ac%")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### in
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."slug" IN ($1, $2) ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("acme")
+--   $2 = Text("globex")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### gt
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."id" > $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(10)
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### gte
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."id" >= $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(10)
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### lt
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."id" < $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(10)
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### lte
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."id" <= $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(10)
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### range
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."id" BETWEEN $1 AND $2 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(1)
+--   $2 = I64(9)
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### isnull true
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."name" IS NULL ORDER BY "tenants"."created_at" DESC
+
+-- no parameters
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp
+
+### isnull false
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."name" IS NOT NULL ORDER BY "tenants"."created_at" DESC
+
+-- no parameters
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

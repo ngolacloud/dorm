@@ -1,0 +1,5 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: err.to_string()
+---
+an `or` cannot mix an aggregate with a plain column; filter the aggregate separately

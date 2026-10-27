@@ -1,0 +1,23 @@
+[package]
+name = "dorm-migrations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The migration autodetector that ADR 0072 presupposes and that the ORM's own
+# `dorm-models` comment promises ("The autodetector in
+# `dorm-migrations` will generate the equivalent from the same
+# metadata"). It depends ONLY on `dorm-core`: it reads the same
+# `&'static ModelMeta` the typed API and the REPL read, and turns it into DDL.
+# It does NOT depend on any crate that defines models — the schema is derived
+# from the registry, never from a hand-written list.
+
+[dependencies]
+dorm-core = { path = "../dorm-core" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio-postgres = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

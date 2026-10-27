@@ -1,0 +1,15 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Application::objects().filter(application::tenant.slug().eq(\"acme\")).filter(application::name.icontains(\"ap\")))"
+---
+SELECT "applications"."id", "applications"."tenant", "applications"."plan", "applications"."name", "applications"."created_at" FROM "applications" LEFT JOIN "tenants" AS "j_tenant" ON "applications"."tenant" = "j_tenant"."id" WHERE "j_tenant"."slug" = $1 AND "applications"."name" ILIKE $2 ORDER BY "applications"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("acme")
+--   $2 = Text("%ap%")
+-- result columns:
+--   id : I64
+--   tenant : I64
+--   plan : I64
+--   name : Text
+--   created_at : Timestamp

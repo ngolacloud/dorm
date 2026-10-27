@@ -1,0 +1,11 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: select(qs)
+---
+SELECT "tenants"."slug", COUNT(DISTINCT "r_apps"."id") AS "n" FROM "tenants" LEFT JOIN "applications" AS "r_apps" ON "tenants"."id" = "r_apps"."tenant" GROUP BY "tenants"."id" HAVING COUNT(DISTINCT "r_apps"."id") >= $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = I64(1)
+-- result columns:
+--   slug : Text
+--   n : I64

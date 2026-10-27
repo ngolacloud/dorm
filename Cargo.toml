@@ -1,0 +1,41 @@
+# DORM — the Delonix ORM.
+#
+# A Django-shaped, compile-time-typed ORM for PostgreSQL, built on
+# `tokio-postgres`. This is the ORM as an INDEPENDENT product (ADR 0073): the
+# crates here carry no NgolaCloud business entity and no platform code — an
+# external Rust application can depend on `dorm-core` alone, define its models,
+# review the migration SQL, and inspect a query's SQL without a database. The
+# platform's own tables live OUTSIDE this repo, over these crates.
+[workspace]
+resolver = "2"
+members = [
+    "crates/dorm-core",
+    "crates/dorm-derive",
+    "crates/dorm-migrations",
+    # The ORM's OWN example models, exercised by the snapshot tests — not a
+    # business entity. Kept in the workspace so `cargo test` pins the generated
+    # SQL for every front end at once.
+    "crates/dorm-models",
+    # A standalone ~40-line blog using only `dorm-*`: the independence proof.
+    "crates/dorm-example",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Still proprietary until the owner open-sources it (ADR 0073 calls the ORM
+# "open-source-bound"); every crate is `publish = false` until then.
+license = "LicenseRef-NgolaCloud-Proprietary"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1" }
+uuid = { version = "1" }
+chrono = { version = "0.4", default-features = false }
+tokio-postgres = { version = "0.7" }
+deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
+inventory = { version = "0.3" }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+insta = { version = "1" }

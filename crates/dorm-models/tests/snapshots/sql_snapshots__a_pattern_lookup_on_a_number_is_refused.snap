@@ -1,0 +1,5 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: err.to_string()
+---
+column `replicas__icontains` is not a text column, for a pattern lookup

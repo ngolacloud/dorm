@@ -1,0 +1,13 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Tenant::objects().filter(tenant::slug.eq(\"acme\")))"
+---
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."slug" = $1 ORDER BY "tenants"."created_at" DESC
+
+-- parameters, in binding order:
+--   $1 = Text("acme")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

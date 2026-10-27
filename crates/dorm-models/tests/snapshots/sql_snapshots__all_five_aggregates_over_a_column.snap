@@ -1,0 +1,38 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: out
+---
+### Count
+SELECT COUNT("deployments"."replicas") AS "value" FROM "deployments"
+
+-- no parameters
+-- result columns:
+--   value : I64
+
+### Sum
+SELECT SUM("deployments"."replicas") AS "value" FROM "deployments"
+
+-- no parameters
+-- result columns:
+--   value : I64
+
+### Avg
+SELECT AVG("deployments"."replicas") AS "value" FROM "deployments"
+
+-- no parameters
+-- result columns:
+--   value : Decimal
+
+### Min
+SELECT MIN("deployments"."replicas") AS "value" FROM "deployments"
+
+-- no parameters
+-- result columns:
+--   value : I64
+
+### Max
+SELECT MAX("deployments"."replicas") AS "value" FROM "deployments"
+
+-- no parameters
+-- result columns:
+--   value : I64

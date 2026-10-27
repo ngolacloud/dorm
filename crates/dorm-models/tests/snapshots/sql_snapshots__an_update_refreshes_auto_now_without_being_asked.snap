@@ -1,0 +1,9 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+UPDATE "deployments" SET "status" = $1, "updated_at" = now() WHERE "id" IN (SELECT "deployments"."id" FROM "deployments" WHERE "deployments"."id" = $2)
+
+-- parameters, in binding order:
+--   $1 = Text("running")
+--   $2 = I64(1)

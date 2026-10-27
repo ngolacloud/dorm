@@ -1,0 +1,8 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+DELETE FROM "applications" WHERE "id" IN (SELECT "applications"."id" FROM "applications" LEFT JOIN "tenants" AS "j_tenant" ON "applications"."tenant" = "j_tenant"."id" WHERE "j_tenant"."slug" = $1)
+
+-- parameters, in binding order:
+--   $1 = Text("acme")

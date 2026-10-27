@@ -1,0 +1,5 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: err.to_string()
+---
+model `Tenant` has no field `slog`

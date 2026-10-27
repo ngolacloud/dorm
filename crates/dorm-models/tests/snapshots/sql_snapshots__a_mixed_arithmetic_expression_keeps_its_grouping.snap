@@ -1,0 +1,10 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+UPDATE "deployments" SET "replicas" = (("replicas" + $1) * $2), "updated_at" = now() WHERE "id" IN (SELECT "deployments"."id" FROM "deployments" WHERE "deployments"."id" = $3)
+
+-- parameters, in binding order:
+--   $1 = I64(1)
+--   $2 = I64(2)
+--   $3 = I64(1)

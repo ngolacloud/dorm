@@ -1,0 +1,18 @@
+[package]
+name = "dorm-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+proc-macro = true
+
+# Pinned locally rather than in `[workspace.dependencies]`: these three are a
+# proc-macro crate's private toolchain and no other member of the workspace has
+# any business depending on them. Same reasoning as `clap_complete` in
+# `crates/delonixctl/Cargo.toml`.
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

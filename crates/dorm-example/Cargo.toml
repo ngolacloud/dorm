@@ -1,0 +1,19 @@
+[package]
+name = "dorm-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A STANDALONE example: it depends only on the ORM crates — no control plane, no
+# platform models, no runtime. Its existence (and `cargo tree -p
+# dorm-example` showing only `dorm-*` + third-party) is the proof
+# that the ORM is usable by any Rust application, per the independence rule
+# (ADR 0073). A blog in ~40 lines: define models, see the migration SQL to
+# review, and inspect a typed query's SQL — all without a database.
+
+[dependencies]
+dorm-core = { path = "../dorm-core" }
+dorm-derive = { path = "../dorm-derive" }
+dorm-migrations = { path = "../dorm-migrations" }
+chrono = { workspace = true, features = ["clock"] }

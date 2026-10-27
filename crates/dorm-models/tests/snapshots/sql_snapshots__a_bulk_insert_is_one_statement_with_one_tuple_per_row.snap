@@ -1,0 +1,18 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+INSERT INTO "tenants" ("slug", "name") VALUES ($1, $2), ($3, $4), ($5, $6) RETURNING "id", "slug", "name", "created_at"
+
+-- parameters, in binding order:
+--   $1 = Text("a")
+--   $2 = Text("Tenant a")
+--   $3 = Text("b")
+--   $4 = Text("Tenant b")
+--   $5 = Text("c")
+--   $6 = Text("Tenant c")
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

@@ -1,0 +1,10 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: render(&sql)
+---
+SELECT EXISTS (SELECT 1 FROM (SELECT "applications"."id", "applications"."tenant", "applications"."plan", "applications"."name", "applications"."created_at" FROM "applications" WHERE "applications"."name" = $1 LIMIT 1) AS _e)
+
+-- parameters, in binding order:
+--   $1 = Text("api")
+-- result columns:
+--   exists : Bool

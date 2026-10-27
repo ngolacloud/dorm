@@ -1,0 +1,21 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Application::objects().select_related(\"tenant\").select_related(\"plan\"))"
+---
+SELECT "applications"."id", "applications"."tenant", "applications"."plan", "applications"."name", "applications"."created_at", "j_tenant"."id", "j_tenant"."slug", "j_tenant"."name", "j_tenant"."created_at", "j_plan"."id", "j_plan"."code", "j_plan"."name", "j_plan"."monthly_price" FROM "applications" LEFT JOIN "plans" AS "j_plan" ON "applications"."plan" = "j_plan"."id" LEFT JOIN "tenants" AS "j_tenant" ON "applications"."tenant" = "j_tenant"."id" ORDER BY "applications"."created_at" DESC
+
+-- no parameters
+-- result columns:
+--   id : I64
+--   tenant : I64
+--   plan : I64
+--   name : Text
+--   created_at : Timestamp
+--   tenant__id : I64
+--   tenant__slug : Text
+--   tenant__name : Text
+--   tenant__created_at : Timestamp
+--   plan__id : I64
+--   plan__code : Text
+--   plan__name : Text
+--   plan__monthly_price : Decimal

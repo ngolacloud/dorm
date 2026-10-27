@@ -1,0 +1,10 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Application::objects().values(&[\"name\", \"tenant__slug\"]))"
+---
+SELECT "applications"."name", "j_tenant"."slug" FROM "applications" LEFT JOIN "tenants" AS "j_tenant" ON "applications"."tenant" = "j_tenant"."id" ORDER BY "applications"."created_at" DESC
+
+-- no parameters
+-- result columns:
+--   name : Text
+--   tenant__slug : Text

@@ -1,0 +1,12 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Tenant::objects().filter(Q::new(\"name\", none)))"
+---
+SELECT "tenants"."id", "tenants"."slug", "tenants"."name", "tenants"."created_at" FROM "tenants" WHERE "tenants"."name" IS NULL ORDER BY "tenants"."created_at" DESC
+
+-- no parameters
+-- result columns:
+--   id : I64
+--   slug : Text
+--   name : Text
+--   created_at : Timestamp

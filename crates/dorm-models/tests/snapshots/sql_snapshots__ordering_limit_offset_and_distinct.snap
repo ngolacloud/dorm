@@ -1,0 +1,13 @@
+---
+source: crates/dorm-models/tests/sql_snapshots.rs
+expression: "select(Application::objects().order_by_str(&[\"tenant__slug\",\n\"-created_at\"]).distinct().limit(10).offset(20))"
+---
+SELECT DISTINCT "applications"."id", "applications"."tenant", "applications"."plan", "applications"."name", "applications"."created_at" FROM "applications" LEFT JOIN "tenants" AS "j_tenant" ON "applications"."tenant" = "j_tenant"."id" ORDER BY "j_tenant"."slug" ASC, "applications"."created_at" DESC LIMIT 10 OFFSET 20
+
+-- no parameters
+-- result columns:
+--   id : I64
+--   tenant : I64
+--   plan : I64
+--   name : Text
+--   created_at : Timestamp

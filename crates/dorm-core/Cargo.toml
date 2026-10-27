@@ -1,0 +1,30 @@
+[package]
+name = "dorm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `clock` is what gives `Utc::now()`, which `auto_now_add`/`auto_now` need. The
+# workspace entry turns defaults off, so it is listed here.
+chrono = { workspace = true, features = ["clock", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+rust_decimal = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# The `with-*` features are not cosmetic: without them `Decimal`, `DateTime`,
+# `Uuid` and `Value` have no wire representation and every such column would
+# have to travel as text.
+tokio-postgres = { workspace = true, features = [
+    "with-serde_json-1",
+    "with-chrono-0_4",
+    "with-uuid-1",
+] }
+deadpool-postgres = { workspace = true }
+inventory = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
