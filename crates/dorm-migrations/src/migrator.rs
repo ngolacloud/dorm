@@ -99,6 +99,101 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
     Ok(applied)
 }
 
+/// Bring the live schema in line with `models`, **additively**: create any table
+/// that is missing (with its indexes), and add any column a model declares that
+/// its table does not yet have. Returns the DDL it actually ran, in order.
+///
+/// This is the quick-iteration path — the shape `prisma db push` has — as opposed
+/// to the versioned [`migrate`]: no ledger, no history, just "make the database
+/// match the models". It is deliberately **only additive**: it never drops a
+/// table or column and never changes a type, so it cannot lose data. Destructive
+/// changes stay a human's decision.
+///
+/// The set difference is computed from `information_schema`, under the same
+/// advisory lock and single transaction as [`migrate`], so two concurrent syncs
+/// serialise rather than racing on `ALTER TABLE`.
+pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
+    db::guard_write("sync")?;
+
+    // Generate every statement up front — this is the pure, fallible half, so a
+    // bad relation surfaces as a migration error here rather than inside the
+    // transaction, where the error type would have to be the ORM's. Each entry is
+    // `(table, CREATE TABLE, [CREATE INDEX…], [(column, ADD COLUMN)…])`.
+    type Plan = (
+        &'static str,
+        String,
+        Vec<String>,
+        Vec<(&'static str, String)>,
+    );
+    let mut plans: Vec<Plan> = Vec::with_capacity(models.len());
+    for m in models {
+        let mut adds = Vec::new();
+        for f in m.fields {
+            // A missing primary key is not something additive sync adds.
+            if !f.primary_key {
+                adds.push((f.column, ddl::add_column(m, f)?));
+            }
+        }
+        plans.push((m.table, ddl::create_table(m)?, ddl::indexes(m), adds));
+    }
+
+    // Apply under the lock, in one transaction. Only `db::` calls here, so the
+    // closure's error is the ORM's — which `?` on the outside maps back.
+    db::atomic(|_tx| async move {
+        db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+
+        let tables: std::collections::HashSet<String> = db::query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+
+        let mut columns: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for r in db::query(
+            "SELECT table_name, column_name FROM information_schema.columns \
+             WHERE table_schema = 'public'",
+            &[],
+        )
+        .await?
+        {
+            columns
+                .entry(r.get::<_, String>(0))
+                .or_default()
+                .insert(r.get::<_, String>(1));
+        }
+
+        // `changes` is what we report; the indexes are run too (idempotently) but
+        // are not reported, so the output names only tables created and columns
+        // added.
+        let mut changes = Vec::new();
+        for (table, create, indexes, adds) in &plans {
+            if !tables.contains(*table) {
+                db::execute(create, &[]).await?;
+                changes.push(create.clone());
+            } else {
+                let have = columns.get(*table).cloned().unwrap_or_default();
+                for (col, stmt) in adds {
+                    if !have.contains(*col) {
+                        db::execute(stmt, &[]).await?;
+                        changes.push(stmt.clone());
+                    }
+                }
+            }
+            for idx in indexes {
+                db::execute(idx, &[]).await?;
+            }
+        }
+        Ok(changes)
+    })
+    .await
+    .map_err(Into::into)
+}
+
 /// Seconds since the epoch. `SystemTime`, not a database `now()`, because the
 /// ledger stamp is wall-clock metadata, not a value a query reasons about.
 fn now_unix() -> i64 {

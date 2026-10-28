@@ -49,4 +49,4 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub use migrator::{initial, migrate, Migration};
+pub use migrator::{initial, migrate, sync, Migration};

@@ -53,6 +53,10 @@ enum CliCommand {
     },
     /// Open your project's REPL by building and running it (`cargo run`).
     Shell,
+    /// Push the schema to the database additively — create missing tables and
+    /// columns to match your models — by building and running the project. Like
+    /// `prisma db push`; no migration history. (`cargo run --bin sync`.)
+    Push,
     /// Add to the project in the current directory.
     New {
         #[command(subcommand)]
@@ -124,6 +128,7 @@ fn main() -> ExitCode {
             action: Some(MigrateAction::Status),
         } => on_runtime(migrate_status()),
         CliCommand::Shell => cargo_run(&["--bin", "shell"]),
+        CliCommand::Push => cargo_run(&["--bin", "sync"]),
         CliCommand::New {
             what: NewKind::Model { name },
         } => scaffold::new_model(&name),

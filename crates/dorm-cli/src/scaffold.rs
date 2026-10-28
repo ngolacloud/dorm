@@ -39,6 +39,7 @@ pub fn init(name: Option<&str>) -> CliResult {
     write(root.join("src/models.rs"), MODELS_RS)?;
     write(root.join("src/main.rs"), &render(MAIN_RS))?;
     write(root.join("src/bin/migrate.rs"), &render(MIGRATE_RS))?;
+    write(root.join("src/bin/sync.rs"), &render(SYNC_RS))?;
     write(root.join("src/bin/shell.rs"), &render(SHELL_RS))?;
 
     println!("created `{name}`.\n");
@@ -50,7 +51,7 @@ pub fn init(name: Option<&str>) -> CliResult {
         whoami(),
         krate
     );
-    println!("  dorm migrate                   # apply the schema");
+    println!("  dorm push                      # create tables/columns to match your models");
     println!("  dorm shell                     # a REPL over your models");
     Ok(())
 }
@@ -176,13 +177,13 @@ const CARGO_TOML: &str = r#"[package]
 name = "__APP_NAME__"
 version = "0.1.0"
 edition = "2021"
-# Three binaries share the library; `cargo run` means the demo.
+# The binaries share the library; `cargo run` means the demo.
 default-run = "__APP_NAME__"
 
 [dependencies]
 dorm-core = "0.2"
 dorm-derive = "0.2"
-dorm-migrations = "0.2"
+dorm-migrations = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["clock"] }
 "#;
@@ -197,13 +198,14 @@ A DORM project.
 cargo run                       # the generated schema + a sample query (no database)
 
 export DELONIX_ORM_DSN='host=/var/run/postgresql user=me dbname=__APP_CRATE__'
-dorm migrate                    # apply the schema (= cargo run --bin migrate)
+dorm push                       # create tables/columns to match your models
 dorm shell                      # a REPL over your models (= cargo run --bin shell)
 dorm db tables                  # browse the live database
 ```
 
-Define your models in `src/models.rs` and list them in `all_models()` in
-`src/lib.rs`. Everything else reads from there.
+Add a model with `dorm new model <Name>` (or by hand in `src/models.rs`, then
+list it in `all_models()` in `src/lib.rs`), then `dorm push` to create its table.
+`dorm migrate` is the versioned alternative to `dorm push`.
 "#;
 
 const LIB_RS: &str = r#"//! The project's models, and the one list the tools read.
@@ -280,6 +282,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("up to date — nothing to apply.");
     } else {
         println!("applied version(s): {applied:?}");
+    }
+    Ok(())
+}
+"#;
+
+const SYNC_RS: &str = r#"//! `dorm push` runs this: bring the database in line with the models,
+//! additively — create missing tables and add missing columns. No migration
+//! history; the quick-iteration path, like `prisma db push`.
+
+use dorm_migrations as mig;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let models = __APP_CRATE__::all_models();
+    let changes = mig::sync(&models).await?;
+    if changes.is_empty() {
+        println!("database already matches the models — nothing to push.");
+    } else {
+        println!("pushed {} change(s):", changes.len());
+        for c in &changes {
+            println!("  {c}");
+        }
     }
     Ok(())
 }

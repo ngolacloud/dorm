@@ -1,6 +1,8 @@
 [package]
 name = "dorm-migrations"
-version.workspace = true
+# Independent of the 0.2.x libraries: this release adds `sync` (additive
+# schema push), a new minor on its own line, while dorm-core/derive stay 0.2.x.
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

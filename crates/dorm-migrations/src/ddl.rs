@@ -74,7 +74,15 @@ fn column_def(f: &FieldMeta) -> Result<String> {
         return Ok(s);
     }
 
-    let mut s = format!("{} {}", f.column, column_type(f)?);
+    Ok(format!("{} {}", f.column, column_modifiers(f)?))
+}
+
+/// Everything after the column name in a definition: the type, then
+/// `NOT NULL` / `UNIQUE` / `DEFAULT` / `REFERENCES` in that order. Shared by the
+/// `CREATE TABLE` column list and the `ALTER TABLE … ADD COLUMN` of [`add_column`]
+/// so the two never diverge.
+fn column_modifiers(f: &FieldMeta) -> Result<String> {
+    let mut s = column_type(f)?;
     if !f.nullable {
         s.push_str(" NOT NULL");
     }
@@ -94,6 +102,22 @@ fn column_def(f: &FieldMeta) -> Result<String> {
         ));
     }
     Ok(s)
+}
+
+/// `ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <column> <modifiers>` for one
+/// field — the additive half of [`crate::sync`]. Idempotent, and never a primary
+/// key: adding a surrogate key to a populated table is not a thing `sync` does.
+///
+/// A new `NOT NULL` column with no default is only safe on an empty table;
+/// PostgreSQL will reject it otherwise, which is the right answer — `sync` is for
+/// additive changes, not backfills.
+pub fn add_column(meta: &ModelMeta, f: &FieldMeta) -> Result<String> {
+    Ok(format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
+        meta.table,
+        f.column,
+        column_modifiers(f)?
+    ))
 }
 
 /// The column's SQL default, if any. An explicit `default = "..."` wins; failing

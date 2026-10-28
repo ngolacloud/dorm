@@ -72,5 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Migrate (create the schema, then prove idempotence)
         run: cargo test -p dorm-models --test migrate_live -- --nocapture
+      - name: Sync (additive schema push — create, add column, recreate table)
+        run: cargo test -p dorm-models --test sync_live -- --nocapture
       - name: Typed API end to end
         run: cargo test -p dorm-models --test typed_e2e -- --ignored --nocapture
