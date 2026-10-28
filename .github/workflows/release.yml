@@ -51,6 +51,7 @@ jobs:
           publish dorm-derive
           publish dorm-migrations
           publish dorm-schema
+          publish dorm-sqlite
           publish dorm-cli
 
       - name: GitHub Release

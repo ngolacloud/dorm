@@ -203,7 +203,7 @@ edition = "2021"
 default-run = "__APP_NAME__"
 
 [dependencies]
-dorm-core = "0.3"
+dorm-core = "0.4"
 dorm-derive = "0.2"
 dorm-migrations = "0.4"
 tokio = { version = "1", features = ["full"] }

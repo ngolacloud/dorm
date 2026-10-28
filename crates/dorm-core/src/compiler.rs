@@ -125,20 +125,53 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// The SQL dialect a plan is compiled for. Only the placeholder style (`$n` vs
+/// `?n`) and case-insensitive `LIKE` differ between the two today; identifiers,
+/// joins and clause structure are shared (ADR 0002). PostgreSQL is the default,
+/// so every existing caller and every snapshot is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Postgres,
+    Sqlite,
+}
+
+impl Dialect {
+    /// The case-insensitive pattern operator: PostgreSQL's `ILIKE`, or `LIKE` on
+    /// SQLite (whose `LIKE` is already case-insensitive for ASCII).
+    fn ilike(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "ILIKE",
+            Dialect::Sqlite => "LIKE",
+        }
+    }
+}
+
 /// Accumulates parameters so the placeholder numbers and the vector stay in step.
 struct Binder {
     params: Vec<Value>,
+    dialect: Dialect,
 }
 
 impl Binder {
     fn new() -> Binder {
-        Binder { params: Vec::new() }
+        Binder::with_dialect(Dialect::Postgres)
     }
 
-    /// Bind one value and return its placeholder.
+    fn with_dialect(dialect: Dialect) -> Binder {
+        Binder {
+            params: Vec::new(),
+            dialect,
+        }
+    }
+
+    /// Bind one value and return its placeholder — `$n` on PostgreSQL, `?n` on
+    /// SQLite.
     fn bind(&mut self, v: Value) -> String {
         self.params.push(v);
-        format!("${}", self.params.len())
+        match self.dialect {
+            Dialect::Postgres => format!("${}", self.params.len()),
+            Dialect::Sqlite => format!("?{}", self.params.len()),
+        }
     }
 }
 
@@ -261,7 +294,8 @@ fn compile_comparison(
         }
         Lookup::IExact => {
             let v = pattern(&values[0], ty, PatternShape::Exact)?;
-            format!("{operand} ILIKE {}", binder.bind(v))
+            let op = binder.dialect.ilike();
+            format!("{operand} {op} {}", binder.bind(v))
         }
         Lookup::Contains => {
             let v = pattern(&values[0], ty, PatternShape::Anywhere)?;
@@ -269,7 +303,8 @@ fn compile_comparison(
         }
         Lookup::IContains => {
             let v = pattern(&values[0], ty, PatternShape::Anywhere)?;
-            format!("{operand} ILIKE {}", binder.bind(v))
+            let op = binder.dialect.ilike();
+            format!("{operand} {op} {}", binder.bind(v))
         }
         Lookup::StartsWith => {
             let v = pattern(&values[0], ty, PatternShape::Prefix)?;
@@ -286,7 +321,8 @@ fn compile_comparison(
         }
         Lookup::IEndsWith => {
             let v = pattern(&values[0], ty, PatternShape::Exact)?;
-            format!("{operand} ILIKE '%' || {}", binder.bind(v))
+            let op = binder.dialect.ilike();
+            format!("{operand} {op} '%' || {}", binder.bind(v))
         }
         // The regex operators take a POSIX pattern, so the value is bound raw —
         // its metacharacters are the point, and escaping them as a `LIKE` pattern
@@ -617,9 +653,15 @@ fn compile_order(plan: &Plan, joins: &mut Joins) -> Result<Option<String>> {
     Ok(Some(parts.join(", ")))
 }
 
-/// Compile a `SELECT`.
+/// Compile a `SELECT` for PostgreSQL. See [`compile_select_on`] for SQLite.
 pub fn compile_select(plan: &Plan) -> Result<Sql> {
-    let mut binder = Binder::new();
+    compile_select_on(plan, Dialect::Postgres)
+}
+
+/// Compile a `SELECT` for `dialect`. Only the placeholders and case-insensitive
+/// `LIKE` differ; the shape is identical.
+pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
+    let mut binder = Binder::with_dialect(dialect);
     let mut joins = Joins::default();
 
     // Order of work, not order of text: the clauses that bind parameters are
@@ -941,6 +983,15 @@ fn shift_placeholders(sql: &str, by: usize) -> String {
 /// Every row must offer the same columns, which `bulk_create` guarantees by
 /// construction and `create` trivially satisfies.
 pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -> Result<Sql> {
+    compile_insert_on(meta, rows, Dialect::Postgres)
+}
+
+/// Compile an `INSERT … RETURNING *` for `dialect`.
+pub fn compile_insert_on(
+    meta: &'static ModelMeta,
+    rows: &[Vec<(String, Value)>],
+    dialect: Dialect,
+) -> Result<Sql> {
     let first = rows
         .first()
         .ok_or_else(|| Error::Config("insert was given no rows".into()))?;
@@ -954,7 +1005,7 @@ pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -
         fields.push(f);
     }
 
-    let mut binder = Binder::new();
+    let mut binder = Binder::with_dialect(dialect);
     let mut tuples = Vec::new();
     for row in rows {
         if row.len() != first.len() {

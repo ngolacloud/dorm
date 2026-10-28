@@ -26,6 +26,8 @@ members = [
     "crates/dorm-cli",
     # The `dorm.schema` parser + code generator (Prisma-style schema → Rust).
     "crates/dorm-schema",
+    # The SQLite executor: run the ORM's SQLite-dialect compiled SQL (ADR 0002).
+    "crates/dorm-sqlite",
 ]
 
 [workspace.package]
