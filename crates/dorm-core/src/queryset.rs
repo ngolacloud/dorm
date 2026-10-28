@@ -159,6 +159,56 @@ impl<T: Model> Manager<T> {
             Err(e) => Err(e),
         }
     }
+
+    /// Fetch the row matching `lookup` and apply `updates` to it, or insert `new`
+    /// if there is none. Returns whether it was created — Django's
+    /// `update_or_create`.
+    ///
+    /// Like [`get_or_create`](Self::get_or_create), a create that loses a race
+    /// with a concurrent caller is recovered by falling back to the update path,
+    /// so the call is idempotent. `updates` must not touch the columns `lookup`
+    /// filters on — the row is re-read by the same `lookup` to return it.
+    pub async fn update_or_create<N: NewRow<T>>(
+        &self,
+        lookup: Q,
+        new: N,
+        updates: Vec<Assignment>,
+    ) -> Result<(T, bool)> {
+        db::guard_write("update_or_create")?;
+        if QuerySet::<T>::new()
+            .filter(lookup.clone())
+            .first()
+            .await?
+            .is_some()
+        {
+            return Ok((self.apply_and_fetch(lookup, updates).await?, false));
+        }
+        match self.create(new).await {
+            Ok(created) => Ok((created, true)),
+            Err(e) if crate::error::is_unique_violation(&e) => {
+                // Lost the race: update the row the winner inserted and return it.
+                Ok((self.apply_and_fetch(lookup, updates).await?, false))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Apply `updates` to the rows matching `lookup` (a no-op when empty) and
+    /// return the row `lookup` now selects. Shared by the two found-paths of
+    /// [`update_or_create`](Self::update_or_create).
+    async fn apply_and_fetch(&self, lookup: Q, updates: Vec<Assignment>) -> Result<T> {
+        if !updates.is_empty() {
+            QuerySet::<T>::new()
+                .filter(lookup.clone())
+                .update(updates)
+                .await?;
+        }
+        QuerySet::<T>::new()
+            .filter(lookup)
+            .first()
+            .await?
+            .ok_or_else(|| Error::Db("the row vanished during update_or_create".into()))
+    }
 }
 
 /// A lazy, immutable, chainable query.

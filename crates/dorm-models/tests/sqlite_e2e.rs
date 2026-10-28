@@ -217,5 +217,47 @@ fn the_typed_queryset_runs_end_to_end_on_sqlite() {
             0,
             "the savepoint's insert was undone"
         );
+
+        // update_or_create() — Django's sibling of get_or_create. First call
+        // creates (nothing matches the lookup); the second finds and updates.
+        let (made, created) = Tenant::objects()
+            .update_or_create(
+                tenant::slug.eq("uoc"),
+                NewTenant {
+                    slug: "uoc".into(),
+                    name: "First".into(),
+                },
+                vec![],
+            )
+            .await
+            .expect("update_or_create inserts");
+        assert!(created, "the first call created the row");
+        assert_eq!(made.name, "First");
+
+        let (updated, created) = Tenant::objects()
+            .update_or_create(
+                tenant::slug.eq("uoc"),
+                NewTenant {
+                    slug: "uoc".into(),
+                    name: "ignored — the row exists".into(),
+                },
+                vec![Assignment::new(
+                    "name",
+                    F::lit(Value::Text("Renamed".into())),
+                )],
+            )
+            .await
+            .expect("update_or_create updates");
+        assert!(!created, "the second call found the existing row");
+        assert_eq!(updated.name, "Renamed", "the update was applied");
+        assert_eq!(
+            Tenant::objects()
+                .filter(tenant::slug.eq("uoc"))
+                .count()
+                .await
+                .expect("count uoc"),
+            1,
+            "update_or_create did not insert a duplicate"
+        );
     });
 }
