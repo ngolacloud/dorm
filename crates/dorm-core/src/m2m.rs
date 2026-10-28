@@ -19,6 +19,7 @@
 //! needs no database to construct.
 
 use crate::db::{self, Backend};
+use crate::meta::ModelMeta;
 use crate::model::Model;
 use crate::row::Decode;
 use crate::value::Value;
@@ -38,7 +39,18 @@ impl ManyToMany {
     /// "right" model. The columns are read from `J`'s metadata, so a misspelt
     /// field name is a configuration error, not a malformed query.
     pub fn on<J: Model>(a_field: &str, b_field: &str) -> Result<Self> {
-        let j = J::meta();
+        Self::from_meta(J::meta(), a_field, b_field)
+    }
+
+    /// Build from the junction model's registered *name* and its two foreign-key
+    /// field names — the string-keyed counterpart of [`on`](Self::on), for the
+    /// dynamic path (the REPL, or a derive-generated accessor) where the junction
+    /// type is not named in code. The model must be registered.
+    pub fn through(junction: &str, a_field: &str, b_field: &str) -> Result<Self> {
+        Self::from_meta(crate::registry::model(junction)?, a_field, b_field)
+    }
+
+    fn from_meta(j: &'static ModelMeta, a_field: &str, b_field: &str) -> Result<Self> {
         let col = |name: &str| {
             j.field(name).map(|f| f.column).ok_or_else(|| {
                 Error::Config(format!(

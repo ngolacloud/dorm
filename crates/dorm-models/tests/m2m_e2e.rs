@@ -109,6 +109,15 @@ fn many_to_many_through_a_junction_model() {
             .expect("insert book 2");
 
         let link = ManyToMany::on::<Authorship>("author", "book").expect("the junction resolves");
+        // The string-keyed constructor resolves to the same thing via the registry.
+        assert_eq!(
+            format!("{link:?}"),
+            format!(
+                "{:?}",
+                ManyToMany::through("Authorship", "author", "book").expect("through resolves")
+            ),
+            "on::<J> and through(name) agree"
+        );
 
         // add() — Ada wrote both books; Grace wrote the compiler one.
         link.add(ada.pk(), analytical.pk()).await.expect("link 1");
