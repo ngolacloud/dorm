@@ -39,6 +39,12 @@ tokio-postgres = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# Lets the versioned migrator run against SQLite as well as PostgreSQL, by
+# turning on the ORM core's SQLite backend. Off by default so the ordinary build
+# stays PostgreSQL-only, exactly like `dorm-core`'s own `sqlite` feature.
+sqlite = ["dorm-core/sqlite"]
+
 [dev-dependencies]
 insta = { workspace = true }
 # Proves the generated SQLite DDL creates a working database (ADR 0002, brick 1).
