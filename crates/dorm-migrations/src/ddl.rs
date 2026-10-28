@@ -138,12 +138,54 @@ fn column_modifiers(f: &FieldMeta, backend: Backend) -> Result<String> {
 /// PostgreSQL will reject it otherwise, which is the right answer — `sync` is for
 /// additive changes, not backfills.
 pub fn add_column(meta: &ModelMeta, f: &FieldMeta) -> Result<String> {
+    add_column_on(meta, f, Backend::Postgres)
+}
+
+/// `ALTER TABLE … ADD COLUMN …` for `backend` — the additive half of both
+/// [`crate::sync`] and the autodetector. PostgreSQL gets `IF NOT EXISTS` (so the
+/// statement is idempotent and can adopt a column that is already there); SQLite
+/// does not support that clause on `ADD COLUMN`, so it is omitted there.
+pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Result<String> {
+    let guard = match backend {
+        Backend::Postgres => "IF NOT EXISTS ",
+        Backend::Sqlite => "",
+    };
     Ok(format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
+        "ALTER TABLE {} ADD COLUMN {}{} {}",
         meta.table,
+        guard,
         f.column,
-        column_modifiers(f, Backend::Postgres)?
+        column_modifiers(f, backend)?
     ))
+}
+
+/// `ALTER TABLE … DROP COLUMN …` for `backend`. PostgreSQL gets `IF EXISTS`;
+/// SQLite does not support it on `DROP COLUMN`, so it is omitted there. The
+/// autodetector only drops a column the previous snapshot recorded, so the
+/// column is expected to be present.
+pub fn drop_column(table: &str, column: &str, backend: Backend) -> String {
+    let guard = match backend {
+        Backend::Postgres => "IF EXISTS ",
+        Backend::Sqlite => "",
+    };
+    format!("ALTER TABLE {table} DROP COLUMN {guard}{column}")
+}
+
+/// `DROP TABLE IF EXISTS …` — the same on both backends.
+pub fn drop_table(table: &str) -> String {
+    format!("DROP TABLE IF EXISTS {table}")
+}
+
+/// `DROP INDEX IF EXISTS …` for the index [`index_on`] would have created.
+pub fn drop_index(table: &str, column: &str) -> String {
+    format!("DROP INDEX IF EXISTS {}_{}_idx", table, column)
+}
+
+/// `CREATE INDEX IF NOT EXISTS <table>_<column>_idx ON <table> (<column>)` — the
+/// one place the index name is spelled, shared by [`indexes`] and the
+/// autodetector so a dropped index names exactly what a created one made.
+pub fn index_on(table: &str, column: &str) -> String {
+    format!("CREATE INDEX IF NOT EXISTS {table}_{column}_idx ON {table} ({column})")
 }
 
 /// The column's SQL default, if any. An explicit `default = "..."` wins; failing
@@ -209,12 +251,7 @@ pub fn indexes(meta: &ModelMeta) -> Vec<String> {
     meta.fields
         .iter()
         .filter(|f| f.index)
-        .map(|f| {
-            format!(
-                "CREATE INDEX IF NOT EXISTS {}_{}_idx ON {} ({})",
-                meta.table, f.column, meta.table, f.column
-            )
-        })
+        .map(|f| index_on(meta.table, f.column))
         .collect()
 }
 

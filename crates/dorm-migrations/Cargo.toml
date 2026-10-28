@@ -33,6 +33,11 @@ dorm-core = { path = "../dorm-core", version = "0.6.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
+# The autodetector's schema snapshot is serialised so the migration history can
+# persist the state each migration left behind — the role Django's migration
+# state and Prisma's migration history play.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

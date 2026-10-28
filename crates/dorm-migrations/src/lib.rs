@@ -10,15 +10,19 @@
 //! ("The autodetector in `dorm-migrations` will generate the equivalent
 //! from the same metadata"). Until now it did not exist.
 //!
-//! # What it is, and what it is not yet
+//! # What it is
 //!
 //! * [`ddl`] generates the **forward/initial** schema from a set of models —
 //!   enough to create a database, and enough to *adopt* one that already has the
 //!   tables (every statement is `IF NOT EXISTS`). This is the `expand` step of
 //!   `expand → migrate → contract`.
-//! * It does **not** yet diff an existing schema against the models to emit
-//!   `ALTER`/`DROP` (the full autodetector). That is the next step, and it is
-//!   deliberately out of this crate's first version.
+//! * [`autodetect`] diffs a stored [`Snapshot`] of the schema's previous state
+//!   against the current models and emits the **next versioned migration** —
+//!   `CREATE`/`DROP TABLE`, `ADD`/`DROP COLUMN`, `CREATE`/`DROP INDEX` — the
+//!   shape of Django's `makemigrations` and Prisma's `migrate dev`. An in-place
+//!   column alteration or a composite-constraint change is an explicit
+//!   [`Error::UnsupportedChange`] (the table-rebuild path is the next increment),
+//!   never a silent wrong result.
 //!
 //! # The one invariant it keeps
 //!
@@ -29,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod autodetect;
 pub mod ddl;
 pub mod migrator;
 
@@ -45,8 +50,15 @@ pub enum Error {
     /// An error from the ORM core (the database, the pool, a transaction).
     #[error(transparent)]
     Orm(#[from] dorm_core::Error),
+    /// The autodetector found a change it does not emit SQL for in this version:
+    /// an in-place column alteration (type/nullability/uniqueness/default/foreign
+    /// key changed), or a change to a table's composite `UNIQUE`/`CHECK`. The
+    /// message names the table and what changed; the next version handles these.
+    #[error("unsupported schema change: {0}")]
+    UnsupportedChange(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub use autodetect::{autodetect, make_migration, Snapshot};
 pub use migrator::{diff, initial, migrate, sync, Migration};
