@@ -1,6 +1,6 @@
 # ADR 0003 — a backend-generic `dorm-core::db`
 
-Status: accepted (design); implementation pending a dedicated effort · 2026-10-28
+Status: accepted · implemented 2026-10-28 (dorm-core 0.6.0)
 
 ## Context
 

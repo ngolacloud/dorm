@@ -32,7 +32,7 @@
 //! ```
 //!
 //! Scalars: `Int`→i32, `BigInt`→i64, `String`→String, `Boolean`→bool,
-//! `DateTime`→DateTime<Utc>, `Decimal`→Decimal, `Json`→serde_json::Value,
+//! `DateTime`→`DateTime<Utc>`, `Decimal`→Decimal, `Json`→serde_json::Value,
 //! `Uuid`→uuid::Uuid. `@id @default(autoincrement())` becomes a `BIGSERIAL`
 //! (i64) key. `@default(now())`→`auto_now_add`, `@updatedAt`→`auto_now`,
 //! `@db.VarChar(n)`→`max_length`, `@map`/`@@map` rename a column/table, `?`

@@ -1,6 +1,9 @@
 [package]
 name = "dorm-derive"
-version.workspace = true
+# Independent of the workspace version: `from_row` now decodes through the
+# backend-generic `Row::try_get::<T>` (ADR 0003), so the generated code is paired
+# with dorm-core 0.6 and cannot run against 0.5.
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

@@ -1,7 +1,9 @@
 [package]
 name = "dorm-core"
-# Independent: this release adds the `registry::validate` API.
-version = "0.5.0"
+# Independent: this release adds the backend-generic `db` (ADR 0003) — the `row`
+# module, the `Decode` seam, `db::{fetch, run, run_ddl, dialect}`, the
+# `compile_*_on` round-out, and the opt-in `sqlite` feature.
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -39,6 +41,18 @@ tokio-postgres = { workspace = true, features = [
 ] }
 deadpool-postgres = { workspace = true }
 inventory = { workspace = true }
+# The SQLite driver, opt-in behind the `sqlite` feature (ADR 0003). `bundled`
+# compiles SQLite in, so a user who turns the feature on needs no system
+# library; a user who leaves it off pulls neither this crate nor SQLite.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+# A process talks to one backend, chosen by the DSN (ADR 0003). PostgreSQL is
+# the default so a user who names no feature gets today's behaviour unchanged
+# and pulls no SQLite; `sqlite` adds the second backend.
+[features]
+default = ["postgres"]
+postgres = []
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 insta = { workspace = true }

@@ -1,14 +1,16 @@
-//! Apply migrations: versioned, advisory-locked, idempotent, and able to adopt a
-//! database that already carries the schema.
+//! Apply migrations: versioned, idempotent, backend-agnostic, and able to adopt
+//! a database that already carries the schema.
 //!
 //! This mirrors the discipline `delonix-api`'s hand-written `CpStore` migrator
-//! already keeps — a versions table, an advisory lock, one transaction per
-//! step — so that when ADR 0072 folds the two, there is one migrator, not two
-//! with different rules.
+//! already keeps — a versions table, one transaction per step, and (on
+//! PostgreSQL) an advisory lock — so that when ADR 0072 folds the two, there is
+//! one migrator, not two with different rules. [`migrate`] runs on PostgreSQL
+//! and SQLite alike; see its docs for how each backend is serialised.
 
 use crate::{ddl, Result};
 use dorm_core::db;
 use dorm_core::meta::ModelMeta;
+use dorm_core::value::Value;
 
 /// A versioned migration: a monotonically increasing version, a name, and the
 /// statements to run. The statements are expected to be idempotent
@@ -51,18 +53,36 @@ const LEDGER: &str = "orm_schema_migrations";
 const MIGRATE_LOCK: i64 = 0x0072_0d61;
 
 /// Apply the migrations not yet recorded in `orm_schema_migrations`, in order,
-/// under an advisory lock, each inside the transaction that records it.
+/// each inside the transaction that records it — the `prisma migrate deploy` /
+/// Django `migrate` shape. Backend-agnostic: it runs on PostgreSQL and SQLite
+/// alike, choosing its statement forms from the DSN's backend.
 ///
 /// Idempotent in two ways: an already-recorded version is skipped, and because
 /// the statements use `IF NOT EXISTS`, a first run against a database that
 /// already carries the schema records the version without altering anything.
 ///
+/// # How the two backends are kept safe
+///
+/// On PostgreSQL an advisory transaction lock serialises two `migrate` calls in
+/// *different processes*; within one process the surrounding transaction already
+/// does. SQLite needs no advisory lock: [`db::atomic`] holds its single
+/// connection for the whole scope, and SQLite's own file lock serialises writers
+/// across processes. The ledger's `BIGINT`/`TEXT` column types and the
+/// `IF NOT EXISTS` guard are accepted verbatim by both.
+///
 /// Returns the versions applied this call — empty when everything was current.
 pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
     db::guard_write("migrate")?;
+    let is_postgres = db::backend_of(&db::dsn()?) == db::Backend::Postgres;
     let applied = db::atomic(|_tx| async move {
-        db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
-        db::execute(
+        if is_postgres {
+            db::run(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[Value::I64(MIGRATE_LOCK)],
+            )
+            .await?;
+        }
+        db::run(
             &format!(
                 "CREATE TABLE IF NOT EXISTS {LEDGER} (\
                  version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_unix BIGINT NOT NULL)"
@@ -72,11 +92,19 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
         .await?;
 
         let done: std::collections::HashSet<i64> =
-            db::query(&format!("SELECT version FROM {LEDGER}"), &[])
+            db::fetch(&format!("SELECT version FROM {LEDGER}"), &[])
                 .await?
                 .iter()
-                .map(|r| r.get::<_, i64>(0))
-                .collect();
+                .map(|r| r.try_get::<i64>(0))
+                .collect::<dorm_core::Result<_>>()?;
+
+        // `$n` on PostgreSQL, `?n` on SQLite — the one placeholder difference the
+        // two dialects force; the values are identical.
+        let insert = if is_postgres {
+            format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES ($1, $2, $3)")
+        } else {
+            format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES (?1, ?2, ?3)")
+        };
 
         let mut just_applied = Vec::new();
         for m in migrations {
@@ -84,11 +112,15 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
                 continue;
             }
             for stmt in &m.statements {
-                db::execute(stmt, &[]).await?;
+                db::run(stmt, &[]).await?;
             }
-            db::execute(
-                &format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES ($1, $2, $3)"),
-                &[&m.version, &m.name, &now_unix()],
+            db::run(
+                &insert,
+                &[
+                    Value::I64(m.version),
+                    Value::Text(m.name.clone()),
+                    Value::I64(now_unix()),
+                ],
             )
             .await?;
             just_applied.push(m.version);

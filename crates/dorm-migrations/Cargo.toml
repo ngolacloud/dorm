@@ -2,7 +2,7 @@
 name = "dorm-migrations"
 # Independent of the 0.2.x libraries: this release adds `sync` (additive
 # schema push), a new minor on its own line, while dorm-core/derive stay 0.2.x.
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -29,10 +29,21 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # Both a path (for in-workspace builds) and a version (required by crates.io,
 # which resolves it to the published `dorm-core`). They must be kept in step.
-dorm-core = { path = "../dorm-core", version = "0.5.0" }
+dorm-core = { path = "../dorm-core", version = "0.6.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
+# The autodetector's schema snapshot is serialised so the migration history can
+# persist the state each migration left behind — the role Django's migration
+# state and Prisma's migration history play.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Lets the versioned migrator run against SQLite as well as PostgreSQL, by
+# turning on the ORM core's SQLite backend. Off by default so the ordinary build
+# stays PostgreSQL-only, exactly like `dorm-core`'s own `sqlite` feature.
+sqlite = ["dorm-core/sqlite"]
 
 [dev-dependencies]
 insta = { workspace = true }
