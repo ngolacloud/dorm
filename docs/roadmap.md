@@ -61,15 +61,16 @@ errors rather than wrong results.
   - *Brick 1* — the DDL dialect
     (`dorm_migrations::ddl::schema_for_on(models, Backend::Sqlite)`) generates
     SQLite schema from the same `ModelMeta`.
-  - *Brick 2 (partial)* — the compiler is dialect-aware
-    (`compile_select_on`/`compile_insert_on` with `Dialect::Sqlite`: `?n`
-    placeholders, `LIKE`), and the new `dorm-sqlite` crate executes that compiled
-    SQL against `rusqlite` and decodes rows to `Value`s — proven with an
-    insert/select round-trip. **Remaining**: `UPDATE`/`DELETE`/aggregate dialect
-    (placeholder shifting in subqueries), and wiring SQLite into `QuerySet`'s
-    async terminals via one backend-generic `dorm-core::db` (so `.all().await`
-    chooses the backend). PostgreSQL stays the default throughout
-    ([ADR 0002](adr/0002-multi-backend.md)).
+  - *Brick 2 (compiler + executor)* — the compiler is dialect-aware across
+    `compile_{select,insert,update,delete,count}_on` with `Dialect::Sqlite`
+    (`?n` placeholders — renumbered correctly through the `UPDATE`/`DELETE`
+    subqueries — `LIKE`, `CURRENT_TIMESTAMP`), and `dorm-sqlite` executes that
+    compiled SQL against `rusqlite`, decoding rows to `Value`s. **Full CRUD +
+    count proven** over a real SQLite database (insert `RETURNING`, select,
+    update, delete). **Remaining**: wiring SQLite into `QuerySet`'s async
+    terminals (`.all().await`) via one backend-generic `dorm-core::db` so the
+    backend is chosen there, and aggregate/exists dialect. PostgreSQL stays the
+    default throughout ([ADR 0002](adr/0002-multi-backend.md)).
 - **Tier 2**: MySQL; MariaDB with its own tests and documented differences.
 - **Enterprise**: Microsoft SQL Server; Oracle.
 - Other engines evaluated separately.

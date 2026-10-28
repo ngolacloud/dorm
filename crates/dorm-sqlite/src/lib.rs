@@ -140,7 +140,11 @@ fn sqlite_err(e: rusqlite::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dorm_core::compiler::{compile_insert_on, compile_select_on, Dialect, Plan};
+    use dorm_core::compiler::{
+        compile_count_on, compile_delete_on, compile_insert_on, compile_select_on,
+        compile_update_on, Dialect, Plan,
+    };
+    use dorm_core::expr::{Assignment, F, Q};
     use dorm_core::meta::{FieldMeta, ModelMeta};
 
     const FIELDS: &[FieldMeta] = &[
@@ -232,5 +236,37 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], Value::Text("widget".into()));
         assert_eq!(rows[0]["qty"], Value::I32(5));
+
+        // UPDATE … WHERE pk IN (subquery): the SET placeholder and the subquery's
+        // are renumbered as `?1`, `?2` for SQLite.
+        let mut filtered = Plan::new(&WIDGET);
+        filtered.filters.push(Q::new("id", Value::I64(1)));
+        let update = compile_update_on(
+            &filtered,
+            &[Assignment::new("qty", F::lit(Value::I64(99)))],
+            Dialect::Sqlite,
+        )
+        .expect("compile update");
+        assert!(
+            update.text.contains("?1") && update.text.contains("?2"),
+            "{}",
+            update.text
+        );
+        assert_eq!(execute(&conn, &update).expect("update"), 1);
+        let after = query(&conn, &select).expect("re-select");
+        assert_eq!(after[0]["qty"], Value::I32(99), "update applied");
+
+        // COUNT, then DELETE, then COUNT again.
+        let count = compile_count_on(&plan, Dialect::Sqlite).expect("compile count");
+        assert_eq!(
+            query(&conn, &count).expect("count")[0]["count"],
+            Value::I64(1)
+        );
+        let delete = compile_delete_on(&filtered, Dialect::Sqlite).expect("compile delete");
+        assert_eq!(execute(&conn, &delete).expect("delete"), 1);
+        assert_eq!(
+            query(&conn, &count).expect("count 0")[0]["count"],
+            Value::I64(0)
+        );
     }
 }

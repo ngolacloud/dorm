@@ -721,6 +721,11 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
 
 /// Compile a `COUNT(*)` over the same conditions.
 pub fn compile_count(plan: &Plan) -> Result<Sql> {
+    compile_count_on(plan, Dialect::Postgres)
+}
+
+/// Compile `COUNT(*)` for `dialect`.
+pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
     // An annotated or distinct plan has to be counted as a subquery: counting
     // the grouped rows is the question being asked, and `COUNT(*)` over the
     // groups would answer a different one.
@@ -729,7 +734,7 @@ pub fn compile_count(plan: &Plan) -> Result<Sql> {
         || plan.limit.is_some()
         || plan.offset.is_some()
     {
-        let inner = compile_select(plan)?;
+        let inner = compile_select_on(plan, dialect)?;
         return Ok(Sql {
             text: format!("SELECT COUNT(*) FROM ({}) AS _c", inner.text),
             params: inner.params,
@@ -740,7 +745,7 @@ pub fn compile_count(plan: &Plan) -> Result<Sql> {
         });
     }
 
-    let mut binder = Binder::new();
+    let mut binder = Binder::with_dialect(dialect);
     let mut joins = Joins::default();
     let (where_clause, _) = compile_conditions(plan, &mut binder, &mut joins)?;
 
@@ -858,6 +863,11 @@ fn compile_f(plan: &Plan, e: &F, binder: &mut Binder) -> Result<String> {
 /// (subquery)` instead, which is both correct and the only form that keeps
 /// `update()` meaningful after `filter(tenant__slug=…)`.
 pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
+    compile_update_on(plan, assignments, Dialect::Postgres)
+}
+
+/// Compile an `UPDATE … WHERE pk IN (subquery)` for `dialect`.
+pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Dialect) -> Result<Sql> {
     if assignments.is_empty() {
         return Err(Error::Config("update() was given nothing to set".into()));
     }
@@ -868,7 +878,7 @@ pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
         ))
     })?;
 
-    let mut binder = Binder::new();
+    let mut binder = Binder::with_dialect(dialect);
     let mut sets = Vec::new();
     for a in assignments {
         let field = plan
@@ -885,16 +895,20 @@ pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
         ));
     }
     // `auto_now` columns are refreshed on every write without the caller asking.
+    let now = match dialect {
+        Dialect::Postgres => "now()",
+        Dialect::Sqlite => "CURRENT_TIMESTAMP",
+    };
     for f in plan.model.fields {
         if f.auto_now && !assignments.iter().any(|a| a.field == f.name) {
-            sets.push(format!("{} = now()", quote(f.column)?));
+            sets.push(format!("{} = {now}", quote(f.column)?));
         }
     }
 
     let mut selector = plan.clone();
     selector.unordered = true;
     selector.values = vec![pk.name.to_string()];
-    let inner = compile_select(&selector)?;
+    let inner = compile_select_on(&selector, dialect)?;
 
     let mut text = format!(
         "UPDATE {} SET {}",
@@ -904,7 +918,7 @@ pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
     // The subquery's own placeholders have to be renumbered to sit after the SET
     // clause's. Done by compiling the selector against a binder that already
     // holds the SET parameters.
-    let shifted = shift_placeholders(&inner.text, binder.params.len());
+    let shifted = shift_placeholders(&inner.text, binder.params.len(), dialect);
     write!(text, " WHERE {} IN ({})", quote(pk.column)?, shifted)
         .map_err(|e| Error::Config(e.to_string()))?;
     let mut params = binder.params;
@@ -919,6 +933,11 @@ pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
 
 /// Compile a `DELETE`, by the same subquery route as `compile_update`.
 pub fn compile_delete(plan: &Plan) -> Result<Sql> {
+    compile_delete_on(plan, Dialect::Postgres)
+}
+
+/// Compile a `DELETE … WHERE pk IN (subquery)` for `dialect`.
+pub fn compile_delete_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
     let pk = plan.model.primary_key().ok_or_else(|| {
         Error::Config(format!(
             "model `{}` declares no primary key, so it cannot be deleted by query",
@@ -928,7 +947,7 @@ pub fn compile_delete(plan: &Plan) -> Result<Sql> {
     let mut selector = plan.clone();
     selector.unordered = true;
     selector.values = vec![pk.name.to_string()];
-    let inner = compile_select(&selector)?;
+    let inner = compile_select_on(&selector, dialect)?;
 
     Ok(Sql {
         text: format!(
@@ -948,14 +967,18 @@ pub fn compile_delete(plan: &Plan) -> Result<Sql> {
 /// Scanning for `$` is safe here because the only text this is ever applied to
 /// is compiler output, where every literal has already become a placeholder —
 /// there is no string constant left that could contain a `$`.
-fn shift_placeholders(sql: &str, by: usize) -> String {
+fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     if by == 0 {
         return sql.to_string();
     }
+    let marker = match dialect {
+        Dialect::Postgres => '$',
+        Dialect::Sqlite => '?',
+    };
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '$' {
+        if c != marker {
             out.push(c);
             continue;
         }
@@ -966,11 +989,11 @@ fn shift_placeholders(sql: &str, by: usize) -> String {
         }
         match digits.parse::<usize>() {
             Ok(n) => {
-                out.push('$');
+                out.push(marker);
                 out.push_str(&(n + by).to_string());
             }
             Err(_) => {
-                out.push('$');
+                out.push(marker);
                 out.push_str(&digits);
             }
         }
@@ -1082,13 +1105,19 @@ mod tests {
     #[test]
     fn placeholders_are_renumbered_when_a_fragment_is_spliced_after_others() {
         assert_eq!(
-            shift_placeholders("a = $1 AND b = $2", 2),
+            shift_placeholders("a = $1 AND b = $2", 2, Dialect::Postgres),
             "a = $3 AND b = $4"
         );
         // Double digits must not be split into `$1` plus a stray `0`.
-        assert_eq!(shift_placeholders("x = $10", 1), "x = $11");
-        assert_eq!(shift_placeholders("no params", 3), "no params");
-        assert_eq!(shift_placeholders("a = $1", 0), "a = $1");
+        assert_eq!(
+            shift_placeholders("x = $10", 1, Dialect::Postgres),
+            "x = $11"
+        );
+        assert_eq!(
+            shift_placeholders("no params", 3, Dialect::Postgres),
+            "no params"
+        );
+        assert_eq!(shift_placeholders("a = $1", 0, Dialect::Postgres), "a = $1");
     }
 
     #[test]
