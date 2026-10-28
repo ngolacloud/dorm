@@ -14,13 +14,14 @@ jobs:
       - run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: The tag must match the dorm-cli version
+      - name: Report crate versions (the tag is a release marker)
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          ver=$(cargo metadata --no-deps --format-version 1 \
-                | jq -r '.packages[] | select(.name=="dorm-cli") | .version')
-          echo "tag=$tag dorm-cli=$ver"
-          test "$tag" = "$ver" || { echo "::error::tag v$tag != dorm-cli version $ver"; exit 1; }
+          # Crates are versioned independently (ADR 0002 / per-crate releases), so
+          # the git tag is a release marker, not a single crate version. What gets
+          # published is decided per-crate below: anything not yet on the index.
+          echo "tag: $GITHUB_REF_NAME"
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | "  \(.name) \(.version)"'
 
       - name: Test
         run: cargo test --all-targets

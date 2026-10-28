@@ -10,17 +10,30 @@ use dorm_core::meta::{FieldMeta, ModelMeta};
 use dorm_core::registry;
 use dorm_core::value::FieldType;
 
-/// The full schema for an ordered set of models: each `CREATE TABLE` followed by
-/// its `CREATE INDEX`es. Statements are terminated by `;\n`, so a caller can run
-/// them by splitting on `";\n"` (which is exactly what the integration harness
-/// already does).
+/// The SQL backend a schema is generated for. The portable core — the columns,
+/// the `UNIQUE`/`CHECK`/`REFERENCES` constraints, the indexes — is the same; the
+/// type names, the serial primary key and the `now()` default differ (ADR 0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Postgres,
+    Sqlite,
+}
+
+/// The full schema for an ordered set of models, for PostgreSQL. See
+/// [`schema_for_on`] for another backend.
 pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
+    schema_for_on(models, Backend::Postgres)
+}
+
+/// The full schema for an ordered set of models, for `backend`: each
+/// `CREATE TABLE` followed by its `CREATE INDEX`es, terminated by `;\n`.
+pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<String> {
     let mut out = String::new();
     for (i, m) in models.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&create_table(m)?);
+        out.push_str(&create_table_on(m, backend)?);
         out.push_str(";\n");
         for idx in indexes(m) {
             out.push_str(&idx);
@@ -30,16 +43,22 @@ pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
     Ok(out)
 }
 
-/// `CREATE TABLE IF NOT EXISTS <table> ( <columns>, <table constraints> )`.
+/// `CREATE TABLE …` for PostgreSQL. See [`create_table_on`] for another backend.
+pub fn create_table(meta: &ModelMeta) -> Result<String> {
+    create_table_on(meta, Backend::Postgres)
+}
+
+/// `CREATE TABLE IF NOT EXISTS <table> ( <columns>, <table constraints> )` for
+/// `backend`.
 ///
 /// Columns come first, in metadata order; then the table-level constraints —
 /// composite `UNIQUE` groups, then `CHECK`s — matching the order the
 /// hand-written schemas use.
-pub fn create_table(meta: &ModelMeta) -> Result<String> {
+pub fn create_table_on(meta: &ModelMeta, backend: Backend) -> Result<String> {
     let mut parts =
         Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
     for f in meta.fields {
-        parts.push(column_def(f)?);
+        parts.push(column_def(f, backend)?);
     }
     for group in meta.unique_together {
         parts.push(format!("UNIQUE ({})", group.join(", ")));
@@ -56,40 +75,46 @@ pub fn create_table(meta: &ModelMeta) -> Result<String> {
 
 /// One column definition.
 ///
-/// A serial primary key is the `i64` PK with no explicit default — it becomes
-/// `BIGSERIAL`. A primary key of any other type (a `TEXT` key like the DBaaS
-/// `tenant_databases.addon_name`) keeps its own type: the "PK with no default ⇒
-/// serial" shortcut that `FieldMeta::is_database_generated` uses on the *insert*
-/// path would be wrong here, and the schema must not inherit that conflation.
-fn column_def(f: &FieldMeta) -> Result<String> {
+/// A serial primary key is the `i64` PK with no explicit default — `BIGSERIAL`
+/// on PostgreSQL, `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. A primary key of
+/// any other type (a `TEXT` key like the DBaaS `tenant_databases.addon_name`)
+/// keeps its own type: the "PK with no default ⇒ serial" shortcut that
+/// `FieldMeta::is_database_generated` uses on the *insert* path would be wrong
+/// here, and the schema must not inherit that conflation.
+fn column_def(f: &FieldMeta, backend: Backend) -> Result<String> {
     if f.primary_key {
-        if matches!(f.ty, FieldType::I64) && effective_default(f).is_none() && f.relation.is_none()
+        if matches!(f.ty, FieldType::I64)
+            && effective_default(f, backend).is_none()
+            && f.relation.is_none()
         {
-            return Ok(format!("{} BIGSERIAL PRIMARY KEY", f.column));
+            return Ok(match backend {
+                Backend::Postgres => format!("{} BIGSERIAL PRIMARY KEY", f.column),
+                Backend::Sqlite => format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", f.column),
+            });
         }
-        let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f)?);
-        if let Some(d) = effective_default(f) {
+        let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f, backend)?);
+        if let Some(d) = effective_default(f, backend) {
             s.push_str(&format!(" DEFAULT {d}"));
         }
         return Ok(s);
     }
 
-    Ok(format!("{} {}", f.column, column_modifiers(f)?))
+    Ok(format!("{} {}", f.column, column_modifiers(f, backend)?))
 }
 
 /// Everything after the column name in a definition: the type, then
 /// `NOT NULL` / `UNIQUE` / `DEFAULT` / `REFERENCES` in that order. Shared by the
 /// `CREATE TABLE` column list and the `ALTER TABLE … ADD COLUMN` of [`add_column`]
 /// so the two never diverge.
-fn column_modifiers(f: &FieldMeta) -> Result<String> {
-    let mut s = column_type(f)?;
+fn column_modifiers(f: &FieldMeta, backend: Backend) -> Result<String> {
+    let mut s = column_type(f, backend)?;
     if !f.nullable {
         s.push_str(" NOT NULL");
     }
     if f.unique {
         s.push_str(" UNIQUE");
     }
-    if let Some(d) = effective_default(f) {
+    if let Some(d) = effective_default(f, backend) {
         s.push_str(&format!(" DEFAULT {d}"));
     }
     if let Some(rel) = f.relation {
@@ -105,8 +130,9 @@ fn column_modifiers(f: &FieldMeta) -> Result<String> {
 }
 
 /// `ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <column> <modifiers>` for one
-/// field — the additive half of [`crate::sync`]. Idempotent, and never a primary
-/// key: adding a surrogate key to a populated table is not a thing `sync` does.
+/// field — the additive half of [`crate::sync`], which runs over PostgreSQL.
+/// Idempotent, and never a primary key: adding a surrogate key to a populated
+/// table is not a thing `sync` does.
 ///
 /// A new `NOT NULL` column with no default is only safe on an empty table;
 /// PostgreSQL will reject it otherwise, which is the right answer — `sync` is for
@@ -116,36 +142,56 @@ pub fn add_column(meta: &ModelMeta, f: &FieldMeta) -> Result<String> {
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
         meta.table,
         f.column,
-        column_modifiers(f)?
+        column_modifiers(f, Backend::Postgres)?
     ))
 }
 
 /// The column's SQL default, if any. An explicit `default = "..."` wins; failing
-/// that, an `auto_now_add`/`auto_now` column gets `now()` as a database-level
-/// safety net (the ORM also stamps the value in Rust on write, so this default
-/// only ever applies if a row were inserted without the column — it never is).
-/// This is exactly how the hand-written schema spelled these columns.
-fn effective_default(f: &FieldMeta) -> Option<String> {
+/// that, an `auto_now_add`/`auto_now` column gets the backend's "now" as a
+/// database-level safety net (the ORM also stamps the value in Rust on write, so
+/// this default only ever applies if a row were inserted without the column — it
+/// never is).
+fn effective_default(f: &FieldMeta, backend: Backend) -> Option<String> {
     f.default.map(ToString::to_string).or_else(|| {
         if f.auto_now_add || f.auto_now {
-            Some("now()".to_string())
+            Some(match backend {
+                Backend::Postgres => "now()".to_string(),
+                Backend::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+            })
         } else {
             None
         }
     })
 }
 
-/// The SQL type for a column. A foreign key adopts the type of the primary key
-/// it points at; every other column uses its own field type.
-fn column_type(f: &FieldMeta) -> Result<String> {
-    match f.relation {
+/// The SQL type for a column on `backend`. A foreign key adopts the type of the
+/// primary key it points at; every other column uses its own field type.
+fn column_type(f: &FieldMeta, backend: Backend) -> Result<String> {
+    let ty = match f.relation {
         Some(rel) => {
             let target =
                 registry::model(rel.model).map_err(|_| Error::UnknownRelationTarget(rel.model))?;
-            let pk = target.primary_key().ok_or(Error::NoPrimaryKey(rel.model))?;
-            Ok(pk.ty.sql_type().to_string())
+            target
+                .primary_key()
+                .ok_or(Error::NoPrimaryKey(rel.model))?
+                .ty
         }
-        None => Ok(f.ty.sql_type().to_string()),
+        None => f.ty,
+    };
+    Ok(sql_type(ty, backend))
+}
+
+/// A field type's column type on `backend`. PostgreSQL uses the ORM core's
+/// mapping; SQLite collapses onto its storage classes (ADR 0002).
+fn sql_type(ty: FieldType, backend: Backend) -> String {
+    match backend {
+        Backend::Postgres => ty.sql_type().to_string(),
+        Backend::Sqlite => match ty {
+            FieldType::I32 | FieldType::I64 | FieldType::Bool => "INTEGER",
+            FieldType::Text | FieldType::Timestamp | FieldType::Uuid | FieldType::Json => "TEXT",
+            FieldType::Decimal => "NUMERIC",
+        }
+        .to_string(),
     }
 }
 
@@ -202,7 +248,10 @@ mod tests {
             primary_key: true,
             ..field("id", FieldType::I64)
         };
-        assert_eq!(column_def(&f).unwrap(), "id BIGSERIAL PRIMARY KEY");
+        assert_eq!(
+            column_def(&f, Backend::Postgres).unwrap(),
+            "id BIGSERIAL PRIMARY KEY"
+        );
     }
 
     #[test]
@@ -213,7 +262,10 @@ mod tests {
             primary_key: true,
             ..field("addon_name", FieldType::Text)
         };
-        assert_eq!(column_def(&f).unwrap(), "addon_name TEXT PRIMARY KEY");
+        assert_eq!(
+            column_def(&f, Backend::Postgres).unwrap(),
+            "addon_name TEXT PRIMARY KEY"
+        );
     }
 
     #[test]
@@ -222,7 +274,10 @@ mod tests {
             unique: true,
             ..field("slug", FieldType::Text)
         };
-        assert_eq!(column_def(&f).unwrap(), "slug TEXT NOT NULL UNIQUE");
+        assert_eq!(
+            column_def(&f, Backend::Postgres).unwrap(),
+            "slug TEXT NOT NULL UNIQUE"
+        );
     }
 
     #[test]
@@ -232,7 +287,7 @@ mod tests {
             ..field("created_at", FieldType::Timestamp)
         };
         assert_eq!(
-            column_def(&f).unwrap(),
+            column_def(&f, Backend::Postgres).unwrap(),
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
         );
     }
@@ -243,17 +298,17 @@ mod tests {
             nullable: true,
             ..field("note", FieldType::Text)
         };
-        assert_eq!(column_def(&f).unwrap(), "note TEXT");
+        assert_eq!(column_def(&f, Backend::Postgres).unwrap(), "note TEXT");
     }
 
     #[test]
     fn jsonb_and_bigint_map_from_their_field_types() {
         assert_eq!(
-            column_def(&field("doc", FieldType::Json)).unwrap(),
+            column_def(&field("doc", FieldType::Json), Backend::Postgres).unwrap(),
             "doc JSONB NOT NULL"
         );
         assert_eq!(
-            column_def(&field("n", FieldType::I64)).unwrap(),
+            column_def(&field("n", FieldType::I64), Backend::Postgres).unwrap(),
             "n BIGINT NOT NULL"
         );
     }
@@ -389,6 +444,108 @@ mod tests {
              UNIQUE (a, b),\n    \
              UNIQUE (c),\n    \
              CHECK (a <> '')\n)"
+        );
+    }
+
+    // A small model used by the SQLite dialect tests: a serial key, a text
+    // column, and an `auto_now_add` timestamp.
+    const NOTE_FIELDS: &[FieldMeta] = &[
+        FieldMeta {
+            name: "id",
+            column: "id",
+            ty: FieldType::I64,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+        FieldMeta {
+            name: "title",
+            column: "title",
+            ty: FieldType::Text,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: false,
+            max_length: Some(200),
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+        FieldMeta {
+            name: "created_at",
+            column: "created_at",
+            ty: FieldType::Timestamp,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: None,
+            auto_now_add: true,
+            auto_now: false,
+            relation: None,
+        },
+    ];
+    const NOTE: ModelMeta = ModelMeta {
+        name: "Note",
+        table: "notes",
+        fields: NOTE_FIELDS,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    #[test]
+    fn sqlite_maps_the_serial_key_the_types_and_the_now_default() {
+        let ddl = schema_for_on(&[&NOTE], Backend::Sqlite).unwrap();
+        assert!(
+            ddl.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("title TEXT NOT NULL"), "{ddl}");
+        assert!(
+            ddl.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "{ddl}"
+        );
+        // The PostgreSQL spelling must be absent.
+        assert!(!ddl.contains("BIGSERIAL"), "{ddl}");
+        assert!(!ddl.contains("TIMESTAMPTZ"), "{ddl}");
+    }
+
+    #[test]
+    fn sqlite_schema_creates_a_working_database() {
+        // The real proof: the generated SQLite DDL creates a usable schema, and a
+        // row round-trips — the serial key assigns, the `now()` default fills.
+        let ddl = schema_for_on(&[&NOTE], Backend::Sqlite).unwrap();
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(&ddl).expect("apply schema");
+        conn.execute("INSERT INTO notes (title) VALUES ('hello')", [])
+            .expect("insert");
+        let (id, title): (i64, String) = conn
+            .query_row("SELECT id, title FROM notes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("select");
+        assert_eq!(id, 1);
+        assert_eq!(title, "hello");
+        let with_ts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM notes WHERE created_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            with_ts, 1,
+            "the CURRENT_TIMESTAMP default filled created_at"
         );
     }
 }

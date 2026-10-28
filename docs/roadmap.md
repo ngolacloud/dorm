@@ -57,8 +57,12 @@ trait** that separates the portable core from each engine's dialect; the
 compiler emits backend-aware SQL; unsupported capabilities return explicit
 errors rather than wrong results.
 
-- **Tier 1**: PostgreSQL (shipped), **SQLite** (file + in-memory, in the test
-  matrix from day one — see below).
+- **Tier 1**: PostgreSQL (shipped), **SQLite** — brick 1 shipped: the DDL
+  dialect (`dorm_migrations::ddl::schema_for_on(models, Backend::Sqlite)`)
+  generates SQLite schema from the same `ModelMeta`, proven creating a working
+  SQLite database with `rusqlite` (serial key, types, `now()` default). Querying
+  SQLite through the ORM is brick 2 — the driver trait in `dorm-core::db`
+  ([ADR 0002](adr/0002-multi-backend.md)).
 - **Tier 2**: MySQL; MariaDB with its own tests and documented differences.
 - **Enterprise**: Microsoft SQL Server; Oracle.
 - Other engines evaluated separately.

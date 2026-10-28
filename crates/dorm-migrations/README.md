@@ -9,6 +9,11 @@ database).
 It depends only on [`dorm-core`](https://crates.io/crates/dorm-core): the schema
 is derived from the registry, never from a hand-written list.
 
+Multi-backend DDL (ADR 0002): `ddl::schema_for_on(models, Backend::Sqlite)`
+generates SQLite-flavoured schema from the same models — `INTEGER PRIMARY KEY
+AUTOINCREMENT`, SQLite storage classes, `CURRENT_TIMESTAMP` — proven to create a
+working SQLite database. The default `schema_for` stays PostgreSQL.
+
 See the [project README](https://github.com/ngolacloud/dorm) for the full guide.
 
 ## License

@@ -2,7 +2,7 @@
 name = "dorm-migrations"
 # Independent of the 0.2.x libraries: this release adds `sync` (additive
 # schema push), a new minor on its own line, while dorm-core/derive stay 0.2.x.
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -36,3 +36,6 @@ tokio-postgres = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# Proves the generated SQLite DDL creates a working database (ADR 0002, brick 1).
+# `bundled` compiles SQLite, so the test needs no system library.
+rusqlite = { version = "0.31", features = ["bundled"] }
