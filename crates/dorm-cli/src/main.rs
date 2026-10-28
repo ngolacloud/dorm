@@ -24,6 +24,7 @@
 //! Every read command takes `--json` for a stable, scriptable object. Human text
 //! is the default. Credentials are never printed — a DSN is always redacted.
 
+use std::fmt::Write as _;
 use std::process::{Command, ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -172,6 +173,13 @@ enum DbAction {
         /// `--where slug=acme`.
         #[arg(long = "where", value_name = "COL=VALUE")]
         filter: Option<String>,
+    },
+    /// Introspect a live PostgreSQL schema into a `dorm.schema` (the reverse of
+    /// `dorm generate`). Approximate — review the result.
+    Pull {
+        /// Where to write the schema.
+        #[arg(long, default_value = "dorm.schema")]
+        out: String,
     },
 }
 
@@ -466,6 +474,7 @@ async fn run_db(action: DbAction, json: bool) -> CliResult {
             limit,
             filter,
         } => db_rows(&table, limit, filter.as_deref(), json).await,
+        DbAction::Pull { out } => db_pull(&out).await,
     }
 }
 
@@ -623,6 +632,160 @@ async fn db_rows(table: &str, limit: i64, filter: Option<&str>, json: bool) -> C
         if cells.len() == 1 { "" } else { "s" }
     );
     Ok(0)
+}
+
+/// `dorm db pull`: introspect the live PostgreSQL `public` schema into a
+/// `dorm.schema`. Approximate by design — it recovers tables, columns, types,
+/// primary keys (serial ones become `@id @default(autoincrement())`), nullability
+/// and foreign keys; it does not yet recover unique/index/length/check/ordering,
+/// and relation `onDelete` is a guess. The header says so.
+async fn db_pull(out: &str) -> CliResult {
+    let tables: Vec<String> = db::query(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+         AND table_name <> 'orm_schema_migrations' ORDER BY table_name",
+        &[],
+    )
+    .await?
+    .iter()
+    .map(|r| r.get::<_, String>(0))
+    .collect();
+
+    let mut doc = String::from(
+        "// Pulled by `dorm db pull` — approximate; review before use.\n\
+         // Not recovered: unique/index, column lengths, checks, ordering, and\n\
+         // relation onDelete (defaulted). Re-run `dorm generate` after editing.\n\n\
+         datasource db {\n  provider = \"postgresql\"\n  url      = env(\"DELONIX_ORM_DSN\")\n}\n",
+    );
+
+    for table in &tables {
+        // Primary-key columns.
+        let pk: std::collections::HashSet<String> = db::query(
+            "SELECT kcu.column_name FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name \
+             AND tc.table_schema = kcu.table_schema \
+             WHERE tc.table_schema='public' AND tc.table_name=$1 AND tc.constraint_type='PRIMARY KEY'",
+            &[table],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+
+        // Foreign keys: column → referenced table.
+        let mut fks: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for r in db::query(
+            "SELECT kcu.column_name, ccu.table_name FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name \
+             JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name \
+             WHERE tc.table_schema='public' AND tc.table_name=$1 AND tc.constraint_type='FOREIGN KEY'",
+            &[table],
+        )
+        .await?
+        {
+            fks.insert(r.get::<_, String>(0), r.get::<_, String>(1));
+        }
+
+        let cols = db::query(
+            "SELECT column_name, data_type, is_nullable, column_default \
+             FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 \
+             ORDER BY ordinal_position",
+            &[table],
+        )
+        .await?;
+
+        let _ = write!(doc, "\nmodel {} {{\n", singularize_pascal(table));
+        for r in &cols {
+            let name: String = r.get(0);
+            let data_type: String = r.get(1);
+            let nullable = r.get::<_, String>(2) == "YES";
+            let default: Option<String> = r.get(3);
+            let null = if nullable { "?" } else { "" };
+
+            if let Some(target) = fks.get(&name) {
+                // A relation: this column holds the foreign key.
+                let _ = writeln!(
+                    doc,
+                    "  {name} {}{null} @relation(onDelete: Cascade)",
+                    singularize_pascal(target)
+                );
+                continue;
+            }
+
+            let serial = default
+                .as_deref()
+                .is_some_and(|d| d.starts_with("nextval("));
+            let is_pk = pk.contains(&name);
+            if is_pk && serial {
+                let _ = writeln!(doc, "  {name} Int @id @default(autoincrement())");
+            } else {
+                let mut attrs = String::new();
+                if is_pk {
+                    attrs.push_str(" @id");
+                }
+                if default
+                    .as_deref()
+                    .is_some_and(|d| d.contains("now()") || d.contains("CURRENT_TIMESTAMP"))
+                {
+                    attrs.push_str(" @default(now())");
+                }
+                let _ = writeln!(
+                    doc,
+                    "  {name} {}{null}{attrs}",
+                    pg_to_schema_type(&data_type)
+                );
+            }
+        }
+        let _ = writeln!(doc, "  @@map(\"{table}\")\n}}");
+    }
+
+    std::fs::write(out, &doc).map_err(|e| format!("writing {out}: {e}"))?;
+    println!("pulled {} table(s) into {out}.", tables.len());
+    Ok(0)
+}
+
+/// A PostgreSQL `data_type` as the nearest `dorm.schema` scalar.
+fn pg_to_schema_type(data_type: &str) -> &'static str {
+    match data_type {
+        "bigint" => "BigInt",
+        "integer" | "smallint" => "Int",
+        "boolean" => "Boolean",
+        "numeric" => "Decimal",
+        "uuid" => "Uuid",
+        "json" | "jsonb" => "Json",
+        d if d.starts_with("timestamp") => "DateTime",
+        _ => "String", // text, character varying, and anything unmapped
+    }
+}
+
+/// A table name as a model type name: a best-effort singular, PascalCased. The
+/// `@@map` keeps the real table name, so an imperfect singular is cosmetic.
+fn singularize_pascal(table: &str) -> String {
+    let singular = if let Some(stem) = table.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if table.ends_with("ses")
+        || table.ends_with("xes")
+        || table.ends_with("zes")
+        || table.ends_with("ches")
+        || table.ends_with("shes")
+    {
+        table[..table.len() - 2].to_string()
+    } else if let Some(stem) = table.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        table.to_string()
+    };
+    singular
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// The column names of a table, in declaration order; errors if the table does
