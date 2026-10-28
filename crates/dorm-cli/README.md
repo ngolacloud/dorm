@@ -22,6 +22,9 @@ dorm migrate diff            # show what push would do, without applying
 dorm migrate deploy          # apply the reviewed migration (ledger)
 dorm shell                   # a REPL over your models
 
+dorm api generate            # src/bin/api.rs — an Axum read API + OpenAPI
+dorm api serve               # serve it (DORM_API_ADDR sets host:port)
+
 # live database (DELONIX_ORM_DSN, or --dsn), read-only, Prisma-Studio-style:
 dorm db tables               # tables in the public schema
 dorm db show tenants         # a table's columns and types

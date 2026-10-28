@@ -97,11 +97,32 @@ enum CliCommand {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Generate and serve a read API (Axum + OpenAPI) over your models.
+    Api {
+        #[command(subcommand)]
+        action: ApiAction,
+    },
     /// Print a shell completion script to stdout (bash, zsh, fish, …).
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum ApiAction {
+    /// Generate `src/bin/api.rs` from `dorm.schema` — an Axum read API with an
+    /// OpenAPI document. Native; re-run after changing the schema.
+    Generate {
+        /// The schema file to read.
+        #[arg(long, default_value = "dorm.schema")]
+        schema: String,
+        /// Where to write the generated API binary.
+        #[arg(long, default_value = "src/bin/api.rs")]
+        out: String,
+    },
+    /// Build and run the generated API. (`cargo run --bin api`.)
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -179,6 +200,12 @@ fn main() -> ExitCode {
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
         CliCommand::Db { action } => on_runtime(run_db(action, json)),
+        CliCommand::Api { action } => match action {
+            ApiAction::Generate { schema, out } => {
+                scaffold::api_generate(&schema, &out).map(|()| 0)
+            }
+            ApiAction::Serve => cargo_run("api", false),
+        },
         CliCommand::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "dorm", &mut std::io::stdout());
             Ok(0)

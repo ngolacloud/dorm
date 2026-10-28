@@ -66,6 +66,7 @@ pub fn init(name: Option<&str>) -> CliResult {
     println!("  dorm doctor                    # check config and connectivity");
     println!("  dorm push                      # create tables/columns to match your models");
     println!("  dorm shell                     # a REPL over your models");
+    println!("  dorm api generate && dorm api serve   # an Axum read API + OpenAPI");
     Ok(())
 }
 
@@ -81,6 +82,44 @@ pub fn generate(schema_path: &str, out_path: &str) -> CliResult {
         schema.models.len()
     );
     Ok(())
+}
+
+/// `dorm api generate` — write an Axum read API (`src/bin/api.rs`) from the schema.
+pub fn api_generate(schema_path: &str, out_path: &str) -> CliResult {
+    let src = fs::read_to_string(schema_path)
+        .map_err(|e| format!("reading {schema_path}: {e} (run `dorm init` first?)"))?;
+    let schema = dorm_schema::parse(&src).map_err(|e| format!("{schema_path}: {e}"))?;
+    let krate = package_name()?;
+    let rust = dorm_schema::generate_axum(&schema, &krate);
+    write(out_path, &rust)?;
+    println!(
+        "generated {out_path} from {schema_path} ({} model(s)).",
+        schema.models.len()
+    );
+    println!(
+        "run `dorm api serve` to serve it (needs `axum` in Cargo.toml — `dorm init` adds it)."
+    );
+    Ok(())
+}
+
+/// The package's library crate name (underscored), read from `Cargo.toml`, so a
+/// generated binary can `use <crate>::models`.
+fn package_name() -> Result<String, Box<dyn std::error::Error>> {
+    let toml = fs::read_to_string("Cargo.toml")
+        .map_err(|e| format!("reading Cargo.toml: {e} (run inside a DORM project?)"))?;
+    // The first `name = "..."` is the package name (the `[package]` section leads
+    // the manifest in these projects).
+    for line in toml.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("name") {
+            if let Some(q1) = rest.find('"') {
+                if let Some(q2) = rest[q1 + 1..].find('"') {
+                    return Ok(rest[q1 + 1..q1 + 1 + q2].replace('-', "_"));
+                }
+            }
+        }
+    }
+    Err("could not find the package name in Cargo.toml".into())
 }
 
 fn write(path: impl AsRef<Path>, contents: &str) -> CliResult {
@@ -167,13 +206,16 @@ default-run = "__APP_NAME__"
 dorm-core = "0.3"
 dorm-derive = "0.2"
 dorm-migrations = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Present so a generated model can use any scalar (Decimal, Uuid) without a
 # manual edit; unused ones cost nothing.
 rust_decimal = "1"
 uuid = { version = "1", features = ["v4"] }
+# For the API `dorm api generate` writes (`src/bin/api.rs`).
+axum = "0.7"
 "#;
 
 const GITIGNORE: &str = "/target\n**/*.rs.bk\n.env\n";

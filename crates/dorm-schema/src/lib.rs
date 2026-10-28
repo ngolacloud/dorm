@@ -41,10 +41,12 @@
 #![forbid(unsafe_code)]
 
 mod codegen;
+mod codegen_api;
 mod lexer;
 mod parser;
 
 pub use codegen::generate_rust;
+pub use codegen_api::generate_axum;
 pub use parser::{parse, ParseError};
 
 /// A parsed `dorm.schema`.
@@ -77,6 +79,16 @@ pub struct Model {
     /// The table, defaulting to the snake_case plural of `name`.
     pub table: String,
     pub fields: Vec<Field>,
+}
+
+impl Model {
+    /// The primary-key scalar field, if the model declares one.
+    pub fn primary_key(&self) -> Option<&ScalarField> {
+        self.fields.iter().find_map(|f| match f {
+            Field::Scalar(s) if s.primary_key => Some(s),
+            _ => None,
+        })
+    }
 }
 
 /// One line inside a model.

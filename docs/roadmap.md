@@ -12,9 +12,14 @@ completions), and the **declarative `dorm.schema` → Rust** pipeline (`dorm
 generate`, Prisma-faithful syntax, [ADR 0001](adr/0001-declarative-schema.md),
 [schema.md](schema.md)). See [cli-contract.md](cli-contract.md) for exact status.
 
-Next on this front: `dorm api generate` (Axum service + OpenAPI over the models,
-generated code — ADR 0001's corollary), then `db pull` (introspect → schema) and
-`format` (pretty-print the schema), which the schema file now makes tractable.
+`dorm api generate`/`serve` ships its **read** half: an Axum service with
+`GET /<table>`, `GET /<table>/{id}` and `/openapi.json`, generated code over the
+`QuerySet` (ADR 0001's corollary), proven serving live JSON.
+
+Next on this front: the API's **write** half (POST/PATCH/DELETE, needing typed
+request bodies and the create/update path), then `db pull` (introspect → schema)
+and `format` (pretty-print the schema), which the schema file now makes
+tractable.
 
 ## Guiding rules
 
