@@ -33,7 +33,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm migrate deploy` (= `dorm migrate`) | Apply reviewed migrations (the initial migration). | 0/1 | **partial** | Applies version 1; multi-version authoring is `migrate dev` (planned). |
 | `dorm migrate status` | Applied-versions ledger. | 0/1 | **done** | Native; `--json`; readable UTC timestamps. |
 | `dorm migrate diff` | Show the additive changes `push` would apply, without touching the DB. | 0/1 | **done** | Cargo lane; read-only; `--json`. |
-| `dorm shell` | Open the project REPL. | 0/1 | **partial** | Query + `:models`; admin ops and transactions are [roadmap](roadmap.md). |
+| `dorm shell` | Open the project REPL. | 0/1 | **partial** | Query + `:models` + **DML** `insert`/`update`/`delete` through the compiler, `:sql` preview and `:raw` (ADR 0006), read-only unless `--write`. Interactive transactions and admin ops are [roadmap](roadmap.md). |
 | `dorm db tables\|show\|count\|rows` | Browse the live database, read-only. | 0/1 | **done** | Native; `--json`; `rows --where col=value` (bound param, column validated). |
 | `dorm completions <shell>` | Print a completion script. | 0 | **done** | |
 | `dorm generate` | Compile `dorm.schema` → `src/models.rs`. | 0/1 | **done** | Native; the declarative schema compiled to `#[derive(Model)]` — see [schema.md](schema.md), [ADR 0001](adr/0001-declarative-schema.md). |

@@ -90,6 +90,12 @@ system-provided or bundled.
 
 ## Phase 4 — Shell inspired by Django
 
+**Shipped (ADR 0006, brick 1)**: write DML through the compiler — `insert`,
+`update`, `delete` from string-keyed input — plus `:sql` to preview a command's
+SQL and bound params, and `:raw` for the ADR 0005 escape hatch; read-only by
+default, `--write` to opt in, unfiltered `delete` refused unless `all`. Next:
+interactive transactions (`:begin`/`:commit`), autocomplete and history.
+
 `dorm shell` loads the project's models and config and offers: discovery of
 models/fields/relations, CRUD, explicit transactions, SQL inspection,
 connection/context inspection (no secrets), reproducible scripts, autocomplete
