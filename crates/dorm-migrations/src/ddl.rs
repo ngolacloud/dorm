@@ -55,6 +55,14 @@ pub fn create_table(meta: &ModelMeta) -> Result<String> {
 /// composite `UNIQUE` groups, then `CHECK`s — matching the order the
 /// hand-written schemas use.
 pub fn create_table_on(meta: &ModelMeta, backend: Backend) -> Result<String> {
+    create_table_named_on(meta, meta.table, backend)
+}
+
+/// `CREATE TABLE IF NOT EXISTS <name> ( … )` with `meta`'s columns and
+/// constraints but an explicit table name — used by the autodetector's SQLite
+/// table rebuild, which creates the new shape under a temporary name before
+/// swapping it in. With `name == meta.table` this is exactly [`create_table_on`].
+pub fn create_table_named_on(meta: &ModelMeta, name: &str, backend: Backend) -> Result<String> {
     let mut parts =
         Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
     for f in meta.fields {
@@ -68,7 +76,7 @@ pub fn create_table_on(meta: &ModelMeta, backend: Backend) -> Result<String> {
     }
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {} (\n    {}\n)",
-        meta.table,
+        name,
         parts.join(",\n    ")
     ))
 }
