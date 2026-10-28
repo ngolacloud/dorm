@@ -30,7 +30,7 @@ use syn::{
     PathArguments, Result, Type,
 };
 
-#[proc_macro_derive(Model, attributes(model, field))]
+#[proc_macro_derive(Model, attributes(model, field, m2m))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     expand(&ast)
@@ -47,6 +47,20 @@ struct ModelOpts {
     unique_together: Vec<Vec<String>>,
     /// Table-level `CHECK` predicates (raw SQL, no `CHECK (...)` wrapper).
     checks: Vec<String>,
+}
+
+/// What one `#[m2m(..)]` struct attribute declares: a named accessor onto a
+/// many-to-many through an explicit junction model.
+struct M2mSpec {
+    /// The accessor method to emit — `name = "tags"` gives `post.tags()`.
+    name: Ident,
+    /// The junction model's registered *name* (not a type), resolved at runtime
+    /// through the registry by [`ManyToMany::through`].
+    through: String,
+    /// The junction field pointing back at *this* model — the "left" key.
+    via: String,
+    /// The junction field pointing at the *other* model — the "right" key.
+    to: String,
 }
 
 /// What `#[field(..)]` can say, plus what was inferred from the Rust type.
@@ -142,8 +156,10 @@ fn expand(ast: &DeriveInput) -> Result<TokenStream2> {
         ));
     }
 
+    let m2m = parse_m2m_specs(ast)?;
+
     let meta_tokens = build_meta(name, &table, &opts, &specs);
-    let impl_tokens = build_model_impl(name, &specs)?;
+    let impl_tokens = build_model_impl(name, &specs, &m2m)?;
     let fields_struct = build_fields_struct(name, &specs);
     let module = build_module(name, &specs);
     let new_row = build_new_row(name, &specs);
@@ -224,6 +240,55 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
         })?;
     }
     Ok(opts)
+}
+
+/// Parse every `#[m2m(..)]` struct attribute. Each needs all four of `name`,
+/// `through`, `via`, `to`; a missing one is an error naming it, since a
+/// half-specified association could not resolve.
+fn parse_m2m_specs(ast: &DeriveInput) -> Result<Vec<M2mSpec>> {
+    let mut specs = Vec::new();
+    for attr in &ast.attrs {
+        if !attr.path().is_ident("m2m") {
+            continue;
+        }
+        let (mut name, mut through, mut via, mut to) = (None, None, None, None);
+        attr.parse_nested_meta(|meta| {
+            let key = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            match key.as_str() {
+                "name" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    // The accessor's method name — an identifier, not a string.
+                    name = Some(Ident::new(&s.value(), s.span()));
+                }
+                "through" => through = Some(meta.value()?.parse::<LitStr>()?.value()),
+                "via" => via = Some(meta.value()?.parse::<LitStr>()?.value()),
+                "to" => to = Some(meta.value()?.parse::<LitStr>()?.value()),
+                other => {
+                    return Err(meta.error(format!(
+                        "unknown `m2m` option `{other}`; known: name, through, via, to"
+                    )))
+                }
+            }
+            Ok(())
+        })?;
+        let missing = |what: &str| {
+            Error::new_spanned(
+                attr,
+                format!("`#[m2m(..)]` needs `{what}`; all of name, through, via, to are required"),
+            )
+        };
+        specs.push(M2mSpec {
+            name: name.ok_or_else(|| missing("name"))?,
+            through: through.ok_or_else(|| missing("through"))?,
+            via: via.ok_or_else(|| missing("via"))?,
+            to: to.ok_or_else(|| missing("to"))?,
+        });
+    }
+    Ok(specs)
 }
 
 fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
@@ -580,7 +645,7 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
     }
 }
 
-fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
+fn build_model_impl(name: &Ident, specs: &[FieldSpec], m2m: &[M2mSpec]) -> Result<TokenStream2> {
     let meta_static = format_ident!("__{}_META_STATIC", name.to_string().to_uppercase());
 
     // The decoder reads columns by position, in metadata order, offset by where
@@ -682,6 +747,35 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
             }
         });
 
+    // One accessor per `#[m2m(..)]`: a method named by `name`, returning the
+    // association with this instance's key already bound. Fallible because the
+    // junction and its fields resolve through the registry at runtime — a
+    // misspelt `through`/`via`/`to` surfaces here, not at compile time.
+    let m2m_accessors = m2m.iter().map(|s| {
+        let method = &s.name;
+        let through = &s.through;
+        let via = &s.via;
+        let to = &s.to;
+        let doc = format!(
+            "The `{method}` many-to-many association, through the `{through}` junction \
+             (`{via}` → this model, `{to}` → the other).\n\n\
+             Returns the association with this instance's key already bound, so \
+             `self.{method}()?.add(other_pk)` and `.all_keys()` need no repetition of \
+             this key. Fallible: the junction resolves through the registry."
+        );
+        quote! {
+            #[doc = #doc]
+            pub fn #method(
+                &self,
+            ) -> ::dorm_core::Result<::dorm_core::m2m::BoundManyToMany> {
+                ::core::result::Result::Ok(
+                    ::dorm_core::m2m::ManyToMany::through(#through, #via, #to)?
+                        .bind(::dorm_core::model::Model::pk(self)),
+                )
+            }
+        }
+    });
+
     Ok(quote! {
         impl ::dorm_core::model::Model for #name {
             fn meta() -> &'static ::dorm_core::meta::ModelMeta {
@@ -744,6 +838,8 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
                     ::dorm_core::model::Model::pk(self),
                 )
             }
+
+            #(#m2m_accessors)*
         }
     })
 }
