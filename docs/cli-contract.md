@@ -39,7 +39,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm generate` | Compile `dorm.schema` → `src/models.rs`. | 0/1 | **done** | Native; the declarative schema compiled to `#[derive(Model)]` — see [schema.md](schema.md), [ADR 0001](adr/0001-declarative-schema.md). |
 | `dorm format` | Pretty-print `dorm.schema`. | — | **planned** | Now that the schema exists, this is a formatter over it. |
 | `dorm db pull` | Introspect an existing DB into `dorm.schema`. | — | **planned** | Reverse of `generate`; writes the schema. |
-| `dorm api generate` / `dorm api serve` | Generate (`src/bin/api.rs`) and serve an Axum read API + OpenAPI over the models. | 0/1 | **partial** | Read endpoints (`GET /<table>`, `GET /<table>/{id}`, `/openapi.json`) ship and serve; writes (POST/PATCH/DELETE) are next. `DORM_API_ADDR` sets the listen address. Generated code — see ADR 0001. |
+| `dorm api generate` / `dorm api serve` | Generate (`src/bin/api.rs`) and serve an Axum CRUD API + OpenAPI over the models. | 0/1 | **done** | Full CRUD: `GET`/`POST /<table>`, `GET`/`PATCH`/`DELETE /<table>/{id}`, `/openapi.json`, `/health`. Handlers go through the `QuerySet`; `DORM_API_ADDR` sets host:port. Generated code — see ADR 0001. |
 | `dorm db seed` | Run configured seeds. | — | **planned** | |
 | `dorm db execute` | Run explicit SQL with parameters. | — | **planned** | |
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
