@@ -77,6 +77,8 @@ A crate that only **defines models** needs `dorm-core` and `dorm-derive`. Add
 | [Making queries](docs/queries.md) | `QuerySet` in full: filtering, lookups, ordering, writes, aggregates, relations |
 | [Migrations](docs/migrations.md) | Generating DDL, the versioned migrator, and the migration ledger |
 | [Connection & transactions](docs/connection-and-transactions.md) | The DSN, the pool, read-only mode, `atomic`, and the one-runtime rule |
+| [CLI contract](docs/cli-contract.md) | The `dorm` command surface mapped onto Prisma, with honest per-command status |
+| [Roadmap](docs/roadmap.md) | The phased plan: migrations, multi-SGBD tiers, SQLite, the admin shell, accounts |
 
 ## Try it without a database
 

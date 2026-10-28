@@ -27,6 +27,123 @@ pub fn model_by_table(table: &str) -> Option<&'static ModelMeta> {
     models().find(|m| m.table == table)
 }
 
+/// How serious a [`validate`] finding is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// The schema will not work as written — a query or a migration would fail.
+    Error,
+    /// Legal, but likely a mistake or a limitation worth naming.
+    Warning,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+}
+
+/// One thing [`validate`] found wrong with the registered models.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue {
+    pub severity: Severity,
+    /// The model the issue is about, or empty for a registry-wide finding.
+    pub model: String,
+    pub message: String,
+}
+
+/// Check the registered models for the mistakes that would otherwise only
+/// surface as a failing query or migration: a relation pointing at a model that
+/// is not registered or has no key, two tables sharing a name, a reverse
+/// `related_name` that is ambiguous, or a model with no primary key.
+///
+/// Pure and read-only — it inspects the same metadata the compiler and the
+/// migrator read, so `dorm validate` reports exactly what they would trip over.
+/// An empty result means the model set is internally consistent.
+pub fn validate() -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let all: Vec<&'static ModelMeta> = models().collect();
+
+    if all.is_empty() {
+        issues.push(Issue {
+            severity: Severity::Warning,
+            model: String::new(),
+            message: "no models are registered — is the model crate linked?".to_string(),
+        });
+        return issues;
+    }
+
+    // Two models mapping to one table is a silent data hazard.
+    let mut by_table: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for m in &all {
+        by_table.entry(m.table).or_default().push(m.name);
+    }
+    for (table, owners) in &by_table {
+        if owners.len() > 1 {
+            let mut names = owners.clone();
+            names.sort_unstable();
+            issues.push(Issue {
+                severity: Severity::Error,
+                model: names.join(", "),
+                message: format!("share the table `{table}` — one table per model"),
+            });
+        }
+    }
+
+    for m in &all {
+        if m.primary_key().is_none() {
+            issues.push(Issue {
+                severity: Severity::Error,
+                model: m.name.to_string(),
+                message: "has no primary key, so it cannot be saved or deleted by instance"
+                    .to_string(),
+            });
+        }
+
+        // Relations must point at a registered model that has a key to reference,
+        // and no two reverse accessors may collide on the target.
+        let mut related_seen: std::collections::HashMap<(&str, &str), &str> =
+            std::collections::HashMap::new();
+        for f in m.fields {
+            let Some(rel) = f.relation else { continue };
+            match model(rel.model) {
+                Err(_) => issues.push(Issue {
+                    severity: Severity::Error,
+                    model: m.name.to_string(),
+                    message: format!(
+                        "field `{}` points at model `{}`, which is not registered",
+                        f.name, rel.model
+                    ),
+                }),
+                Ok(target) if target.primary_key().is_none() => issues.push(Issue {
+                    severity: Severity::Error,
+                    model: m.name.to_string(),
+                    message: format!(
+                        "field `{}` references `{}`, which has no primary key",
+                        f.name, rel.model
+                    ),
+                }),
+                Ok(_) => {}
+            }
+            if let Some(name) = rel.related_name {
+                if let Some(prev) = related_seen.insert((rel.model, name), f.name) {
+                    issues.push(Issue {
+                        severity: Severity::Error,
+                        model: m.name.to_string(),
+                        message: format!(
+                            "fields `{prev}` and `{}` both declare related_name `{name}` on `{}`",
+                            f.name, rel.model
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    issues
+}
+
 /// Resolve a `related_name` back to the model and foreign key that declared it.
 ///
 /// `Tenant` does not know that `Application` points at it; only `Application`'s

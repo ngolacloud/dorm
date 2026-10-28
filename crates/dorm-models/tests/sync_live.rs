@@ -74,6 +74,18 @@ fn sync_creates_is_idempotent_adds_columns_and_recreates_tables() {
             .await
             .expect("drop column");
         assert!(!column_exists("tenants", "created_at").await);
+        // `diff` must report the pending ADD COLUMN without touching anything.
+        let pending = mig::diff(&models).await.expect("diff");
+        assert!(
+            pending
+                .iter()
+                .any(|s| s.contains("ADD COLUMN") && s.contains("created_at")),
+            "diff should show the pending column, got {pending:?}"
+        );
+        assert!(
+            !column_exists("tenants", "created_at").await,
+            "diff must not apply anything"
+        );
         let added = mig::sync(&models).await.expect("sync adds the column");
         assert!(
             added

@@ -114,17 +114,49 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
 /// serialise rather than racing on `ALTER TABLE`.
 pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     db::guard_write("sync")?;
+    let plans = build_plans(models)?;
+    db::atomic(|_tx| async move {
+        db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+        let (tables, columns) = introspect().await?;
+        let changes = changes_for(&plans, &tables, &columns);
+        // Apply the changes; then the indexes (idempotent, so run for every table,
+        // and not counted among the reported changes).
+        for stmt in &changes {
+            db::execute(stmt, &[]).await?;
+        }
+        for (_, _, indexes, _) in &plans {
+            for idx in indexes {
+                db::execute(idx, &[]).await?;
+            }
+        }
+        Ok(changes)
+    })
+    .await
+    .map_err(Into::into)
+}
 
-    // Generate every statement up front — this is the pure, fallible half, so a
-    // bad relation surfaces as a migration error here rather than inside the
-    // transaction, where the error type would have to be the ORM's. Each entry is
-    // `(table, CREATE TABLE, [CREATE INDEX…], [(column, ADD COLUMN)…])`.
-    type Plan = (
-        &'static str,
-        String,
-        Vec<String>,
-        Vec<(&'static str, String)>,
-    );
+/// The additive changes [`sync`] *would* apply, without touching the database —
+/// `prisma migrate diff` for the quick-iteration path. Read-only: it takes no
+/// write lock and runs in a read-only session, so it is safe to point at
+/// production to see what a `push` would do. An empty result means the schema
+/// already matches the models.
+pub async fn diff(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
+    let plans = build_plans(models)?;
+    let (tables, columns) = introspect().await?;
+    Ok(changes_for(&plans, &tables, &columns))
+}
+
+/// One table's intended DDL: `(table, CREATE TABLE, [CREATE INDEX…],
+/// [(column, ADD COLUMN)…])`. Built purely from the models so the fallible DDL
+/// generation happens outside any transaction.
+type Plan = (
+    &'static str,
+    String,
+    Vec<String>,
+    Vec<(&'static str, String)>,
+);
+
+fn build_plans(models: &[&'static ModelMeta]) -> Result<Vec<Plan>> {
     let mut plans: Vec<Plan> = Vec::with_capacity(models.len());
     for m in models {
         let mut adds = Vec::new();
@@ -136,62 +168,65 @@ pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
         }
         plans.push((m.table, ddl::create_table(m)?, ddl::indexes(m), adds));
     }
+    Ok(plans)
+}
 
-    // Apply under the lock, in one transaction. Only `db::` calls here, so the
-    // closure's error is the ORM's — which `?` on the outside maps back.
-    db::atomic(|_tx| async move {
-        db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+/// Read the public schema's tables and their columns from `information_schema`.
+async fn introspect() -> dorm_core::Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, std::collections::HashSet<String>>,
+)> {
+    let tables: std::collections::HashSet<String> = db::query(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+        &[],
+    )
+    .await?
+    .iter()
+    .map(|r| r.get::<_, String>(0))
+    .collect();
 
-        let tables: std::collections::HashSet<String> = db::query(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+    let mut columns: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for r in db::query(
+        "SELECT table_name, column_name FROM information_schema.columns \
+         WHERE table_schema = 'public'",
+        &[],
+    )
+    .await?
+    {
+        columns
+            .entry(r.get::<_, String>(0))
+            .or_default()
+            .insert(r.get::<_, String>(1));
+    }
+    Ok((tables, columns))
+}
 
-        let mut columns: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
-        for r in db::query(
-            "SELECT table_name, column_name FROM information_schema.columns \
-             WHERE table_schema = 'public'",
-            &[],
-        )
-        .await?
-        {
-            columns
-                .entry(r.get::<_, String>(0))
-                .or_default()
-                .insert(r.get::<_, String>(1));
-        }
-
-        // `changes` is what we report; the indexes are run too (idempotently) but
-        // are not reported, so the output names only tables created and columns
-        // added.
-        let mut changes = Vec::new();
-        for (table, create, indexes, adds) in &plans {
-            if !tables.contains(*table) {
-                db::execute(create, &[]).await?;
-                changes.push(create.clone());
-            } else {
-                let have = columns.get(*table).cloned().unwrap_or_default();
-                for (col, stmt) in adds {
-                    if !have.contains(*col) {
-                        db::execute(stmt, &[]).await?;
-                        changes.push(stmt.clone());
-                    }
+/// The additive statements needed to bring the schema to the models: a
+/// `CREATE TABLE` for each missing table, an `ADD COLUMN` for each missing
+/// column. Pure — the caller decides whether to run them. Indexes are not
+/// included: they are idempotent and applied separately by [`sync`].
+fn changes_for(
+    plans: &[Plan],
+    tables: &std::collections::HashSet<String>,
+    columns: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    let empty = std::collections::HashSet::new();
+    for (table, create, _indexes, adds) in plans {
+        if !tables.contains(*table) {
+            changes.push(create.clone());
+        } else {
+            let have = columns.get(*table).unwrap_or(&empty);
+            for (col, stmt) in adds {
+                if !have.contains(*col) {
+                    changes.push(stmt.clone());
                 }
             }
-            for idx in indexes {
-                db::execute(idx, &[]).await?;
-            }
         }
-        Ok(changes)
-    })
-    .await
-    .map_err(Into::into)
+    }
+    changes
 }
 
 /// Seconds since the epoch. `SystemTime`, not a database `now()`, because the

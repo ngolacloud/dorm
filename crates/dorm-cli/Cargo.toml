@@ -1,10 +1,9 @@
 [package]
 name = "dorm-cli"
-# Versioned independently of the libraries: the CLI iterates faster than
-# dorm-core/derive/migrations, so it moves ahead (0.3.x) while they stay at the
-# version it depends on (0.2.x). The release workflow publishes per-crate and
-# skips versions already on the index, so a CLI-only release republishes nothing.
-version = "0.4.0"
+# Versioned independently: the CLI iterates faster than the libraries, so it
+# runs ahead of dorm-core (0.3.x) and dorm-migrations (0.4.x). The release
+# workflow publishes per-crate and skips versions already on the index.
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -30,8 +29,10 @@ path = "src/main.rs"
 # Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
 # A path alongside the version so an in-workspace build uses the local crate and
 # crates.io resolves the published one.
-dorm-core = { path = "../dorm-core", version = "0.2.0" }
+dorm-core = { path = "../dorm-core", version = "0.3.0" }
 clap = { workspace = true }
+clap_complete = "4"
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
 # Only to render the ledger's `applied_unix` as a readable UTC timestamp.

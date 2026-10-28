@@ -156,6 +156,18 @@ mod tests {
     use dorm_core::registry;
 
     #[test]
+    fn the_example_models_validate_without_any_findings() {
+        // The whole point of `dorm validate`: a consistent model set reports
+        // nothing. If a future edit breaks a relation or drops a primary key,
+        // this test names it before a migration does.
+        let issues = registry::validate();
+        assert!(
+            issues.is_empty(),
+            "expected a clean validate, got {issues:?}"
+        );
+    }
+
+    #[test]
     fn every_model_reaches_the_registry_without_being_listed_anywhere() {
         // This is the property the REPL depends on. Nothing in this crate
         // enumerates the four models; the linker does.

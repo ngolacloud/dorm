@@ -40,6 +40,8 @@ pub fn init(name: Option<&str>) -> CliResult {
     write(root.join("src/main.rs"), &render(MAIN_RS))?;
     write(root.join("src/bin/migrate.rs"), &render(MIGRATE_RS))?;
     write(root.join("src/bin/sync.rs"), &render(SYNC_RS))?;
+    write(root.join("src/bin/diff.rs"), &render(DIFF_RS))?;
+    write(root.join("src/bin/validate.rs"), &render(VALIDATE_RS))?;
     write(root.join("src/bin/shell.rs"), &render(SHELL_RS))?;
 
     println!("created `{name}`.\n");
@@ -51,6 +53,8 @@ pub fn init(name: Option<&str>) -> CliResult {
         whoami(),
         krate
     );
+    println!("  dorm validate                  # check the models for mistakes");
+    println!("  dorm doctor                    # check config and connectivity");
     println!("  dorm push                      # create tables/columns to match your models");
     println!("  dorm shell                     # a REPL over your models");
     Ok(())
@@ -181,11 +185,12 @@ edition = "2021"
 default-run = "__APP_NAME__"
 
 [dependencies]
-dorm-core = "0.2"
+dorm-core = "0.3"
 dorm-derive = "0.2"
-dorm-migrations = "0.3"
+dorm-migrations = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["clock"] }
+serde_json = "1"
 "#;
 
 const GITIGNORE: &str = "/target\n**/*.rs.bk\n.env\n";
@@ -306,6 +311,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+"#;
+
+const DIFF_RS: &str = r#"//! `dorm migrate diff` runs this: show the additive changes `push` would apply,
+//! read-only. Pass `--json` for a stable object.
+
+use dorm_migrations as mig;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let json = std::env::args().any(|a| a == "--json");
+    let changes = mig::diff(&__APP_CRATE__::all_models()).await?;
+    if json {
+        println!("{}", serde_json::json!({ "changes": changes }));
+    } else if changes.is_empty() {
+        println!("no pending changes — the database matches the models.");
+    } else {
+        println!("{} pending change(s):", changes.len());
+        for c in &changes {
+            println!("  {c}");
+        }
+    }
+    Ok(())
+}
+"#;
+
+const VALIDATE_RS: &str = r#"//! `dorm validate` runs this: check the project's models for inconsistencies a
+//! query or migration would otherwise trip over. Exits 3 if there are errors.
+//! Pass `--json` for a stable object.
+
+use dorm_core::registry::{self, Severity};
+
+fn main() {
+    // Link the models into the registry.
+    let _ = __APP_CRATE__::all_models();
+    let json = std::env::args().any(|a| a == "--json");
+    let issues = registry::validate();
+    let errors = issues.iter().filter(|i| i.severity == Severity::Error).count();
+
+    if json {
+        let arr: Vec<_> = issues
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "severity": i.severity.label(),
+                    "model": i.model,
+                    "message": i.message,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "ok": errors == 0, "issues": arr }));
+    } else if issues.is_empty() {
+        println!("validate: ok — the models are consistent.");
+    } else {
+        for i in &issues {
+            let who = if i.model.is_empty() {
+                String::new()
+            } else {
+                format!("{}: ", i.model)
+            };
+            println!("  {:<7} {who}{}", i.severity.label(), i.message);
+        }
+        println!("validate: {errors} error(s)");
+    }
+    std::process::exit(if errors > 0 { 3 } else { 0 });
 }
 "#;
 

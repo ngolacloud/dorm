@@ -5,20 +5,30 @@
 //! arbitrary project's models the way `prisma` reads `schema.prisma`. It works on
 //! the two things it *can* reach without your compiled code:
 //!
-//! * **the files** — `dorm init` scaffolds a ready-to-run project; and
-//! * **the database** — `dorm db …` and `dorm migrate status` talk to a live
-//!   PostgreSQL over `DELONIX_ORM_DSN` (or `--dsn`), introspecting and browsing
-//!   it, Prisma-Studio-style.
+//! * **the files** — `dorm init` / `dorm new model` write the project; and
+//! * **the database** — `dorm doctor` and `dorm db …` talk to a live PostgreSQL
+//!   over `DELONIX_ORM_DSN` (or `--dsn`), diagnosing and browsing it.
 //!
-//! The two commands that *do* need your typed models — `dorm migrate` and
-//! `dorm shell` — run them the only way that is honest: by building and running
-//! your own project through `cargo`. The project `dorm init` scaffolds answers
-//! both.
+//! The commands that need your typed models — `dorm validate`, `dorm migrate`,
+//! `dorm push`, `dorm shell` — run them the only honest way: by building and
+//! running your own project through `cargo`. `dorm init` scaffolds the binaries
+//! they drive.
+//!
+//! ## Exit codes
+//!
+//! * `0` success · `1` an error (message on stderr) · `2` a usage error (clap) ·
+//!   `3` a command that checks things found problems (`doctor`, `validate`).
+//!
+//! ## `--json`
+//!
+//! Every read command takes `--json` for a stable, scriptable object. Human text
+//! is the default. Credentials are never printed — a DSN is always redacted.
 
 use std::process::{Command, ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use dorm_core::db;
+use serde_json::json;
 
 mod scaffold;
 
@@ -26,13 +36,19 @@ mod scaffold;
 #[command(
     name = "dorm",
     version,
-    about = "Scaffold a DORM project and manage its PostgreSQL — migrations, schema, and a row browser."
+    about = "Scaffold a DORM project and manage its PostgreSQL — migrations, schema, diagnostics and a row browser.",
+    long_about = None
 )]
 struct Cli {
-    /// The database to talk to, as a libpq DSN or URL. Overrides
-    /// `DELONIX_ORM_DSN` for this run. Only the live-database commands use it.
-    #[arg(long, global = true)]
+    /// The database to talk to, as a libpq DSN or URL. Overrides the
+    /// `DELONIX_ORM_DSN` environment variable for this run. Only the
+    /// live-database commands use it. The password is never logged.
+    #[arg(long, global = true, value_name = "DSN")]
     dsn: Option<String>,
+
+    /// Emit a stable JSON object instead of human text (read commands).
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: CliCommand,
@@ -45,18 +61,22 @@ enum CliCommand {
         /// The project directory to create. Defaults to `dorm-app`.
         name: Option<String>,
     },
-    /// Apply your project's migrations by building and running it (`cargo run`),
-    /// or `dorm migrate status` to read the applied-versions ledger from the database.
+    /// Check your models for mistakes a query or migration would otherwise trip
+    /// over — by building and running the project. (`cargo run --bin validate`.)
+    Validate,
+    /// Diagnose configuration and connectivity to the database (no project needed).
+    Doctor,
+    /// Migrations.
     Migrate {
         #[command(subcommand)]
         action: Option<MigrateAction>,
     },
-    /// Open your project's REPL by building and running it (`cargo run`).
-    Shell,
     /// Push the schema to the database additively — create missing tables and
     /// columns to match your models — by building and running the project. Like
-    /// `prisma db push`; no migration history. (`cargo run --bin sync`.)
+    /// `prisma db push`; no migration history, and only additive (never drops).
     Push,
+    /// Open your project's REPL by building and running it. (`cargo run --bin shell`.)
+    Shell,
     /// Add to the project in the current directory.
     New {
         #[command(subcommand)]
@@ -66,6 +86,11 @@ enum CliCommand {
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+    /// Print a shell completion script to stdout (bash, zsh, fish, …).
+    Completions {
+        /// The shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -81,8 +106,14 @@ enum NewKind {
 
 #[derive(Subcommand)]
 enum MigrateAction {
+    /// Apply reviewed migrations (the initial migration). The default when
+    /// `migrate` is given no subcommand. (`cargo run --bin migrate`.)
+    Deploy,
     /// Show which migration versions the database has recorded as applied.
     Status,
+    /// Show the additive changes `push` would apply, without touching the
+    /// database. Read-only. (`cargo run --bin diff`.)
+    Diff,
 }
 
 #[derive(Subcommand)]
@@ -120,23 +151,31 @@ fn main() -> ExitCode {
         // `dorm_core::db`. Setting it here lets `--dsn` win for this process.
         std::env::set_var(db::DSN_ENV, dsn);
     }
+    let json = cli.json;
 
-    let result = match cli.command {
-        CliCommand::Init { name } => scaffold::init(name.as_deref()),
-        CliCommand::Migrate { action: None } => cargo_run(&["--bin", "migrate"]),
-        CliCommand::Migrate {
-            action: Some(MigrateAction::Status),
-        } => on_runtime(migrate_status()),
-        CliCommand::Shell => cargo_run(&["--bin", "shell"]),
-        CliCommand::Push => cargo_run(&["--bin", "sync"]),
+    let result: CliResult = match cli.command {
+        CliCommand::Init { name } => scaffold::init(name.as_deref()).map(|()| 0),
         CliCommand::New {
             what: NewKind::Model { name },
-        } => scaffold::new_model(&name),
-        CliCommand::Db { action } => on_runtime(run_db(action)),
+        } => scaffold::new_model(&name).map(|()| 0),
+        CliCommand::Validate => cargo_run("validate", json),
+        CliCommand::Doctor => on_runtime(doctor(json)),
+        CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
+            MigrateAction::Deploy => cargo_run("migrate", false),
+            MigrateAction::Status => on_runtime(migrate_status(json)),
+            MigrateAction::Diff => cargo_run("diff", json),
+        },
+        CliCommand::Push => cargo_run("sync", false),
+        CliCommand::Shell => cargo_run("shell", false),
+        CliCommand::Db { action } => on_runtime(run_db(action, json)),
+        CliCommand::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "dorm", &mut std::io::stdout());
+            Ok(0)
+        }
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -144,9 +183,10 @@ fn main() -> ExitCode {
     }
 }
 
-type CliResult = Result<(), Box<dyn std::error::Error>>;
+/// `Ok(exit_code)` — 0 for success, 3 when a check found problems — or an error.
+type CliResult = Result<i32, Box<dyn std::error::Error>>;
 
-/// Run a closure on a fresh multi-threaded runtime — one for the whole command,
+/// Run a future on a fresh multi-threaded runtime — one for the whole command,
 /// as `dorm_core::db` requires (the pool belongs to the runtime that built it).
 fn on_runtime(fut: impl std::future::Future<Output = CliResult>) -> CliResult {
     tokio::runtime::Builder::new_multi_thread()
@@ -155,26 +195,172 @@ fn on_runtime(fut: impl std::future::Future<Output = CliResult>) -> CliResult {
         .block_on(fut)
 }
 
-/// The cargo lane: build and run the project in the current directory. Used for
-/// the commands that need the project's own compiled models.
-fn cargo_run(extra: &[&str]) -> CliResult {
+/// The cargo lane: build and run one of the project's binaries, forwarding
+/// `--json` when asked. Its exit code becomes ours, so a `validate` that exits 3
+/// surfaces as 3.
+fn cargo_run(bin: &str, json: bool) -> CliResult {
     let mut cmd = Command::new("cargo");
-    cmd.arg("run").arg("--quiet").args(extra);
+    cmd.arg("run").arg("--quiet").arg("--bin").arg(bin);
+    if json {
+        cmd.arg("--").arg("--json");
+    }
     let status = cmd.status().map_err(|e| {
         format!(
             "could not run `cargo` (is it on your PATH, and are you inside a DORM project?): {e}"
         )
     })?;
-    if !status.success() {
-        return Err(format!("`cargo run {}` failed", extra.join(" ")).into());
-    }
-    Ok(())
+    Ok(status.code().unwrap_or(1))
 }
 
-/// `migrate status`: the applied-versions ledger `dorm-migrations` keeps.
-async fn migrate_status() -> CliResult {
-    // The ledger is `orm_schema_migrations (version, name, applied_unix)`. If it
-    // does not exist yet, nothing has been migrated — say so rather than error.
+/// Hide the password in a DSN before echoing it. libpq spells the secret
+/// `password=…`; a URL spells it `user:pass@host`.
+fn redact(dsn: &str) -> String {
+    // URL form: scheme://user:pass@rest  → mask between the first ':' after '//'
+    // and the '@'.
+    if let Some(scheme_end) = dsn.find("://") {
+        let (head, rest) = dsn.split_at(scheme_end + 3);
+        if let Some(at) = rest.find('@') {
+            let creds = &rest[..at];
+            if let Some(colon) = creds.find(':') {
+                return format!("{head}{}:***{}", &creds[..colon], &rest[at..]);
+            }
+        }
+    }
+    // libpq keyword form: redact any `password=...` token.
+    dsn.split_whitespace()
+        .map(|t| {
+            if t.starts_with("password=") {
+                "password=***".to_string()
+            } else {
+                t.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One line of `dorm doctor`'s report.
+struct Check {
+    name: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+/// `dorm doctor`: config → connectivity → version → read-only → ledger. Native —
+/// it needs only a DSN, not your compiled models. Returns 3 if any check errored.
+async fn doctor(json: bool) -> CliResult {
+    let mut checks: Vec<Check> = Vec::new();
+
+    match db::dsn() {
+        Ok(dsn) => checks.push(Check {
+            name: "datasource",
+            status: "ok",
+            detail: redact(&dsn),
+        }),
+        Err(e) => {
+            checks.push(Check {
+                name: "datasource",
+                status: "error",
+                detail: e.to_string(),
+            });
+            return report_doctor(json, &checks);
+        }
+    }
+
+    match db::query("SELECT 1", &[]).await {
+        Ok(_) => checks.push(Check {
+            name: "connectivity",
+            status: "ok",
+            detail: "connected".into(),
+        }),
+        Err(e) => {
+            // Redact in case the driver echoed the DSN in its error.
+            checks.push(Check {
+                name: "connectivity",
+                status: "error",
+                detail: redact(&e.to_string()),
+            });
+            return report_doctor(json, &checks);
+        }
+    }
+
+    if let Ok(rows) = db::query("SELECT version()", &[]).await {
+        if let Some(row) = rows.first() {
+            checks.push(Check {
+                name: "server",
+                status: "ok",
+                detail: row.get::<_, String>(0),
+            });
+        }
+    }
+
+    if let Ok(rows) = db::query("SELECT current_setting('transaction_read_only')", &[]).await {
+        let ro: String = rows.first().map(|r| r.get(0)).unwrap_or_default();
+        checks.push(Check {
+            name: "read_only",
+            status: "ok",
+            detail: if ro == "on" {
+                "on".into()
+            } else {
+                "off".into()
+            },
+        });
+    }
+
+    if let Ok(rows) = db::query(
+        "SELECT to_regclass('public.orm_schema_migrations')::text",
+        &[],
+    )
+    .await
+    {
+        let present = rows
+            .first()
+            .map(|r| r.get::<_, Option<String>>(0))
+            .unwrap_or(None);
+        checks.push(Check {
+            name: "migrations_ledger",
+            status: "ok",
+            detail: if present.is_some() {
+                "present".into()
+            } else {
+                "absent".into()
+            },
+        });
+    }
+
+    report_doctor(json, &checks)
+}
+
+fn report_doctor(json: bool, checks: &[Check]) -> CliResult {
+    let problems = checks.iter().any(|c| c.status == "error");
+    if json {
+        let arr: Vec<_> = checks
+            .iter()
+            .map(|c| json!({ "name": c.name, "status": c.status, "detail": c.detail }))
+            .collect();
+        println!("{}", json!({ "ok": !problems, "checks": arr }));
+    } else {
+        for c in checks {
+            let mark = match c.status {
+                "ok" => "✓",
+                "error" => "✗",
+                _ => "!",
+            };
+            println!("  {mark} {:<18} {}", c.name, c.detail);
+        }
+        println!(
+            "{}",
+            if problems {
+                "doctor: problems found"
+            } else {
+                "doctor: ok"
+            }
+        );
+    }
+    Ok(if problems { 3 } else { 0 })
+}
+
+async fn migrate_status(json: bool) -> CliResult {
     let rows = match db::query(
         "SELECT version, name, applied_unix FROM orm_schema_migrations ORDER BY version",
         &[],
@@ -183,15 +369,35 @@ async fn migrate_status() -> CliResult {
     {
         Ok(rows) => rows,
         Err(_) => {
-            println!(
-                "no migrations recorded (the ledger `orm_schema_migrations` does not exist yet)."
-            );
-            return Ok(());
+            if json {
+                println!("{}", json!({ "applied": [] }));
+            } else {
+                println!("no migrations recorded (the ledger does not exist yet).");
+            }
+            return Ok(0);
         }
     };
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                let version: i64 = r.get(0);
+                let name: String = r.get(1);
+                let applied_unix: i64 = r.get(2);
+                json!({
+                    "version": version,
+                    "name": name,
+                    "applied_unix": applied_unix,
+                    "applied_at": applied_at(applied_unix),
+                })
+            })
+            .collect();
+        println!("{}", json!({ "applied": arr }));
+        return Ok(0);
+    }
     if rows.is_empty() {
         println!("the ledger is empty — no migrations applied.");
-        return Ok(());
+        return Ok(0);
     }
     println!("applied migrations:");
     for row in &rows {
@@ -200,7 +406,7 @@ async fn migrate_status() -> CliResult {
         let applied_unix: i64 = row.get(2);
         println!("  v{version:<4} {name:<24} {}", applied_at(applied_unix));
     }
-    Ok(())
+    Ok(0)
 }
 
 /// Render the ledger's Unix seconds as a readable UTC stamp, falling back to the
@@ -212,20 +418,20 @@ fn applied_at(unix: i64) -> String {
     }
 }
 
-async fn run_db(action: DbAction) -> CliResult {
+async fn run_db(action: DbAction, json: bool) -> CliResult {
     match action {
-        DbAction::Tables => db_tables().await,
-        DbAction::Show { table } => db_show(&table).await,
-        DbAction::Count { table } => db_count(&table).await,
+        DbAction::Tables => db_tables(json).await,
+        DbAction::Show { table } => db_show(&table, json).await,
+        DbAction::Count { table } => db_count(&table, json).await,
         DbAction::Rows {
             table,
             limit,
             filter,
-        } => db_rows(&table, limit, filter.as_deref()).await,
+        } => db_rows(&table, limit, filter.as_deref(), json).await,
     }
 }
 
-async fn db_tables() -> CliResult {
+async fn db_tables(json: bool) -> CliResult {
     let rows = db::query(
         "SELECT table_name FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
@@ -233,18 +439,21 @@ async fn db_tables() -> CliResult {
         &[],
     )
     .await?;
-    if rows.is_empty() {
-        println!("(no tables in the `public` schema)");
-        return Ok(());
+    let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    if json {
+        println!("{}", json!({ "tables": names }));
+        return Ok(0);
     }
-    for row in &rows {
-        let name: String = row.get(0);
+    if names.is_empty() {
+        println!("(no tables in the `public` schema)");
+    }
+    for name in &names {
         println!("  {name}");
     }
-    Ok(())
+    Ok(0)
 }
 
-async fn db_show(table: &str) -> CliResult {
+async fn db_show(table: &str, json: bool) -> CliResult {
     let rows = db::query(
         "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = $1 \
@@ -254,6 +463,20 @@ async fn db_show(table: &str) -> CliResult {
     .await?;
     if rows.is_empty() {
         return Err(format!("no table `{table}` in the `public` schema").into());
+    }
+    if json {
+        let cols: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.get::<_, String>(0),
+                    "type": r.get::<_, String>(1),
+                    "nullable": r.get::<_, String>(2) == "YES",
+                })
+            })
+            .collect();
+        println!("{}", json!({ "table": table, "columns": cols }));
+        return Ok(0);
     }
     println!("{table}");
     let table_rows: Vec<Vec<String>> = rows
@@ -274,19 +497,23 @@ async fn db_show(table: &str) -> CliResult {
         &["column".into(), "type".into(), String::new()],
         &table_rows,
     );
-    Ok(())
+    Ok(0)
 }
 
-async fn db_count(table: &str) -> CliResult {
-    validate_table(table).await?;
+async fn db_count(table: &str, json: bool) -> CliResult {
+    table_columns(table).await?; // validates the name before it is quoted in
     let sql = format!("SELECT count(*) FROM {}", quote_ident(table));
     let rows = db::query(&sql, &[]).await?;
     let n: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
-    println!("{n}");
-    Ok(())
+    if json {
+        println!("{}", json!({ "table": table, "count": n }));
+    } else {
+        println!("{n}");
+    }
+    Ok(0)
 }
 
-async fn db_rows(table: &str, limit: i64, filter: Option<&str>) -> CliResult {
+async fn db_rows(table: &str, limit: i64, filter: Option<&str>, json: bool) -> CliResult {
     // Table and column names cannot be bound parameters, so they are validated
     // against the catalogue first and only names that are really there are quoted
     // in. Every *value* — the projected cells and the `--where` operand — is a
@@ -316,11 +543,7 @@ async fn db_rows(table: &str, limit: i64, filter: Option<&str>) -> CliResult {
     params.push(&limit);
 
     let rows = db::query(&sql, &params).await?;
-    if rows.is_empty() {
-        println!("(0 rows)");
-        return Ok(());
-    }
-    let table_rows: Vec<Vec<String>> = rows
+    let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
             (0..names.len())
@@ -331,13 +554,37 @@ async fn db_rows(table: &str, limit: i64, filter: Option<&str>) -> CliResult {
                 .collect()
         })
         .collect();
-    print_table(&names, &table_rows);
+
+    if json {
+        let objs: Vec<_> = cells
+            .iter()
+            .map(|r| {
+                let m: serde_json::Map<String, serde_json::Value> = names
+                    .iter()
+                    .zip(r)
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({ "table": table, "columns": names, "rows": objs, "count": cells.len() })
+        );
+        return Ok(0);
+    }
+
+    if cells.is_empty() {
+        println!("(0 rows)");
+        return Ok(0);
+    }
+    print_table(&names, &cells);
     println!(
         "({} row{})",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" }
+        cells.len(),
+        if cells.len() == 1 { "" } else { "s" }
     );
-    Ok(())
+    Ok(0)
 }
 
 /// The column names of a table, in declaration order; errors if the table does
@@ -354,10 +601,6 @@ async fn table_columns(table: &str) -> Result<Vec<String>, Box<dyn std::error::E
         return Err(format!("no table `{table}` in the `public` schema").into());
     }
     Ok(cols.iter().map(|r| r.get::<_, String>(0)).collect())
-}
-
-async fn validate_table(table: &str) -> CliResult {
-    table_columns(table).await.map(|_| ())
 }
 
 /// Print a left-aligned table: each column as wide as its widest cell (header
