@@ -41,7 +41,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm db pull [--out]` | Introspect a live PostgreSQL schema into `dorm.schema`. | 0/1 | **done** | Native; recovers tables, columns, types, serial/PK, nullability, foreign keys (with `@@map`). Approximate — not unique/index/length/check/ordering or relation `onDelete`; the file says so. Round-trips through `dorm generate`. |
 | `dorm api generate` / `dorm api serve` | Generate (`src/bin/api.rs`) and serve an Axum CRUD API + OpenAPI over the models. | 0/1 | **done** | Full CRUD: `GET`/`POST /<table>`, `GET`/`PATCH`/`DELETE /<table>/{id}`, `/openapi.json`, `/health`. Handlers go through the `QuerySet`; `DORM_API_ADDR` sets host:port. Generated code — see ADR 0001. |
 | `dorm db seed` | Run configured seeds. | — | **planned** | |
-| `dorm db execute` | Run explicit SQL with parameters. | — | **planned** | |
+| `dorm db execute` | Run explicit SQL with parameters. | — | **planned** | The library half shipped (ADR 0005): `db::sql`, `db::sql_execute` (read-only-guarded), and `Manager::raw` (typed). This command is the CLI surface over them. |
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
 | `dorm migrate resolve` | Reconcile ledger after manual recovery. | — | **planned** | Must never mark applied without evidence. |
 | `dorm dbshell` | Open the native DB client (`psql`, …). | — | **planned** | Per-backend. |

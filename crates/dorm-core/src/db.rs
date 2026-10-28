@@ -294,6 +294,33 @@ pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
     }
 }
 
+// ------------------------------------------------------- raw SQL (ADR 0005)
+//
+// The sanctioned escape hatch for a query the compiler cannot build. Every
+// value is still a bound parameter; the text between the placeholders is the
+// caller's. These route through the same backend seam as the typed path, so a
+// raw statement observes the transaction in scope, the pool, the statement
+// timeout, TLS and the read-only guard — nothing steps outside those.
+
+/// Raw read: run hand-written SQL and get untyped [`Row`]s back.
+///
+/// For a result that maps onto a model, use `Manager::raw` instead, which runs
+/// this and decodes each row with `from_row`. Every `params` element is bound as
+/// `$n`/`?n`; the SQL text is the caller's (ADR 0005).
+pub async fn sql(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    fetch(sql, params).await
+}
+
+/// Raw write: run hand-written DML and report the rows affected.
+///
+/// Refused under [`set_read_only`] like every other write, with a named
+/// [`Error::ReadOnly`] — so a read-only session stays read-only even through the
+/// escape hatch (ADR 0005).
+pub async fn sql_execute(sql: &str, params: &[Value]) -> Result<u64> {
+    guard_write("sql_execute")?;
+    run(sql, params).await
+}
+
 /// Run DDL — one or more parameterless statements — against the configured
 /// backend. Used to stand a schema up before the typed path queries it.
 pub async fn run_ddl(ddl: &str) -> Result<()> {
@@ -830,6 +857,16 @@ mod tests {
         assert!(e.contains("delete"), "{e}");
         set_read_only(false);
         assert!(guard_write("delete").is_ok());
+    }
+
+    #[tokio::test]
+    async fn raw_execute_is_refused_in_a_read_only_session() {
+        // The read-only guard must cover the escape hatch too (ADR 0005), or a
+        // read-only session is only read-only until someone drops to raw SQL.
+        set_read_only(true);
+        let err = sql_execute("delete from whatever", &[]).await.unwrap_err();
+        assert!(matches!(err, Error::ReadOnly("sql_execute")), "{err}");
+        set_read_only(false);
     }
 
     #[test]

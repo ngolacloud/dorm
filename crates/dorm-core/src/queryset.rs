@@ -105,6 +105,28 @@ impl<T: Model> Manager<T> {
         QuerySet::new().filter(q).get().await
     }
 
+    /// Run hand-written SQL and map each row back to `T` — Django's
+    /// `Model.objects.raw` (ADR 0005). The escape hatch for a query the compiler
+    /// cannot build (a CTE, a window function, a planner hint).
+    ///
+    /// The `SELECT` must return the model's columns in the model's field order:
+    /// `from_row` reads by position, not by name. Every `params` element is bound
+    /// as `$n`/`?n` — no value is formatted into the text, so the only injection
+    /// risk is one the caller writes into the SQL string itself.
+    ///
+    /// ```ignore
+    /// let active: Vec<Tenant> = Tenant::objects()
+    ///     .raw(
+    ///         "SELECT id, slug, name FROM tenants WHERE slug = $1",
+    ///         &["acme".to_value()],
+    ///     )
+    ///     .await?;
+    /// ```
+    pub async fn raw(&self, sql: &str, params: &[Value]) -> Result<Vec<T>> {
+        let rows = db::sql(sql, params).await?;
+        rows.iter().map(|row| T::from_row(row, 0)).collect()
+    }
+
     /// Insert one row and return it as stored, with database-generated columns
     /// filled in.
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
