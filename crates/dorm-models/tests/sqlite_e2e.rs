@@ -123,5 +123,99 @@ fn the_typed_queryset_runs_end_to_end_on_sqlite() {
             1,
             "only globex remains"
         );
+
+        // atomic() — a failing block rolls its write back, exactly as on
+        // PostgreSQL. The create inside the block hits the connection, then the
+        // Err unwinds it: counting the slug afterwards must find nothing.
+        let outcome: Result<()> = db::atomic(|_tx| async {
+            Tenant::objects()
+                .create(NewTenant {
+                    slug: "rollback-me".into(),
+                    name: "Doomed".into(),
+                })
+                .await?;
+            Err(Error::RolledBack("rollback".into()))
+        })
+        .await;
+        assert!(outcome.is_err(), "the block must report the failure");
+        assert_eq!(
+            Tenant::objects()
+                .filter(tenant::slug.eq("rollback-me"))
+                .count()
+                .await
+                .expect("count the rolled-back slug"),
+            0,
+            "the insert inside the failed atomic must have been rolled back"
+        );
+
+        // atomic() — a block that succeeds commits its write.
+        db::atomic(|_tx| async {
+            Tenant::objects()
+                .create(NewTenant {
+                    slug: "committed".into(),
+                    name: "Kept".into(),
+                })
+                .await?;
+            Ok::<(), Error>(())
+        })
+        .await
+        .expect("the atomic commits");
+        assert_eq!(
+            Tenant::objects()
+                .filter(tenant::slug.eq("committed"))
+                .count()
+                .await
+                .expect("count the committed slug"),
+            1,
+            "the insert inside the ok atomic must have committed"
+        );
+
+        // A savepoint rolls back without losing the outer transaction's work,
+        // the nested-atomic guarantee the REPL relies on.
+        let outcome: Result<()> = db::atomic(|outer| async move {
+            assert_eq!(outer.depth(), 1);
+            assert!(!outer.is_savepoint());
+            Tenant::objects()
+                .create(NewTenant {
+                    slug: "outer-kept".into(),
+                    name: "Outer".into(),
+                })
+                .await?;
+
+            let inner: Result<()> = db::atomic(|sp| async move {
+                assert_eq!(sp.depth(), 2);
+                assert!(sp.is_savepoint());
+                Tenant::objects()
+                    .create(NewTenant {
+                        slug: "inner-discarded".into(),
+                        name: "Inner".into(),
+                    })
+                    .await?;
+                Err(Error::RolledBack("inner".into()))
+            })
+            .await;
+            assert!(inner.is_err(), "the savepoint must report its failure");
+            Ok(())
+        })
+        .await;
+        assert!(outcome.is_ok(), "the outer transaction must still commit");
+        assert_eq!(
+            Tenant::objects()
+                .filter(tenant::slug.eq("outer-kept"))
+                .count()
+                .await
+                .expect("count the outer slug"),
+            1,
+            "the outer insert committed"
+        );
+        assert_eq!(
+            Tenant::objects()
+                .filter(tenant::slug.eq("inner-discarded"))
+                .count()
+                .await
+                .expect("count the savepoint slug"),
+            0,
+            "the savepoint's insert was undone"
+        );
     });
 }

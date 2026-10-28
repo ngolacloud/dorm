@@ -258,9 +258,9 @@ pub fn dialect() -> Dialect {
 /// Run a row-returning statement against the configured backend, taking ORM
 /// values and handing back backend-agnostic [`Row`]s.
 ///
-/// The PostgreSQL path reuses [`query`], so it keeps the transaction-in-scope
-/// routing; the SQLite path has no transaction support yet (`atomic` is
-/// PostgreSQL-only) and runs standalone.
+/// Both paths keep the transaction-in-scope routing: PostgreSQL reuses [`query`]
+/// (routed by [`CURRENT_TX`]); SQLite checks its own transaction task-local and,
+/// inside an [`atomic`], runs on the connection the transaction already holds.
 pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
     match backend()? {
         Backend::Postgres => {
@@ -318,26 +318,81 @@ fn sqlite_disabled() -> Error {
 
 /// The SQLite backend: a single shared connection, driven synchronously under
 /// `spawn_blocking`.
+///
+/// ## Why transactions need a lock the whole connection holds for their scope
+///
+/// PostgreSQL gets isolation for free: `atomic` takes a *dedicated* pooled
+/// connection, and every other task works on a different one. SQLite has one
+/// connection for the whole process, so the only way another task cannot observe
+/// the connection mid-`BEGIN` is to deny it the connection for the transaction's
+/// scope. That is [`TX_LOCK`]: an async mutex the outer `atomic` holds from
+/// `BEGIN` to `COMMIT`/`ROLLBACK`, and that every standalone statement acquires
+/// per call. The per-statement `Mutex` on the connection itself is still taken
+/// inside each `spawn_blocking` — but it is released between statements, so it
+/// cannot be what keeps a transaction private; `TX_LOCK` is.
+///
+/// Inside the transaction, the closure's own `fetch`/`run` must *not* re-acquire
+/// `TX_LOCK` — the transaction already holds it — so a [`SQLITE_TX`] task-local
+/// marks the scope and those calls run straight on the connection.
 #[cfg(feature = "sqlite")]
 mod sqlite {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    use super::{dsn, Error, Result};
+    use super::{dsn, savepoint_name, Error, Result, Tx};
     use crate::row::{value_to_sqlite, Row, SqliteRow};
     use crate::value::Value;
 
-    static CONN: OnceLock<std::sync::Arc<Mutex<rusqlite::Connection>>> = OnceLock::new();
+    static CONN: OnceLock<Arc<Mutex<rusqlite::Connection>>> = OnceLock::new();
+
+    /// Serialises logical access to the single connection. An outer `atomic`
+    /// holds it for its whole scope; a standalone statement holds it for one call.
+    /// This — not the per-call connection `Mutex` — is what keeps a transaction
+    /// from being observed mid-flight by another task.
+    static TX_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+
+    /// The savepoint depth of the transaction in scope, shared so a nested
+    /// `atomic` (a savepoint) can bump it and the outer frame can read it back.
+    #[derive(Clone)]
+    struct SqliteTxState {
+        depth: Arc<Mutex<usize>>,
+    }
+
+    tokio::task_local! {
+        /// Set by the outer [`atomic`] for the duration of its closure. Its
+        /// presence is what tells a standalone statement it is already inside a
+        /// transaction and must not re-acquire [`TX_LOCK`].
+        static SQLITE_TX: SqliteTxState;
+    }
+
+    fn tx_lock() -> Arc<tokio::sync::Mutex<()>> {
+        TX_LOCK
+            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether a SQLite transaction is in scope on this task.
+    fn in_tx() -> bool {
+        SQLITE_TX.try_with(|_| ()).is_ok()
+    }
+
+    /// Acquire the connection lock for a standalone statement, or `None` when a
+    /// transaction already holds it. Held across the statement's `.await`.
+    async fn lock_if_standalone() -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if in_tx() {
+            None
+        } else {
+            Some(tx_lock().lock_owned().await)
+        }
+    }
 
     /// The shared connection, opened once from the DSN.
-    fn conn() -> Result<std::sync::Arc<Mutex<rusqlite::Connection>>> {
+    fn conn() -> Result<Arc<Mutex<rusqlite::Connection>>> {
         if let Some(c) = CONN.get() {
             return Ok(c.clone());
         }
         let dsn = dsn()?;
         let c = open(&dsn)?;
-        Ok(CONN
-            .get_or_init(|| std::sync::Arc::new(Mutex::new(c)))
-            .clone())
+        Ok(CONN.get_or_init(|| Arc::new(Mutex::new(c))).clone())
     }
 
     /// Open a connection for the DSN. `sqlite::memory:`, `sqlite:` and `:memory:`
@@ -357,6 +412,29 @@ mod sqlite {
     }
 
     pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        let _lock = lock_if_standalone().await;
+        fetch_on_conn(sql, params).await
+    }
+
+    pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+        let _lock = lock_if_standalone().await;
+        run_on_conn(sql, params).await
+    }
+
+    pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+        let _lock = lock_if_standalone().await;
+        let conn = conn()?;
+        let ddl = ddl.to_string();
+        blocking(move || {
+            let guard = conn.lock().map_err(|_| poisoned())?;
+            guard.execute_batch(&ddl).map_err(db_err)
+        })
+        .await
+    }
+
+    /// Run a row-returning statement on the connection, assuming the caller holds
+    /// the connection lock (standalone statement) or is inside a transaction.
+    async fn fetch_on_conn(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         let conn = conn()?;
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
@@ -380,7 +458,9 @@ mod sqlite {
         .await
     }
 
-    pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+    /// Run a row-count statement on the connection, under the same assumption as
+    /// [`fetch_on_conn`].
+    async fn run_on_conn(sql: &str, params: &[Value]) -> Result<u64> {
         let conn = conn()?;
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
@@ -394,14 +474,108 @@ mod sqlite {
         .await
     }
 
-    pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+    /// Issue a parameterless transaction-control statement (`BEGIN`, `COMMIT`,
+    /// `SAVEPOINT …`, `ROLLBACK …`) on the connection without touching
+    /// [`TX_LOCK`]: the transaction frame already holds it.
+    async fn control(sql: &str) -> Result<()> {
         let conn = conn()?;
-        let ddl = ddl.to_string();
+        let sql = sql.to_string();
         blocking(move || {
             let guard = conn.lock().map_err(|_| poisoned())?;
-            guard.execute_batch(&ddl).map_err(db_err)
+            guard.execute_batch(&sql).map_err(db_err)
         })
         .await
+    }
+
+    /// Run `f` inside a SQLite transaction. The outer call holds [`TX_LOCK`] for
+    /// the whole scope and brackets the closure with `BEGIN` …
+    /// `COMMIT`/`ROLLBACK`; a nested call is a `SAVEPOINT`, undoing only its own
+    /// work on `Err` while the outer transaction stays usable.
+    pub(super) async fn atomic<F, Fut, T>(f: F) -> Result<T>
+    where
+        F: FnOnce(Tx) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        if in_tx() {
+            // A savepoint: already holding the connection via the outer frame.
+            let state = SQLITE_TX.with(|s| s.clone());
+            let depth = {
+                let mut d = state.depth.lock().map_err(|_| poisoned())?;
+                *d += 1;
+                *d
+            };
+            let name = savepoint_name(depth);
+            control(&format!("SAVEPOINT {name}")).await?;
+            let outcome = f(Tx { depth }).await;
+            {
+                let mut d = state.depth.lock().map_err(|_| poisoned())?;
+                *d -= 1;
+            }
+            match outcome {
+                Ok(v) => {
+                    control(&format!("RELEASE SAVEPOINT {name}")).await?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    control(&format!("ROLLBACK TO SAVEPOINT {name}")).await?;
+                    control(&format!("RELEASE SAVEPOINT {name}")).await?;
+                    Err(e)
+                }
+            }
+        } else {
+            // The outermost transaction. Hold the connection lock for the scope.
+            let conn = conn()?;
+            let guard = tx_lock().lock_owned().await;
+            control("BEGIN").await?;
+
+            // On a panic, async unwinding cannot `.await` a rollback — but SQLite
+            // is synchronous, so a best-effort `ROLLBACK` in `Drop` reaches the
+            // connection and leaves it clean for the next transaction. Disarmed
+            // once control returns normally.
+            let mut panic_guard = RollbackOnPanic {
+                conn: conn.clone(),
+                armed: true,
+            };
+
+            let state = SqliteTxState {
+                depth: Arc::new(Mutex::new(1)),
+            };
+            let outcome = SQLITE_TX.scope(state, f(Tx { depth: 1 })).await;
+            panic_guard.armed = false;
+
+            let result = match outcome {
+                Ok(v) => control("COMMIT").await.map(|()| v),
+                Err(e) => {
+                    // The rollback's own failure must not hide the error that
+                    // caused it; that is the one the caller needs to read.
+                    let _ = control("ROLLBACK").await;
+                    Err(e)
+                }
+            };
+            drop(guard);
+            result
+        }
+    }
+
+    /// Rolls the connection back synchronously if dropped while armed — which
+    /// only happens on a panic unwinding out of the transaction's closure.
+    struct RollbackOnPanic {
+        conn: Arc<Mutex<rusqlite::Connection>>,
+        armed: bool,
+    }
+
+    impl Drop for RollbackOnPanic {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            // No `spawn_blocking` can hold the connection `Mutex` at this point:
+            // the panic is unwinding the async task frame itself, so a plain lock
+            // and a synchronous `ROLLBACK` are safe and best-effort.
+            if let Ok(guard) = self.conn.lock() {
+                let _ = guard.execute_batch("ROLLBACK");
+            }
+        }
     }
 
     /// Run a blocking SQLite closure on tokio's blocking pool, flattening the
@@ -481,7 +655,28 @@ impl Drop for PanicGuard {
 /// Nesting is by savepoint: an inner `atomic` that fails undoes only its own
 /// work, and the outer transaction can still commit. That is what makes the
 /// REPL's `atomic(|| { … throw "rollback"; })` undo exactly the block.
+///
+/// The backend is the DSN's: PostgreSQL takes a dedicated pooled connection and
+/// routes through [`CURRENT_TX`]; SQLite holds its single shared connection for
+/// the scope and routes through the parallel `sqlite` transaction path. Neither
+/// closure signature changes, so `atomic(|tx| …)` reads the same on both.
 pub async fn atomic<F, Fut, T>(f: F) -> Result<T>
+where
+    F: FnOnce(Tx) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    match backend()? {
+        Backend::Postgres => atomic_pg(f).await,
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => sqlite::atomic(f).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+/// The PostgreSQL transaction path: a dedicated pooled connection in a task-local,
+/// `BEGIN`/`SAVEPOINT` issued directly. See the module docs for why.
+async fn atomic_pg<F, Fut, T>(f: F) -> Result<T>
 where
     F: FnOnce(Tx) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
