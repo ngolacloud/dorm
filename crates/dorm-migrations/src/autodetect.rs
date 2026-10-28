@@ -22,8 +22,9 @@
 //!
 //! # In-place column alterations
 //!
-//! A column whose **type or nullability** changed is altered in place:
-//! PostgreSQL gets a targeted `ALTER COLUMN … TYPE` / `SET`/`DROP NOT NULL`;
+//! A column whose **type, nullability, default or uniqueness** changed is altered
+//! in place: PostgreSQL gets targeted `ALTER COLUMN … TYPE` / `SET`/`DROP NOT
+//! NULL` / `SET`/`DROP DEFAULT` and `ADD`/`DROP CONSTRAINT … UNIQUE` statements;
 //! SQLite — which cannot `ALTER COLUMN` at all — gets a **table rebuild** (build
 //! the new shape under a temporary name, copy the shared columns, drop the old
 //! table, rename the new one in, recreate the indexes), the procedure the SQLite
@@ -32,12 +33,11 @@
 //!
 //! # What it still refuses rather than get wrong
 //!
-//! On PostgreSQL, a change to a column's **uniqueness, default, primary key or
-//! foreign key**, and any change to a table's composite `UNIQUE`/`CHECK`, are
-//! returned as [`Error::UnsupportedChange`] — those need named constraints this
-//! version does not yet manage. (SQLite handles them via the rebuild.) Following
-//! the roadmap's rule: unsupported capabilities return an explicit error, never
-//! a wrong result.
+//! On PostgreSQL, a change to a column's **primary key or foreign key**, and any
+//! change to a table's composite `UNIQUE`/`CHECK`, are returned as
+//! [`Error::UnsupportedChange`] — those restructure the table rather than alter a
+//! column. (SQLite handles them via the rebuild.) Following the roadmap's rule:
+//! unsupported capabilities return an explicit error, never a wrong result.
 //!
 //! [ADR 0072]: ../../docs/adr/0072-arquitectura-alvo-de-crates-e-o-orm-como-camada-de-persistencia.md
 
@@ -364,47 +364,48 @@ fn sqlite_rebuild(prev: &Table, cur: &Table, meta: &'static ModelMeta) -> Result
     Ok(out)
 }
 
-/// The PostgreSQL `ALTER COLUMN` statements for one changed column, when the only
-/// things that changed are its type and/or its nullability — the two alterations
-/// a plain `ALTER COLUMN` expresses safely. Any other change (uniqueness,
-/// default, primary key, or a foreign key) is an [`Error::UnsupportedChange`]:
-/// those need named constraints this version does not yet manage.
+/// The PostgreSQL `ALTER` statements for one changed column, covering a change
+/// to its type, nullability, default, or uniqueness. A change to the column's
+/// **primary key** or **foreign key** is an [`Error::UnsupportedChange`] — those
+/// restructure the table and are not a single `ALTER COLUMN`.
+///
+/// The unique constraint is dropped by the name PostgreSQL itself gives an inline
+/// `UNIQUE` column, `<table>_<column>_key`, so a drop matches what `CREATE TABLE`
+/// made; an added one is created under that same name so the next drop will too.
+/// A name past PostgreSQL's 63-byte identifier limit is refused rather than
+/// silently truncated into a drop that cannot find it.
 fn pg_column_alters(
     prev: &Column,
     cur: &Column,
     table: &str,
     field: &FieldMeta,
 ) -> Result<Vec<String>> {
-    // Everything but type and nullability (and the index flag, handled apart)
-    // must be identical; otherwise this is not an alteration we generate.
-    let normalised = Column {
-        ty: cur.ty.clone(),
-        nullable: cur.nullable,
-        index: cur.index,
-        ..prev.clone()
-    };
-    if normalised != *cur {
+    // The table-restructuring changes are out of scope for a column `ALTER`.
+    if prev.primary_key != cur.primary_key {
         return Err(Error::UnsupportedChange(format!(
-            "column `{}` of table `{table}`: a change to uniqueness, default, \
-             primary key or foreign key — only type and nullability are generated",
+            "column `{}` of table `{table}`: changing its primary key",
+            cur.name
+        )));
+    }
+    if prev.references != cur.references {
+        return Err(Error::UnsupportedChange(format!(
+            "column `{}` of table `{table}`: changing its foreign key",
             cur.name
         )));
     }
 
     let mut out = Vec::new();
+
     if prev.ty != cur.ty {
-        if field.relation.is_some() {
-            return Err(Error::UnsupportedChange(format!(
-                "column `{}` of table `{table}`: changing a foreign key's type",
-                cur.name
-            )));
-        }
+        // A plain column: a foreign key's type follows its target, so with the
+        // reference unchanged the type cannot have, and we never reach here.
         out.push(format!(
             "ALTER TABLE {table} ALTER COLUMN {} TYPE {}",
             cur.name,
             field.ty.sql_type()
         ));
     }
+
     if prev.nullable != cur.nullable {
         let verb = if cur.nullable {
             "DROP NOT NULL"
@@ -416,7 +417,51 @@ fn pg_column_alters(
             cur.name
         ));
     }
+
+    if pg_default(prev) != pg_default(cur) {
+        out.push(match pg_default(cur) {
+            Some(d) => format!(
+                "ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {d}",
+                cur.name
+            ),
+            None => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", cur.name),
+        });
+    }
+
+    if prev.unique != cur.unique {
+        let name = format!("{table}_{}_key", cur.name);
+        if name.len() > 63 {
+            return Err(Error::UnsupportedChange(format!(
+                "column `{}` of table `{table}`: the unique constraint name \
+                 `{name}` exceeds PostgreSQL's 63-byte identifier limit",
+                cur.name
+            )));
+        }
+        out.push(if cur.unique {
+            format!(
+                "ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({})",
+                cur.name
+            )
+        } else {
+            format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}")
+        });
+    }
+
     Ok(out)
+}
+
+/// The effective PostgreSQL column default a snapshot column implies: an explicit
+/// default wins; failing that, an `auto_now_add`/`auto_now` column defaults to
+/// `now()` — mirroring [`crate::ddl`]'s `effective_default`, but read from the
+/// snapshot so it needs no live field.
+fn pg_default(c: &Column) -> Option<String> {
+    c.default.clone().or_else(|| {
+        if c.auto_now_add || c.auto_now {
+            Some("now()".to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// The next versioned migration and the snapshot it leaves behind, or `None`
@@ -632,8 +677,8 @@ mod tests {
     }
 
     #[test]
-    fn postgres_refuses_a_change_it_cannot_name_a_constraint_for() {
-        // title gains UNIQUE — an ADD CONSTRAINT this version does not manage.
+    fn postgres_adds_and_drops_a_unique_constraint_by_its_conventional_name() {
+        // title gains UNIQUE: an ADD CONSTRAINT under PostgreSQL's own name…
         const TITLE_UNIQUE: FieldMeta = FieldMeta {
             unique: true,
             ..col("title", FieldType::Text)
@@ -648,11 +693,78 @@ mod tests {
             unique_together: &[],
             checks: &[],
         };
+        let v1 = Snapshot::from_models(&[&NOTE_V1_META]);
+        let add = autodetect(&v1, &[&UNIQ_META], Backend::Postgres).unwrap();
+        assert_eq!(
+            add,
+            vec!["ALTER TABLE notes ADD CONSTRAINT notes_title_key UNIQUE (title)".to_string()]
+        );
+        // …and dropping it later targets the same name.
+        let v2 = Snapshot::from_models(&[&UNIQ_META]);
+        let drop = autodetect(&v2, &[&NOTE_V1_META], Backend::Postgres).unwrap();
+        assert_eq!(
+            drop,
+            vec!["ALTER TABLE notes DROP CONSTRAINT IF EXISTS notes_title_key".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_sets_and_drops_a_column_default() {
+        const TITLE_DEFAULTED: FieldMeta = FieldMeta {
+            default: Some("'untitled'"),
+            ..col("title", FieldType::Text)
+        };
+        const DEF_FIELDS: &[FieldMeta] = &[ID, TITLE_DEFAULTED];
+        const DEF_META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: DEF_FIELDS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let v1 = Snapshot::from_models(&[&NOTE_V1_META]);
+        let set = autodetect(&v1, &[&DEF_META], Backend::Postgres).unwrap();
+        assert_eq!(
+            set,
+            vec!["ALTER TABLE notes ALTER COLUMN title SET DEFAULT 'untitled'".to_string()]
+        );
+        let v2 = Snapshot::from_models(&[&DEF_META]);
+        let drop = autodetect(&v2, &[&NOTE_V1_META], Backend::Postgres).unwrap();
+        assert_eq!(
+            drop,
+            vec!["ALTER TABLE notes ALTER COLUMN title DROP DEFAULT".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_still_refuses_a_foreign_key_change() {
+        // A plain column becoming a foreign key restructures the table.
+        use dorm_core::meta::{OnDelete, Relation};
+        const TITLE_FK: FieldMeta = FieldMeta {
+            relation: Some(Relation {
+                model: "Other",
+                on_delete: OnDelete::Cascade,
+                related_name: None,
+            }),
+            ..col("title", FieldType::I64)
+        };
+        const FK_FIELDS: &[FieldMeta] = &[ID, TITLE_FK];
+        const FK_META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: FK_FIELDS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
         let prev = Snapshot::from_models(&[&NOTE_V1_META]);
-        let err = autodetect(&prev, &[&UNIQ_META], Backend::Postgres).unwrap_err();
+        let err = autodetect(&prev, &[&FK_META], Backend::Postgres).unwrap_err();
         assert!(
             matches!(err, Error::UnsupportedChange(_)),
-            "a uniqueness change must still be an explicit error on PG, got {err:?}"
+            "a foreign-key change must still be an explicit error, got {err:?}"
         );
     }
 
