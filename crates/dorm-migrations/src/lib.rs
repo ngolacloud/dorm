@@ -35,6 +35,7 @@
 
 pub mod autodetect;
 pub mod ddl;
+pub mod history;
 pub mod migrator;
 
 /// What can go wrong building or applying a migration.
@@ -56,9 +57,15 @@ pub enum Error {
     /// message names the table and what changed; the next version handles these.
     #[error("unsupported schema change: {0}")]
     UnsupportedChange(String),
+    /// A problem reading or writing the on-disk migration history: a directory
+    /// that cannot be read, a file that is not valid JSON, or a backend that does
+    /// not match the migrations already there. The message says which.
+    #[error("migration history: {0}")]
+    History(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub use autodetect::{autodetect, make_migration, Snapshot};
+pub use history::{History, StoredMigration};
 pub use migrator::{diff, initial, migrate, sync, Migration};

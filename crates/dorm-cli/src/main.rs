@@ -138,8 +138,17 @@ enum NewKind {
 
 #[derive(Subcommand)]
 enum MigrateAction {
-    /// Apply reviewed migrations (the initial migration). The default when
-    /// `migrate` is given no subcommand. (`cargo run --bin migrate`.)
+    /// Author the next migration: diff your models against the recorded history
+    /// in `migrations/` and write the new migration file. Like `prisma migrate
+    /// dev`/Django `makemigrations`. (`cargo run --bin makemigration`.)
+    Make {
+        /// A short name for the migration, e.g. `add_body`.
+        #[arg(default_value = "migration")]
+        name: String,
+    },
+    /// Apply the recorded migration chain in `migrations/` (or the initial
+    /// schema when there is none yet). The default when `migrate` is given no
+    /// subcommand. Like `prisma migrate deploy`. (`cargo run --bin migrate`.)
     Deploy,
     /// Show which migration versions the database has recorded as applied.
     Status,
@@ -201,6 +210,7 @@ fn main() -> ExitCode {
         CliCommand::Validate => cargo_run("validate", json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
+            MigrateAction::Make { name } => cargo_run_args("makemigration", &[&name], false),
             MigrateAction::Deploy => cargo_run("migrate", false),
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
@@ -245,10 +255,20 @@ fn on_runtime(fut: impl std::future::Future<Output = CliResult>) -> CliResult {
 /// `--json` when asked. Its exit code becomes ours, so a `validate` that exits 3
 /// surfaces as 3.
 fn cargo_run(bin: &str, json: bool) -> CliResult {
+    cargo_run_args(bin, &[], json)
+}
+
+/// Build and run a project binary, forwarding `args` to it after `--`. Used by
+/// `migrate make`, which passes the migration name to the `makemigration` bin.
+fn cargo_run_args(bin: &str, args: &[&str], json: bool) -> CliResult {
     let mut cmd = Command::new("cargo");
     cmd.arg("run").arg("--quiet").arg("--bin").arg(bin);
-    if json {
-        cmd.arg("--").arg("--json");
+    if json || !args.is_empty() {
+        cmd.arg("--");
+        cmd.args(args);
+        if json {
+            cmd.arg("--json");
+        }
     }
     let status = cmd.status().map_err(|e| {
         format!(

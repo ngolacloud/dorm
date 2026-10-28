@@ -47,6 +47,10 @@ pub fn init(name: Option<&str>) -> CliResult {
     write(root.join("src/lib.rs"), &render(LIB_RS))?;
     write(root.join("src/main.rs"), &render(MAIN_RS))?;
     write(root.join("src/bin/migrate.rs"), &render(MIGRATE_RS))?;
+    write(
+        root.join("src/bin/makemigration.rs"),
+        &render(MAKEMIGRATION_RS),
+    )?;
     write(root.join("src/bin/sync.rs"), &render(SYNC_RS))?;
     write(root.join("src/bin/diff.rs"), &render(DIFF_RS))?;
     write(root.join("src/bin/validate.rs"), &render(VALIDATE_RS))?;
@@ -65,6 +69,8 @@ pub fn init(name: Option<&str>) -> CliResult {
     println!("  dorm validate                  # check the models for mistakes");
     println!("  dorm doctor                    # check config and connectivity");
     println!("  dorm push                      # create tables/columns to match your models");
+    println!("  dorm migrate make <name>       # or: author a versioned migration");
+    println!("  dorm migrate deploy            #      and apply the recorded chain");
     println!("  dorm shell                     # a REPL over your models");
     println!("  dorm api generate && dorm api serve   # an Axum read API + OpenAPI");
     Ok(())
@@ -205,7 +211,7 @@ default-run = "__APP_NAME__"
 [dependencies]
 dorm-core = "0.6"
 dorm-derive = "0.3"
-dorm-migrations = "0.4"
+dorm-migrations = "0.7"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
@@ -237,8 +243,20 @@ dorm db tables                  # browse the live database
 ```
 
 Add a model with `dorm new model <Name>` (appends to `dorm.schema`) or by editing
-`dorm.schema` directly, then `dorm generate` and `dorm push`. `dorm migrate` is
-the versioned alternative to `dorm push`.
+`dorm.schema` directly, then `dorm generate` and `dorm push`.
+
+For versioned, reviewable migrations instead of `push`, use the history in
+`migrations/`:
+
+```sh
+dorm migrate make add_body       # author the next migration from your models
+dorm migrate deploy              # apply the recorded chain (or the initial schema)
+dorm migrate status              # which versions the database has applied
+```
+
+`make` diffs your models against the last recorded migration and writes the new
+one; `deploy` applies the chain in order and is idempotent. Like Django's
+`makemigrations`/`migrate` and Prisma's `migrate dev`/`deploy`.
 "#;
 
 const LIB_RS: &str = r#"//! The project. The models are generated from `dorm.schema` into `models.rs`
@@ -273,20 +291,54 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 "#;
 
-const MIGRATE_RS: &str = r#"//! `dorm migrate` runs this: build the initial migration from the models and
-//! apply it to DELONIX_ORM_DSN. Idempotent — a second run is a no-op.
+const MIGRATE_RS: &str = r#"//! `dorm migrate deploy` runs this: apply the recorded migration chain in
+//! `migrations/` to DELONIX_ORM_DSN, in order. When there is no history yet it
+//! falls back to the initial schema straight from the models, so a fresh project
+//! migrates out of the box. Idempotent — a second run is a no-op.
 
 use dorm_migrations as mig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let models = __APP_CRATE__::all_models();
-    let initial = mig::initial(&models)?;
-    let applied = mig::migrate(std::slice::from_ref(&initial)).await?;
+    let history = mig::History::open("migrations");
+    let chain = history.to_migrations()?;
+    let migrations = if chain.is_empty() {
+        // No authored migrations yet — deploy the initial schema from the models.
+        vec![mig::initial(&models)?]
+    } else {
+        chain
+    };
+    let applied = mig::migrate(&migrations).await?;
     if applied.is_empty() {
         println!("up to date — nothing to apply.");
     } else {
         println!("applied version(s): {applied:?}");
+    }
+    Ok(())
+}
+"#;
+
+const MAKEMIGRATION_RS: &str = r#"//! `dorm migrate make <name>` runs this: diff the models against the recorded
+//! history in `migrations/` and write the next migration file. No database is
+//! touched — the history's stored snapshot is what the diff runs against. The
+//! backend is read from DELONIX_ORM_DSN (PostgreSQL if unset).
+
+use dorm_migrations as mig;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let name = std::env::args().nth(1).unwrap_or_else(|| "migration".to_string());
+    let models = __APP_CRATE__::all_models();
+    let backend = mig::ddl::Backend::of_dsn(&std::env::var("DELONIX_ORM_DSN").unwrap_or_default());
+    let history = mig::History::open("migrations");
+    match history.make(&models, &name, backend)? {
+        Some(m) => println!(
+            "created migration {} ({}) — {} statement(s) in migrations/",
+            m.version,
+            m.name,
+            m.statements.len()
+        ),
+        None => println!("no changes detected — the models match the latest migration."),
     }
     Ok(())
 }

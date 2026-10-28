@@ -19,6 +19,19 @@ pub enum Backend {
     Sqlite,
 }
 
+impl Backend {
+    /// The backend a DSN selects, using the ORM core's single detection rule so
+    /// the migrator and the query layer never disagree. An empty or unrecognised
+    /// DSN is PostgreSQL — the same default `dorm_core::db` keeps, which lets
+    /// `dorm migrate make` author a migration with no database configured.
+    pub fn of_dsn(dsn: &str) -> Backend {
+        match dorm_core::db::backend_of(dsn) {
+            dorm_core::db::Backend::Sqlite => Backend::Sqlite,
+            dorm_core::db::Backend::Postgres => Backend::Postgres,
+        }
+    }
+}
+
 /// The full schema for an ordered set of models, for PostgreSQL. See
 /// [`schema_for_on`] for another backend.
 pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
