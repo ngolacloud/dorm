@@ -53,10 +53,25 @@ enum CliCommand {
     },
     /// Open your project's REPL by building and running it (`cargo run`).
     Shell,
+    /// Add to the project in the current directory.
+    New {
+        #[command(subcommand)]
+        what: NewKind,
+    },
     /// Inspect and browse the live database (read-only).
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NewKind {
+    /// Add a model: append a struct to `src/models.rs` and register it in the
+    /// `all_models()` list in `src/lib.rs`.
+    Model {
+        /// The model's type name, in PascalCase, e.g. `Post`.
+        name: String,
     },
 }
 
@@ -109,6 +124,9 @@ fn main() -> ExitCode {
             action: Some(MigrateAction::Status),
         } => on_runtime(migrate_status()),
         CliCommand::Shell => cargo_run(&["--bin", "shell"]),
+        CliCommand::New {
+            what: NewKind::Model { name },
+        } => scaffold::new_model(&name),
         CliCommand::Db { action } => on_runtime(run_db(action)),
     };
 

@@ -64,6 +64,114 @@ fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "postgres".to_string())
 }
 
+/// `dorm new model <Name>` — append a model struct to `src/models.rs` and
+/// register it in `all_models()` in `src/lib.rs`.
+pub fn new_model(name: &str) -> CliResult {
+    if !is_pascal(name) {
+        return Err(format!("`{name}` is not a PascalCase type name (e.g. `Post`)").into());
+    }
+    let models_path = Path::new("src/models.rs");
+    let lib_path = Path::new("src/lib.rs");
+    if !models_path.exists() || !lib_path.exists() {
+        return Err("not inside a DORM project — `src/models.rs` / `src/lib.rs` are missing (run `dorm init` first)".into());
+    }
+
+    // Append the struct, refusing a duplicate.
+    let mut models = fs::read_to_string(models_path)?;
+    if models.contains(&format!("struct {name} ")) || models.contains(&format!("struct {name}\n")) {
+        return Err(format!("a model `{name}` is already defined in src/models.rs").into());
+    }
+    let table = pluralize(&snake(name));
+    let stub = MODEL_STRUCT
+        .replace("__NAME__", name)
+        .replace("__TABLE__", &table);
+    if !models.ends_with('\n') {
+        models.push('\n');
+    }
+    models.push_str(&stub);
+    write(models_path, &models)?;
+
+    // Register it: insert the meta line above the marker the scaffold left.
+    const MARKER: &str = "// dorm:models";
+    let mut lib = fs::read_to_string(lib_path)?;
+    let entry = format!("        <models::{name} as Model>::meta(),\n");
+    if let Some(pos) = lib.find(MARKER) {
+        let line_start = lib[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        lib.insert_str(line_start, &entry);
+        write(lib_path, &lib)?;
+        println!("added model `{name}` (table `{table}`):");
+        println!("  src/models.rs  — the struct");
+        println!("  src/lib.rs     — registered in all_models()");
+    } else {
+        // An older project without the marker: do the safe half, tell the user the rest.
+        println!("added model `{name}` (table `{table}`) to src/models.rs.");
+        println!("src/lib.rs has no `{MARKER}` marker — add this line to all_models() yourself:");
+        println!("    <models::{name} as Model>::meta(),");
+    }
+    Ok(())
+}
+
+/// A type name Rust (and the derive macro) will accept: an uppercase ASCII start,
+/// alphanumeric throughout.
+fn is_pascal(s: &str) -> bool {
+    matches!(s.chars().next(), Some(c) if c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// `PascalCase` → `snake_case`, for the default table name.
+fn snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A good-enough English pluraliser for the default table name: `category` →
+/// `categories`, `box` → `boxes`, `post` → `posts`. Rename the table in the
+/// `#[model(table = …)]` attribute if the guess is wrong.
+fn pluralize(word: &str) -> String {
+    let consonant_y = word.ends_with('y')
+        && word
+            .chars()
+            .rev()
+            .nth(1)
+            .map(|c| !"aeiou".contains(c))
+            .unwrap_or(false);
+    if consonant_y {
+        format!("{}ies", &word[..word.len() - 1])
+    } else if word.ends_with('s')
+        || word.ends_with('x')
+        || word.ends_with('z')
+        || word.ends_with("ch")
+        || word.ends_with("sh")
+    {
+        format!("{word}es")
+    } else {
+        format!("{word}s")
+    }
+}
+
+const MODEL_STRUCT: &str = r#"
+#[derive(Model, Debug, Clone)]
+#[model(table = "__TABLE__", ordering = "-created_at")]
+pub struct __NAME__ {
+    #[field(primary_key)]
+    pub id: i64,
+    #[field(max_length = 200)]
+    pub name: String,
+    #[field(auto_now_add)]
+    pub created_at: DateTime<Utc>,
+}
+"#;
+
 const CARGO_TOML: &str = r#"[package]
 name = "__APP_NAME__"
 version = "0.1.0"
@@ -108,7 +216,10 @@ use dorm_core::model::Model;
 /// Every model in this project. The migrator and the demo read this; add a model
 /// in `models.rs`, then add it here.
 pub fn all_models() -> Vec<&'static ModelMeta> {
-    vec![<models::Tenant as Model>::meta()]
+    vec![
+        <models::Tenant as Model>::meta(),
+        // dorm:models — `dorm new model <Name>` inserts new models above this line.
+    ]
 }
 "#;
 
@@ -139,7 +250,9 @@ use dorm_core::prelude::*;
 use dorm_migrations as mig;
 use __APP_CRATE__::models::{tenant, Tenant};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+// `std::result::Result` spelled out: the ORM prelude brings its own one-argument
+// `Result<T>` into scope, and `Box<dyn Error>` lets `?` box both error types.
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("== generated schema ==\n");
     println!("{}", mig::ddl::schema_for(&__APP_CRATE__::all_models())?);
 

@@ -14,13 +14,13 @@ jobs:
       - run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: The tag must match the workspace version
+      - name: The tag must match the dorm-cli version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           ver=$(cargo metadata --no-deps --format-version 1 \
-                | jq -r '.packages[] | select(.name=="dorm-core") | .version')
-          echo "tag=$tag workspace=$ver"
-          test "$tag" = "$ver" || { echo "::error::tag v$tag != crate version $ver"; exit 1; }
+                | jq -r '.packages[] | select(.name=="dorm-cli") | .version')
+          echo "tag=$tag dorm-cli=$ver"
+          test "$tag" = "$ver" || { echo "::error::tag v$tag != dorm-cli version $ver"; exit 1; }
 
       - name: Test
         run: cargo test --all-targets
@@ -33,13 +33,15 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
+          meta=$(cargo metadata --no-deps --format-version 1)
           publish() {
             crate="$1"
+            # Each crate's own version — the crates are versioned independently.
+            cver=$(echo "$meta" | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
             # Sparse-index path for a name >= 4 chars: <ab>/<cd>/<name>.
             if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/$crate" \
-                 | grep -q "\"vers\":\"$ver\""; then
-              echo "$crate $ver already published — skipping"
+                 | grep -q "\"vers\":\"$cver\""; then
+              echo "$crate $cver already published — skipping"
             else
               cargo publish -p "$crate"
             fi
