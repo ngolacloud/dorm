@@ -61,6 +61,16 @@ enum CliCommand {
         /// The project directory to create. Defaults to `dorm-app`.
         name: Option<String>,
     },
+    /// Compile `dorm.schema` to Rust models (`src/models.rs`). Re-run after
+    /// editing the schema. Native — no project build, no database.
+    Generate {
+        /// The schema file to read.
+        #[arg(long, default_value = "dorm.schema")]
+        schema: String,
+        /// Where to write the generated Rust.
+        #[arg(long, default_value = "src/models.rs")]
+        out: String,
+    },
     /// Check your models for mistakes a query or migration would otherwise trip
     /// over — by building and running the project. (`cargo run --bin validate`.)
     Validate,
@@ -158,6 +168,7 @@ fn main() -> ExitCode {
         CliCommand::New {
             what: NewKind::Model { name },
         } => scaffold::new_model(&name).map(|()| 0),
+        CliCommand::Generate { schema, out } => scaffold::generate(&schema, &out).map(|()| 0),
         CliCommand::Validate => cargo_run("validate", json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {

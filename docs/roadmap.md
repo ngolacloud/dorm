@@ -6,9 +6,15 @@ real use. This roadmap is the authoritative plan for getting there **without**
 shipping empty commands or claiming support that has not been demonstrated.
 
 Done so far: the typed query layer and `QuerySet`, the derive, additive schema
-`sync` (`push`) and the versioned initial migration, and the CLI foundation
+`sync` (`push`) and the versioned initial migration, the CLI foundation
 (`validate`, `doctor`, `migrate diff`, `db *`, `--json`, exit codes, redaction,
-completions). See [cli-contract.md](cli-contract.md) for exact status.
+completions), and the **declarative `dorm.schema` → Rust** pipeline (`dorm
+generate`, Prisma-faithful syntax, [ADR 0001](adr/0001-declarative-schema.md),
+[schema.md](schema.md)). See [cli-contract.md](cli-contract.md) for exact status.
+
+Next on this front: `dorm api generate` (Axum service + OpenAPI over the models,
+generated code — ADR 0001's corollary), then `db pull` (introspect → schema) and
+`format` (pretty-print the schema), which the schema file now makes tractable.
 
 ## Guiding rules
 

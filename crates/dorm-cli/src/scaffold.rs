@@ -35,8 +35,16 @@ pub fn init(name: Option<&str>) -> CliResult {
     write(root.join("Cargo.toml"), &render(CARGO_TOML))?;
     write(root.join(".gitignore"), GITIGNORE)?;
     write(root.join("README.md"), &render(README))?;
+    // The schema is the source of truth; `src/models.rs` is generated from it so
+    // the fresh project is self-consistent and `dorm generate` is a no-op until
+    // the schema changes.
+    write(root.join("dorm.schema"), SCHEMA)?;
+    let models_rs = dorm_schema::generate_rust(
+        &dorm_schema::parse(SCHEMA)
+            .map_err(|e| format!("internal: scaffold schema invalid: {e}"))?,
+    );
+    write(root.join("src/models.rs"), &models_rs)?;
     write(root.join("src/lib.rs"), &render(LIB_RS))?;
-    write(root.join("src/models.rs"), MODELS_RS)?;
     write(root.join("src/main.rs"), &render(MAIN_RS))?;
     write(root.join("src/bin/migrate.rs"), &render(MIGRATE_RS))?;
     write(root.join("src/bin/sync.rs"), &render(SYNC_RS))?;
@@ -47,7 +55,8 @@ pub fn init(name: Option<&str>) -> CliResult {
     println!("created `{name}`.\n");
     println!("next:");
     println!("  cd {name}");
-    println!("  cargo run                      # the schema + a sample query, no database");
+    println!("  # edit dorm.schema, then:");
+    println!("  dorm generate                  # dorm.schema → src/models.rs");
     println!(
         "  export DELONIX_ORM_DSN='host=/var/run/postgresql user={} dbname={}'",
         whoami(),
@@ -60,6 +69,20 @@ pub fn init(name: Option<&str>) -> CliResult {
     Ok(())
 }
 
+/// `dorm generate` — compile `dorm.schema` into `src/models.rs`.
+pub fn generate(schema_path: &str, out_path: &str) -> CliResult {
+    let src = fs::read_to_string(schema_path)
+        .map_err(|e| format!("reading {schema_path}: {e} (run `dorm init` first?)"))?;
+    let schema = dorm_schema::parse(&src).map_err(|e| format!("{schema_path}: {e}"))?;
+    let rust = dorm_schema::generate_rust(&schema);
+    write(out_path, &rust)?;
+    println!(
+        "generated {out_path} from {schema_path} ({} model(s)).",
+        schema.models.len()
+    );
+    Ok(())
+}
+
 fn write(path: impl AsRef<Path>, contents: &str) -> CliResult {
     fs::write(&path, contents)
         .map_err(|e| format!("writing {}: {e}", path.as_ref().display()).into())
@@ -69,50 +92,28 @@ fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "postgres".to_string())
 }
 
-/// `dorm new model <Name>` — append a model struct to `src/models.rs` and
-/// register it in `all_models()` in `src/lib.rs`.
+/// `dorm new model <Name>` — append a `model` block to `dorm.schema`. The user
+/// then runs `dorm generate` to update `src/models.rs`: the schema is the single
+/// source of truth, so new models are added there, not to the generated Rust.
 pub fn new_model(name: &str) -> CliResult {
     if !is_pascal(name) {
         return Err(format!("`{name}` is not a PascalCase type name (e.g. `Post`)").into());
     }
-    let models_path = Path::new("src/models.rs");
-    let lib_path = Path::new("src/lib.rs");
-    if !models_path.exists() || !lib_path.exists() {
-        return Err("not inside a DORM project — `src/models.rs` / `src/lib.rs` are missing (run `dorm init` first)".into());
+    let schema = Path::new("dorm.schema");
+    if !schema.exists() {
+        return Err("no `dorm.schema` here — run `dorm init` first".into());
     }
-
-    // Append the struct, refusing a duplicate.
-    let mut models = fs::read_to_string(models_path)?;
-    if models.contains(&format!("struct {name} ")) || models.contains(&format!("struct {name}\n")) {
-        return Err(format!("a model `{name}` is already defined in src/models.rs").into());
+    let mut src = fs::read_to_string(schema)?;
+    if src.contains(&format!("model {name} ")) || src.contains(&format!("model {name}{{")) {
+        return Err(format!("a model `{name}` already exists in dorm.schema").into());
     }
-    let table = pluralize(&snake(name));
-    let stub = MODEL_STRUCT
-        .replace("__NAME__", name)
-        .replace("__TABLE__", &table);
-    if !models.ends_with('\n') {
-        models.push('\n');
+    if !src.ends_with('\n') {
+        src.push('\n');
     }
-    models.push_str(&stub);
-    write(models_path, &models)?;
-
-    // Register it: insert the meta line above the marker the scaffold left.
-    const MARKER: &str = "// dorm:models";
-    let mut lib = fs::read_to_string(lib_path)?;
-    let entry = format!("        <models::{name} as Model>::meta(),\n");
-    if let Some(pos) = lib.find(MARKER) {
-        let line_start = lib[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        lib.insert_str(line_start, &entry);
-        write(lib_path, &lib)?;
-        println!("added model `{name}` (table `{table}`):");
-        println!("  src/models.rs  — the struct");
-        println!("  src/lib.rs     — registered in all_models()");
-    } else {
-        // An older project without the marker: do the safe half, tell the user the rest.
-        println!("added model `{name}` (table `{table}`) to src/models.rs.");
-        println!("src/lib.rs has no `{MARKER}` marker — add this line to all_models() yourself:");
-        println!("    <models::{name} as Model>::meta(),");
-    }
+    src.push_str(&MODEL_BLOCK.replace("__NAME__", name));
+    write(schema, &src)?;
+    println!("added model `{name}` to dorm.schema.");
+    println!("run `dorm generate` to update src/models.rs.");
     Ok(())
 }
 
@@ -123,57 +124,35 @@ fn is_pascal(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// `PascalCase` → `snake_case`, for the default table name.
-fn snake(name: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in name.chars().enumerate() {
-        if c.is_ascii_uppercase() {
-            if i != 0 {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+/// The `model` block `dorm new model` appends to `dorm.schema`.
+const MODEL_BLOCK: &str = r#"
+model __NAME__ {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(200)
+  createdAt DateTime @default(now())
+}
+"#;
+
+/// The starter `dorm.schema` `dorm init` writes — Prisma-style, the source of
+/// truth `dorm generate` compiles to `src/models.rs`.
+const SCHEMA: &str = r#"datasource db {
+  provider = "postgresql"
+  url      = env("DELONIX_ORM_DSN")
 }
 
-/// A good-enough English pluraliser for the default table name: `category` →
-/// `categories`, `box` → `boxes`, `post` → `posts`. Rename the table in the
-/// `#[model(table = …)]` attribute if the guess is wrong.
-fn pluralize(word: &str) -> String {
-    let consonant_y = word.ends_with('y')
-        && word
-            .chars()
-            .rev()
-            .nth(1)
-            .map(|c| !"aeiou".contains(c))
-            .unwrap_or(false);
-    if consonant_y {
-        format!("{}ies", &word[..word.len() - 1])
-    } else if word.ends_with('s')
-        || word.ends_with('x')
-        || word.ends_with('z')
-        || word.ends_with("ch")
-        || word.ends_with("sh")
-    {
-        format!("{word}es")
-    } else {
-        format!("{word}s")
-    }
+model Tenant {
+  id        Int      @id @default(autoincrement())
+  slug      String   @unique @index @db.VarChar(63)
+  name      String   @db.VarChar(200)
+  createdAt DateTime @default(now())
+  posts     Post[]
 }
 
-const MODEL_STRUCT: &str = r#"
-#[derive(Model, Debug, Clone)]
-#[model(table = "__TABLE__", ordering = "-created_at")]
-pub struct __NAME__ {
-    #[field(primary_key)]
-    pub id: i64,
-    #[field(max_length = 200)]
-    pub name: String,
-    #[field(auto_now_add)]
-    pub created_at: DateTime<Utc>,
+model Post {
+  id        Int      @id @default(autoincrement())
+  tenant    Tenant   @relation(onDelete: Cascade)
+  title     String   @index @db.VarChar(200)
+  createdAt DateTime @default(now())
 }
 "#;
 
@@ -191,15 +170,22 @@ dorm-migrations = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", features = ["clock"] }
 serde_json = "1"
+# Present so a generated model can use any scalar (Decimal, Uuid) without a
+# manual edit; unused ones cost nothing.
+rust_decimal = "1"
+uuid = { version = "1", features = ["v4"] }
 "#;
 
 const GITIGNORE: &str = "/target\n**/*.rs.bk\n.env\n";
 
 const README: &str = r#"# __APP_NAME__
 
-A DORM project.
+A DORM project. Models live in `dorm.schema` (Prisma-style) and are compiled to
+`src/models.rs` by `dorm generate` — edit the schema, not the generated Rust.
 
 ```sh
+# edit dorm.schema, then:
+dorm generate                   # dorm.schema → src/models.rs
 cargo run                       # the generated schema + a sample query (no database)
 
 export DELONIX_ORM_DSN='host=/var/run/postgresql user=me dbname=__APP_CRATE__'
@@ -208,46 +194,18 @@ dorm shell                      # a REPL over your models (= cargo run --bin she
 dorm db tables                  # browse the live database
 ```
 
-Add a model with `dorm new model <Name>` (or by hand in `src/models.rs`, then
-list it in `all_models()` in `src/lib.rs`), then `dorm push` to create its table.
-`dorm migrate` is the versioned alternative to `dorm push`.
+Add a model with `dorm new model <Name>` (appends to `dorm.schema`) or by editing
+`dorm.schema` directly, then `dorm generate` and `dorm push`. `dorm migrate` is
+the versioned alternative to `dorm push`.
 "#;
 
-const LIB_RS: &str = r#"//! The project's models, and the one list the tools read.
+const LIB_RS: &str = r#"//! The project. The models are generated from `dorm.schema` into `models.rs`
+//! by `dorm generate` — do not edit that file; edit the schema and regenerate.
 
 pub mod models;
 
-use dorm_core::meta::ModelMeta;
-use dorm_core::model::Model;
-
-/// Every model in this project. The migrator and the demo read this; add a model
-/// in `models.rs`, then add it here.
-pub fn all_models() -> Vec<&'static ModelMeta> {
-    vec![
-        <models::Tenant as Model>::meta(),
-        // dorm:models — `dorm new model <Name>` inserts new models above this line.
-    ]
-}
-"#;
-
-const MODELS_RS: &str = r#"//! Your models. Each `#[derive(Model)]` registers itself and generates its
-//! typed field handles (e.g. `tenant::slug`).
-
-use chrono::{DateTime, Utc};
-use dorm_derive::Model;
-
-#[derive(Model, Debug, Clone)]
-#[model(table = "tenants", ordering = "-created_at")]
-pub struct Tenant {
-    #[field(primary_key)]
-    pub id: i64,
-    #[field(unique, index, max_length = 63)]
-    pub slug: String,
-    #[field(max_length = 200)]
-    pub name: String,
-    #[field(auto_now_add)]
-    pub created_at: DateTime<Utc>,
-}
+// The generated list every binary reads.
+pub use models::all_models;
 "#;
 
 const MAIN_RS: &str = r#"//! The demo binary: prints the generated schema and a sample query's SQL. It

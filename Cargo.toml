@@ -24,6 +24,8 @@ members = [
     # The installable project manager (`cargo install dorm-cli`, binary `dorm`):
     # scaffolds a project and manages a live database, Prisma-CLI-style.
     "crates/dorm-cli",
+    # The `dorm.schema` parser + code generator (Prisma-style schema → Rust).
+    "crates/dorm-schema",
 ]
 
 [workspace.package]

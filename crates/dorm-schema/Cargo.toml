@@ -1,0 +1,25 @@
+[package]
+name = "dorm-schema"
+# Independent: the declarative-schema front end moves on its own line.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The `dorm.schema` parser and code generator for DORM — a Prisma-style declarative schema compiled to compile-time Rust `#[derive(Model)]` structs."
+readme = "README.md"
+keywords = ["orm", "schema", "codegen", "prisma", "database"]
+categories = ["database", "parsing"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Pure: a parser and a code generator, no I/O and no dependency on the ORM core.
+# It turns `dorm.schema` text into Rust source text; the CLI writes the file.
+[dependencies]
+
+[dev-dependencies]
+insta = { workspace = true }

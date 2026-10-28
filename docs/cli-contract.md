@@ -36,9 +36,10 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm shell` | Open the project REPL. | 0/1 | **partial** | Query + `:models`; admin ops and transactions are [roadmap](roadmap.md). |
 | `dorm db tables\|show\|count\|rows` | Browse the live database, read-only. | 0/1 | **done** | Native; `--json`; `rows --where col=value` (bound param, column validated). |
 | `dorm completions <shell>` | Print a completion script. | 0 | **done** | |
-| `dorm generate` | Generate a client / types. | — | **planned** | DORM has no schema file (models are Rust); needs design — see roadmap. |
-| `dorm format` | Format the schema. | — | **planned** | No schema-file format yet; `cargo fmt` formats the Rust models today. |
-| `dorm db pull` | Introspect an existing DB into models. | — | **planned** | Reverse of the derive; big — roadmap. |
+| `dorm generate` | Compile `dorm.schema` → `src/models.rs`. | 0/1 | **done** | Native; the declarative schema compiled to `#[derive(Model)]` — see [schema.md](schema.md), [ADR 0001](adr/0001-declarative-schema.md). |
+| `dorm format` | Pretty-print `dorm.schema`. | — | **planned** | Now that the schema exists, this is a formatter over it. |
+| `dorm db pull` | Introspect an existing DB into `dorm.schema`. | — | **planned** | Reverse of `generate`; writes the schema. |
+| `dorm api …` | Generate an Axum service + OpenAPI over the models. | — | **planned** | Generated code (compile-time); see ADR 0001. |
 | `dorm db seed` | Run configured seeds. | — | **planned** | |
 | `dorm db execute` | Run explicit SQL with parameters. | — | **planned** | |
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
