@@ -13,7 +13,7 @@
 //! A `rusqlite::Row` borrows its statement and cannot outlive the `query` call,
 //! so it cannot be collected into a `Vec` the way a `tokio_postgres::Row` can.
 //! The SQLite executor therefore reads every column of each row into an owned
-//! `Vec<rusqlite::types::Value>` up front; [`SqliteRow`] holds that.
+//! `Vec<rusqlite::types::Value>` up front; `SqliteRow` holds that.
 //!
 //! ## Why the exact/temporal types travel as text
 //!

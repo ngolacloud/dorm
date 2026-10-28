@@ -15,6 +15,10 @@ publish = false
 [[bin]]
 name = "dorm"
 path = "src/main.rs"
+# Both this REPL and `dorm-cli` build a binary named `dorm`; `cargo doc` writes
+# both to the same path and refuses the collision. The CLI is the one whose docs
+# matter, so the REPL opts out — the binary itself is unaffected.
+doc = false
 
 [dependencies]
 dorm-core = { path = "../dorm-core" }

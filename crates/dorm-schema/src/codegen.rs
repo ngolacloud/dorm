@@ -1,4 +1,4 @@
-//! Generate the Rust a [`Schema`](crate::Schema) compiles to: one
+//! Generate the Rust a [`Schema`] compiles to: one
 //! `#[derive(Model)]` struct per model, plus the `all_models()` the project's
 //! binaries read.
 

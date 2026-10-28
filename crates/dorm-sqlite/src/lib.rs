@@ -34,7 +34,7 @@ use dorm_core::queryset::ValueRow;
 use dorm_core::value::{FieldType, Value};
 
 /// Run DDL (one or more statements) that takes no parameters — `CREATE TABLE`,
-/// `CREATE INDEX`. Use [`dorm_migrations::ddl::schema_for_on`] with
+/// `CREATE INDEX`. Use `dorm_migrations::ddl::schema_for_on` with
 /// `Backend::Sqlite` to produce it.
 pub fn execute_ddl(conn: &rusqlite::Connection, ddl: &str) -> Result<()> {
     conn.execute_batch(ddl).map_err(sqlite_err)

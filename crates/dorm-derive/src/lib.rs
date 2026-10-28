@@ -55,7 +55,7 @@ struct M2mSpec {
     /// The accessor method to emit — `name = "tags"` gives `post.tags()`.
     name: Ident,
     /// The junction model's registered *name* (not a type), resolved at runtime
-    /// through the registry by [`ManyToMany::through`].
+    /// through the registry by `ManyToMany::through`.
     through: String,
     /// The junction field pointing back at *this* model — the "left" key.
     via: String,

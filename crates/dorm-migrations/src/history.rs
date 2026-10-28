@@ -1,7 +1,7 @@
 //! The on-disk migration history — what `dorm migrate make` writes and
 //! `dorm migrate deploy` reads.
 //!
-//! This is the file layer over the [`autodetect`](crate::autodetect)or: Django
+//! This is the file layer over the [`autodetect`](fn@crate::autodetect)or: Django
 //! keeps migrations as `.py` files and reconstructs the state from them; Prisma
 //! keeps a folder per migration with a `migration.sql`. DORM keeps a directory
 //! of one JSON file per migration, each recording the version, the name, the

@@ -16,7 +16,7 @@
 //!   enough to create a database, and enough to *adopt* one that already has the
 //!   tables (every statement is `IF NOT EXISTS`). This is the `expand` step of
 //!   `expand → migrate → contract`.
-//! * [`autodetect`] diffs a stored [`Snapshot`] of the schema's previous state
+//! * [`autodetect`](fn@autodetect) diffs a stored [`Snapshot`] of the schema's previous state
 //!   against the current models and emits the **next versioned migration** —
 //!   `CREATE`/`DROP TABLE`, `ADD`/`DROP COLUMN`, `CREATE`/`DROP INDEX` — the
 //!   shape of Django's `makemigrations` and Prisma's `migrate dev`. An in-place

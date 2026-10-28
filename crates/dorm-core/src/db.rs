@@ -259,7 +259,7 @@ pub fn dialect() -> Dialect {
 /// values and handing back backend-agnostic [`Row`]s.
 ///
 /// Both paths keep the transaction-in-scope routing: PostgreSQL reuses [`query`]
-/// (routed by [`CURRENT_TX`]); SQLite checks its own transaction task-local and,
+/// (routed by `CURRENT_TX`); SQLite checks its own transaction task-local and,
 /// inside an [`atomic`], runs on the connection the transaction already holds.
 pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
     match backend()? {
@@ -657,7 +657,7 @@ impl Drop for PanicGuard {
 /// REPL's `atomic(|| { … throw "rollback"; })` undo exactly the block.
 ///
 /// The backend is the DSN's: PostgreSQL takes a dedicated pooled connection and
-/// routes through [`CURRENT_TX`]; SQLite holds its single shared connection for
+/// routes through `CURRENT_TX`; SQLite holds its single shared connection for
 /// the scope and routes through the parallel `sqlite` transaction path. Neither
 /// closure signature changes, so `atomic(|tx| …)` reads the same on both.
 pub async fn atomic<F, Fut, T>(f: F) -> Result<T>
