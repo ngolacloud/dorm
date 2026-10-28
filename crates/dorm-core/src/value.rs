@@ -304,13 +304,23 @@ impl<T: ColumnType> ColumnType for Option<T> {
 /// Read one column out of a row as a dynamic [`Value`].
 ///
 /// The dynamic path needs this because it has no Rust type to ask `FromSql` for;
-/// the field metadata is the only thing that says what the column holds.
+/// the field metadata is the only thing that says what the column holds. It
+/// dispatches on the backend behind the [`Row`](crate::row::Row): a PostgreSQL
+/// row is read here through `try_get`, a SQLite row through the cell decoder
+/// lifted into [`crate::row`].
 pub fn read_column(
-    row: &tokio_postgres::Row,
+    row: &crate::row::Row,
     idx: usize,
     ty: FieldType,
     column: &str,
 ) -> Result<Value> {
+    let row = match row {
+        crate::row::Row::Pg(row) => row,
+        #[cfg(feature = "sqlite")]
+        crate::row::Row::Sqlite(row) => {
+            return crate::row::cell_to_value(row.cell(idx), ty, column)
+        }
+    };
     let fail = |want: &'static str| Error::UnexpectedColumnType {
         column: column.to_string(),
         want,

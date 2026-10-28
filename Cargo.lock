@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-cli"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "chrono",
  "clap",
@@ -376,12 +376,13 @@ dependencies = [
 
 [[package]]
 name = "dorm-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
  "insta",
  "inventory",
+ "rusqlite",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -393,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-derive"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -412,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-migrations"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dorm-core",
  "insta",
@@ -455,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "dorm-sqlite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "dorm-core",

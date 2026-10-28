@@ -16,6 +16,12 @@ chrono = { workspace = true, features = ["clock"] }
 rust_decimal = { workspace = true }
 serde_json = { workspace = true }
 
+# Opt-in SQLite backend, forwarded to dorm-core (ADR 0003). Off by default, so
+# `make check` (default features) keeps the PostgreSQL-only build it tests; the
+# gated `sqlite_e2e` test runs under `--features sqlite`.
+[features]
+sqlite = ["dorm-core/sqlite"]
+
 [dev-dependencies]
 insta = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

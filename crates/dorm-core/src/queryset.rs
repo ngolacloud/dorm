@@ -13,6 +13,7 @@ use crate::compiler::{self, Plan, Sql};
 use crate::error::{Error, Result};
 use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, Q};
 use crate::model::{run_execute, run_query, Model, NewRow};
+use crate::row::Row;
 use crate::value::{read_column, ToValue, Value};
 use crate::{db, registry};
 
@@ -109,7 +110,8 @@ impl<T: Model> Manager<T> {
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
         db::guard_write("create")?;
         let values = new.column_values();
-        let sql = compiler::compile_insert(T::meta(), std::slice::from_ref(&values))?;
+        let sql =
+            compiler::compile_insert_on(T::meta(), std::slice::from_ref(&values), db::dialect())?;
         let rows = run_query(&sql).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
@@ -128,7 +130,7 @@ impl<T: Model> Manager<T> {
             return Ok(Vec::new());
         }
         let values: Vec<Vec<(String, Value)>> = rows.iter().map(NewRow::column_values).collect();
-        let sql = compiler::compile_insert(T::meta(), &values)?;
+        let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
         let returned = run_query(&sql).await?;
         returned.iter().map(|r| T::from_row(r, 0)).collect()
     }
@@ -295,7 +297,7 @@ impl<T: Model> QuerySet<T> {
                 "this query was projected with values(); call rows() instead of all()".into(),
             ));
         }
-        let sql = compiler::compile_select(&self.plan)?;
+        let sql = compiler::compile_select_on(&self.plan, db::dialect())?;
         let rows = run_query(&sql).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -377,12 +379,12 @@ impl<T: Model> QuerySet<T> {
 
     /// How many rows match.
     pub async fn count(self) -> Result<i64> {
-        let sql = compiler::compile_count(&self.plan)?;
+        let sql = compiler::compile_count_on(&self.plan, db::dialect())?;
         let rows = run_query(&sql).await?;
         let row = rows
             .first()
             .ok_or_else(|| Error::Db("COUNT returned no row".into()))?;
-        row.try_get::<_, i64>(0)
+        row.try_get::<i64>(0)
             .map_err(|_| Error::UnexpectedColumnType {
                 column: "count".into(),
                 want: "bigint",
@@ -391,12 +393,12 @@ impl<T: Model> QuerySet<T> {
 
     /// Whether anything matches, without counting.
     pub async fn exists(self) -> Result<bool> {
-        let sql = compiler::compile_exists(&self.plan)?;
+        let sql = compiler::compile_exists_on(&self.plan, db::dialect())?;
         let rows = run_query(&sql).await?;
         let row = rows
             .first()
             .ok_or_else(|| Error::Db("EXISTS returned no row".into()))?;
-        row.try_get::<_, bool>(0)
+        row.try_get::<bool>(0)
             .map_err(|_| Error::UnexpectedColumnType {
                 column: "exists".into(),
                 want: "boolean",
@@ -405,7 +407,7 @@ impl<T: Model> QuerySet<T> {
 
     /// Rows as name-to-value maps. The counterpart of `values()`.
     pub async fn rows(self) -> Result<Vec<ValueRow>> {
-        let sql = compiler::compile_select(&self.plan)?;
+        let sql = compiler::compile_select_on(&self.plan, db::dialect())?;
         let rows = run_query(&sql).await?;
         decode(&sql, &rows)
     }
@@ -413,14 +415,14 @@ impl<T: Model> QuerySet<T> {
     /// Apply a set of assignments to every matching row.
     pub async fn update(self, assignments: Vec<Assignment>) -> Result<u64> {
         db::guard_write("update")?;
-        let sql = compiler::compile_update(&self.plan, &assignments)?;
+        let sql = compiler::compile_update_on(&self.plan, &assignments, db::dialect())?;
         run_execute(&sql).await
     }
 
     /// Delete every matching row.
     pub async fn delete(self) -> Result<u64> {
         db::guard_write("delete")?;
-        let sql = compiler::compile_delete(&self.plan)?;
+        let sql = compiler::compile_delete_on(&self.plan, db::dialect())?;
         run_execute(&sql).await
     }
 
@@ -431,7 +433,7 @@ impl<T: Model> QuerySet<T> {
                 "aggregate() was given nothing to compute".into(),
             ));
         }
-        let sql = compiler::compile_aggregate(&self.plan, &aggregates)?;
+        let sql = compiler::compile_aggregate_on(&self.plan, &aggregates, db::dialect())?;
         let rows = run_query(&sql).await?;
         let mut decoded = decode(&sql, &rows)?;
         // An aggregate with no GROUP BY always returns exactly one row.
@@ -457,7 +459,7 @@ impl<T: Model> QuerySet<T> {
 /// is unchanged: every identifier in the plan still came from the registry, and
 /// every value is still a bound parameter.
 pub async fn fetch_value_rows(plan: &Plan) -> Result<Vec<ValueRow>> {
-    let sql = compiler::compile_select(plan)?;
+    let sql = compiler::compile_select_on(plan, db::dialect())?;
     let rows = run_query(&sql).await?;
     decode(&sql, &rows)
 }
@@ -467,7 +469,7 @@ pub async fn fetch_value_rows(plan: &Plan) -> Result<Vec<ValueRow>> {
 /// The names and types come from the compiler, not from the server's row
 /// description, so a column is read as the type the metadata declares and a
 /// mismatch is an error rather than a silent reinterpretation.
-fn decode(sql: &Sql, rows: &[tokio_postgres::Row]) -> Result<Vec<ValueRow>> {
+fn decode(sql: &Sql, rows: &[Row]) -> Result<Vec<ValueRow>> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut map = ValueRow::new();
@@ -519,7 +521,7 @@ mod tests {
         fn meta() -> &'static ModelMeta {
             &META
         }
-        fn from_row(_row: &tokio_postgres::Row, _offset: usize) -> Result<Self> {
+        fn from_row(_row: &Row, _offset: usize) -> Result<Self> {
             Ok(Probe)
         }
         fn pk(&self) -> Value {

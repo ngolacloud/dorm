@@ -203,8 +203,8 @@ edition = "2021"
 default-run = "__APP_NAME__"
 
 [dependencies]
-dorm-core = "0.5"
-dorm-derive = "0.2"
+dorm-core = "0.6"
+dorm-derive = "0.3"
 dorm-migrations = "0.4"
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["clock"] }

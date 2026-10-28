@@ -3,7 +3,7 @@ name = "dorm-cli"
 # Versioned independently: the CLI iterates faster than the libraries, so it
 # runs ahead of dorm-core (0.3.x) and dorm-migrations (0.4.x). The release
 # workflow publishes per-crate and skips versions already on the index.
-version = "0.11.0"
+version = "0.11.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -29,7 +29,7 @@ path = "src/main.rs"
 # Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
 # A path alongside the version so an in-workspace build uses the local crate and
 # crates.io resolves the published one.
-dorm-core = { path = "../dorm-core", version = "0.5.0" }
+dorm-core = { path = "../dorm-core", version = "0.6.0" }
 dorm-schema = { path = "../dorm-schema", version = "0.3.0" }
 clap = { workspace = true }
 clap_complete = "4"

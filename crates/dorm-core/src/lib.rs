@@ -45,6 +45,7 @@ pub mod meta;
 pub mod model;
 pub mod queryset;
 pub mod registry;
+pub mod row;
 pub mod value;
 
 pub use error::{Error, Result};
@@ -61,7 +62,7 @@ pub use inventory;
 /// a `tokio-postgres` entry it never mentions itself.
 #[doc(hidden)]
 pub mod __private {
-    pub use tokio_postgres::Row;
+    pub use crate::row::Row;
 }
 
 /// Everything a model definition and a query need.

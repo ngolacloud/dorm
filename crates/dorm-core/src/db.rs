@@ -31,9 +31,12 @@ use std::time::Duration;
 
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Config, NoTls, Row};
+use tokio_postgres::{Config, NoTls, Row as PgRow};
 
+use crate::compiler::Dialect;
 use crate::error::{from_pg, Error, Result};
+use crate::row::Row;
+use crate::value::Value;
 
 /// The DSN. `DELONIX_ORM_DSN` is the name this workspace uses for its own
 /// stores; `PAAS_DATABASE_URL` is accepted as well so the documented invocation
@@ -169,7 +172,12 @@ async fn acquire() -> Result<Object> {
 }
 
 /// Run a query, on the transaction in scope if there is one.
-pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
+///
+/// This is the PostgreSQL-native entry point: it returns `tokio_postgres` rows
+/// and the raw callers (the CLI, the migrator, the shell) consume them with the
+/// driver's own API. The typed `QuerySet` goes through the backend-agnostic
+/// [`fetch`] instead, which wraps these rows in a [`Row`].
+pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
@@ -195,6 +203,226 @@ pub async fn execute(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
 /// Run a statement for its effect only, outside any result set.
 async fn simple(conn: &Object, sql: &str) -> Result<()> {
     conn.batch_execute(sql).await.map_err(from_pg)
+}
+
+// ------------------------------------------------------------- backend seam
+//
+// ADR 0003: the typed `QuerySet` terminals resolve their backend from the DSN
+// and dispatch here. PostgreSQL reuses the pool above; SQLite runs `rusqlite`
+// on `spawn_blocking` (it is synchronous) over a single shared connection, so
+// that `sqlite::memory:` is one database rather than one per connection. A
+// connection pool can come later; correctness of the in-memory case comes
+// first, and SQLite serialises writers regardless.
+
+/// The backend a DSN names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Postgres,
+    Sqlite,
+}
+
+/// Which backend the configured DSN selects.
+///
+/// `postgres(ql)://…` and the libpq keyword form (`host=… user=…`) are
+/// PostgreSQL; `sqlite:…`, `file:…` and a bare `:memory:` are SQLite. PostgreSQL
+/// is the default for anything unrecognised, which keeps the historical
+/// behaviour for a DSN that names no scheme.
+pub fn backend_of(dsn: &str) -> Backend {
+    let d = dsn.trim();
+    let lower = d.to_ascii_lowercase();
+    if lower.starts_with("sqlite:") || lower.starts_with("file:") || d == ":memory:" {
+        Backend::Sqlite
+    } else {
+        Backend::Postgres
+    }
+}
+
+/// The configured backend, or an error if no DSN is set.
+fn backend() -> Result<Backend> {
+    Ok(backend_of(&dsn()?))
+}
+
+/// The SQL dialect the configured backend speaks.
+///
+/// Used by the `QuerySet` terminals to compile with `compile_*_on`. It never
+/// fails: with no DSN set it answers PostgreSQL, so offline compilation of a
+/// query's SQL still works — the missing DSN surfaces later, when the query is
+/// actually run.
+pub fn dialect() -> Dialect {
+    match dsn() {
+        Ok(d) if backend_of(&d) == Backend::Sqlite => Dialect::Sqlite,
+        _ => Dialect::Postgres,
+    }
+}
+
+/// Run a row-returning statement against the configured backend, taking ORM
+/// values and handing back backend-agnostic [`Row`]s.
+///
+/// The PostgreSQL path reuses [`query`], so it keeps the transaction-in-scope
+/// routing; the SQLite path has no transaction support yet (`atomic` is
+/// PostgreSQL-only) and runs standalone.
+pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    match backend()? {
+        Backend::Postgres => {
+            let borrowed: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+            Ok(query(sql, &borrowed)
+                .await?
+                .into_iter()
+                .map(Row::Pg)
+                .collect())
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => sqlite::fetch(sql, params).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+/// Run a statement for its row count against the configured backend.
+pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+    match backend()? {
+        Backend::Postgres => {
+            let borrowed: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+            execute(sql, &borrowed).await
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => sqlite::run(sql, params).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+/// Run DDL — one or more parameterless statements — against the configured
+/// backend. Used to stand a schema up before the typed path queries it.
+pub async fn run_ddl(ddl: &str) -> Result<()> {
+    match backend()? {
+        Backend::Postgres => simple(&acquire().await?, ddl).await,
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => sqlite::run_ddl(ddl).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+/// The error a SQLite DSN gets in a build that left the feature off.
+#[cfg(not(feature = "sqlite"))]
+fn sqlite_disabled() -> Error {
+    Error::Config(
+        "the DSN selects SQLite, but this build has no SQLite backend; \
+         rebuild dorm-core with features = [\"sqlite\"]"
+            .into(),
+    )
+}
+
+/// The SQLite backend: a single shared connection, driven synchronously under
+/// `spawn_blocking`.
+#[cfg(feature = "sqlite")]
+mod sqlite {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{dsn, Error, Result};
+    use crate::row::{value_to_sqlite, Row, SqliteRow};
+    use crate::value::Value;
+
+    static CONN: OnceLock<std::sync::Arc<Mutex<rusqlite::Connection>>> = OnceLock::new();
+
+    /// The shared connection, opened once from the DSN.
+    fn conn() -> Result<std::sync::Arc<Mutex<rusqlite::Connection>>> {
+        if let Some(c) = CONN.get() {
+            return Ok(c.clone());
+        }
+        let dsn = dsn()?;
+        let c = open(&dsn)?;
+        Ok(CONN
+            .get_or_init(|| std::sync::Arc::new(Mutex::new(c)))
+            .clone())
+    }
+
+    /// Open a connection for the DSN. `sqlite::memory:`, `sqlite:` and `:memory:`
+    /// are in-memory; anything else is the file path after the scheme.
+    fn open(dsn: &str) -> Result<rusqlite::Connection> {
+        let rest = dsn
+            .trim()
+            .strip_prefix("sqlite:")
+            .or_else(|| dsn.trim().strip_prefix("file:"))
+            .unwrap_or_else(|| dsn.trim());
+        let conn = if rest.is_empty() || rest == ":memory:" {
+            rusqlite::Connection::open_in_memory()
+        } else {
+            rusqlite::Connection::open(rest)
+        };
+        conn.map_err(|e| Error::Db(e.to_string()))
+    }
+
+    pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        let conn = conn()?;
+        let sql = sql.to_string();
+        let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+        blocking(move || {
+            let guard = conn.lock().map_err(|_| poisoned())?;
+            let mut stmt = guard.prepare(&sql).map_err(db_err)?;
+            let ncols = stmt.column_count();
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(params))
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().map_err(db_err)? {
+                let mut cells = Vec::with_capacity(ncols);
+                for i in 0..ncols {
+                    cells.push(r.get::<usize, rusqlite::types::Value>(i).map_err(db_err)?);
+                }
+                out.push(Row::Sqlite(SqliteRow::new(cells)));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+        let conn = conn()?;
+        let sql = sql.to_string();
+        let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+        blocking(move || {
+            let guard = conn.lock().map_err(|_| poisoned())?;
+            let n = guard
+                .execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(db_err)?;
+            Ok(n as u64)
+        })
+        .await
+    }
+
+    pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+        let conn = conn()?;
+        let ddl = ddl.to_string();
+        blocking(move || {
+            let guard = conn.lock().map_err(|_| poisoned())?;
+            guard.execute_batch(&ddl).map_err(db_err)
+        })
+        .await
+    }
+
+    /// Run a blocking SQLite closure on tokio's blocking pool, flattening the
+    /// join error into the ORM's.
+    async fn blocking<T, F>(f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| Error::Db(format!("the SQLite task failed: {e}")))?
+    }
+
+    fn db_err(e: rusqlite::Error) -> Error {
+        Error::Db(e.to_string())
+    }
+
+    fn poisoned() -> Error {
+        Error::Db("the SQLite connection lock was poisoned".into())
+    }
 }
 
 /// A handle on the transaction in scope.

@@ -153,10 +153,6 @@ struct Binder {
 }
 
 impl Binder {
-    fn new() -> Binder {
-        Binder::with_dialect(Dialect::Postgres)
-    }
-
     fn with_dialect(dialect: Dialect) -> Binder {
         Binder {
             params: Vec::new(),
@@ -768,11 +764,16 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
 
 /// Compile `EXISTS`, which must not pay for counting rows it will not report.
 pub fn compile_exists(plan: &Plan) -> Result<Sql> {
+    compile_exists_on(plan, Dialect::Postgres)
+}
+
+/// Compile `EXISTS` for `dialect`.
+pub fn compile_exists_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
     let mut probe = plan.clone();
     probe.unordered = true;
     probe.limit = Some(1);
     probe.values = vec![];
-    let inner = compile_select(&probe)?;
+    let inner = compile_select_on(&probe, dialect)?;
     Ok(Sql {
         text: format!("SELECT EXISTS (SELECT 1 FROM ({}) AS _e)", inner.text),
         params: inner.params,
@@ -785,7 +786,12 @@ pub fn compile_exists(plan: &Plan) -> Result<Sql> {
 
 /// Compile an `aggregate()` call — aggregates with no grouping.
 pub fn compile_aggregate(plan: &Plan, aggs: &[Aggregate]) -> Result<Sql> {
-    let mut binder = Binder::new();
+    compile_aggregate_on(plan, aggs, Dialect::Postgres)
+}
+
+/// Compile an `aggregate()` call for `dialect`.
+pub fn compile_aggregate_on(plan: &Plan, aggs: &[Aggregate], dialect: Dialect) -> Result<Sql> {
+    let mut binder = Binder::with_dialect(dialect);
     let mut joins = Joins::default();
 
     let mut parts = Vec::new();
@@ -1122,7 +1128,7 @@ mod tests {
 
     #[test]
     fn a_binder_keeps_placeholder_numbers_and_the_parameter_vector_in_step() {
-        let mut b = Binder::new();
+        let mut b = Binder::with_dialect(Dialect::Postgres);
         assert_eq!(b.bind(Value::I64(1)), "$1");
         assert_eq!(b.bind(Value::Text("x".into())), "$2");
         assert_eq!(b.params, vec![Value::I64(1), Value::Text("x".into())]);

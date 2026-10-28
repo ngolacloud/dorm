@@ -5,13 +5,12 @@
 //! things only generated code can do — decode a row into the struct, report the
 //! primary key, and hand back the column values for a write.
 
-use tokio_postgres::Row;
-
 use crate::compiler;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::meta::ModelMeta;
 use crate::queryset::Manager;
+use crate::row::Row;
 use crate::value::Value;
 
 /// A type that maps to one table.
@@ -155,45 +154,12 @@ pub async fn refresh_instance<T: Model>(obj: &mut T) -> Result<()> {
     Ok(())
 }
 
-/// Run compiled SQL that returns rows.
+/// Run compiled SQL that returns rows, against whichever backend the DSN names.
 pub async fn run_query(sql: &compiler::Sql) -> Result<Vec<Row>> {
-    let params = borrow_params(&sql.params);
-    db::query(&sql.text, &params).await
+    db::fetch(&sql.text, &sql.params).await
 }
 
-/// Run compiled SQL for its row count.
+/// Run compiled SQL for its row count, against whichever backend the DSN names.
 pub async fn run_execute(sql: &compiler::Sql) -> Result<u64> {
-    let params = borrow_params(&sql.params);
-    db::execute(&sql.text, &params).await
-}
-
-/// Reborrow the owned parameter vector as the slice of trait objects
-/// `tokio-postgres` wants.
-///
-/// Kept in one place because the lifetime dance is easy to get subtly wrong, and
-/// because every statement in the crate needs it.
-fn borrow_params(params: &[Value]) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
-    params
-        .iter()
-        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parameters_are_reborrowed_without_reordering_them() {
-        // The order of this vector is the placeholder order; a reorder here is
-        // the defect that snapshots of the compiler cannot catch.
-        let params = vec![Value::I64(1), Value::Text("a".into()), Value::Bool(true)];
-        let borrowed = borrow_params(&params);
-        assert_eq!(borrowed.len(), 3);
-    }
-
-    #[test]
-    fn an_empty_parameter_list_reborrows_to_an_empty_slice() {
-        assert!(borrow_params(&[]).is_empty());
-    }
+    db::run(&sql.text, &sql.params).await
 }

@@ -595,7 +595,7 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
                 quote! {
                     #ident: {
                         let raw: ::core::option::Option<_> = row
-                            .try_get::<_, ::core::option::Option<i64>>(offset + #i)
+                            .try_get::<::core::option::Option<i64>>(offset + #i)
                             .map_err(|_| ::dorm_core::Error::UnexpectedColumnType {
                                 column: #column.to_string(),
                                 want: "bigint foreign key",
@@ -614,7 +614,7 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
                 quote! {
                     #ident: ::dorm_core::field::ForeignKey::from_id(
                         ::dorm_core::value::Value::#variant(
-                            row.try_get::<_, i64>(offset + #i).map_err(|_| {
+                            row.try_get::<i64>(offset + #i).map_err(|_| {
                                 ::dorm_core::Error::UnexpectedColumnType {
                                     column: #column.to_string(),
                                     want: "bigint foreign key",
@@ -627,7 +627,7 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
         } else if s.nullable {
             quote! {
                 #ident: row
-                    .try_get::<_, ::core::option::Option<#inner>>(offset + #i)
+                    .try_get::<::core::option::Option<#inner>>(offset + #i)
                     .map_err(|_| ::dorm_core::Error::UnexpectedColumnType {
                         column: #column.to_string(),
                         want: ::core::stringify!(#inner),
@@ -636,7 +636,7 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec]) -> Result<TokenStream2> {
         } else {
             quote! {
                 #ident: row
-                    .try_get::<_, #inner>(offset + #i)
+                    .try_get::<#inner>(offset + #i)
                     .map_err(|_| ::dorm_core::Error::UnexpectedColumnType {
                         column: #column.to_string(),
                         want: ::core::stringify!(#inner),
