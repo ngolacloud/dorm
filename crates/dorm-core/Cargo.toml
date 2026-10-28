@@ -46,13 +46,26 @@ inventory = { workspace = true }
 # library; a user who leaves it off pulls neither this crate nor SQLite.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
+# TLS for the PostgreSQL connection (ADR 0004). Both optional; `tls-rustls` is in
+# the default set. Each is pulled only when its feature is on.
+tokio-postgres-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+postgres-openssl = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+
 # A process talks to one backend, chosen by the DSN (ADR 0003). PostgreSQL is
 # the default so a user who names no feature gets today's behaviour unchanged
-# and pulls no SQLite; `sqlite` adds the second backend.
+# and pulls no SQLite; `sqlite` adds the second backend. `tls-rustls` is default
+# so TLS works out of the box; `tls-openssl` is the opt-in system-libssl backend
+# (ADR 0004). With both on, rustls wins; with neither, a TLS DSN is an error.
 [features]
-default = ["postgres"]
+default = ["postgres", "tls-rustls"]
 postgres = []
 sqlite = ["dep:rusqlite"]
+tls-rustls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+tls-openssl = ["dep:postgres-openssl", "dep:openssl"]
 
 [dev-dependencies]
 insta = { workspace = true }

@@ -29,6 +29,29 @@ variables — not a panic.
 |---|---|---|
 | `DELONIX_ORM_POOL_MAX` | 8 | Ceiling on pooled connections. |
 | `DELONIX_ORM_POOL_ACQUIRE_TIMEOUT_MS` | 5000 | How long a caller waits for a connection before giving up. |
+| `DELONIX_ORM_STATEMENT_TIMEOUT_MS` | 0 (off) | Server-side `statement_timeout`. When positive, PostgreSQL cancels an over-running statement and DORM returns `Error::Timeout`. Bounds DDL too, so leave it off while migrating unless you mean it. |
+
+## TLS (ADR 0004)
+
+TLS is chosen by the DSN's `sslmode`, or by `DELONIX_ORM_SSLMODE` /
+`DELONIX_ORM_SSLROOTCERT` which override it. DORM never half-encrypts — the
+opportunistic libpq modes (`prefer`, `allow`) and an absent `sslmode` mean
+plaintext; ask for `require` or `verify-full` to get TLS.
+
+| `sslmode` | Meaning | Status |
+|---|---|---|
+| `disable` *(default)* | Plaintext. | supported |
+| `require` | Encrypt; do **not** verify the certificate. | supported |
+| `verify-full` | Encrypt **and** verify the chain and hostname. Roots come from `sslrootcert` if set, else the bundled Mozilla roots. | supported |
+| `verify-ca` | Verify the chain, not the hostname. | not yet — use `verify-full` or `require` |
+
+```console
+$ export DELONIX_ORM_DSN='postgresql://me@db.internal:5432/blog?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem'
+```
+
+The backend is a Cargo feature of `dorm-core`: `tls-rustls` (default, pure Rust,
+builds offline) or `tls-openssl` (system libssl). With neither compiled in, a
+DSN that asks for TLS is a configuration error — never a silent downgrade.
 
 ## The one-runtime rule
 

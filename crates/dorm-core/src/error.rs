@@ -75,6 +75,19 @@ pub enum Error {
     /// A write was attempted in a session opened `--read-only`.
     #[error("this session is read-only; `{0}` would write")]
     ReadOnly(&'static str),
+
+    /// The server cancelled a statement that ran past
+    /// `DELONIX_ORM_STATEMENT_TIMEOUT_MS` (SQLSTATE `57014`). Named separately
+    /// from [`Error::Db`] so a caller can retry or report it as a timeout rather
+    /// than reading a generic "canceling statement" driver string (ADR 0004).
+    #[error("statement timed out: {0}")]
+    Timeout(String),
+
+    /// The DSN asks for TLS, but this build has no TLS backend compiled in, or
+    /// asks for an `sslmode` this release does not yet implement. Never a silent
+    /// downgrade to plaintext (ADR 0004).
+    #[error("{0}")]
+    Tls(String),
 }
 
 /// The ORM's result type.
@@ -98,7 +111,7 @@ pub fn from_pg(e: tokio_postgres::Error) -> Error {
             if let Some(constraint) = db.constraint() {
                 msg.push_str(&format!(" (constraint `{constraint}`)"));
             }
-            Error::Db(msg)
+            classify_db(db.code().code(), msg)
         }
         // No server error attached: a connection that died, a TLS failure, a
         // type mismatch caught client-side. `source()` carries the detail.
@@ -115,9 +128,27 @@ pub fn from_pg(e: tokio_postgres::Error) -> Error {
     }
 }
 
+/// Decide which [`enum@Error`] a server error becomes from its SQLSTATE and its
+/// already-formatted message. Factored out of [`from_pg`] so the code→variant
+/// mapping is testable without constructing a `tokio_postgres::DbError`, which
+/// has no public constructor.
+pub fn classify_db(code: &str, msg: String) -> Error {
+    match code {
+        // The server cancelled the statement — almost always our
+        // `statement_timeout` (ADR 0004). Surface it as a timeout, not a
+        // generic database error, so a caller can react to it as one.
+        QUERY_CANCELED => Error::Timeout(msg),
+        _ => Error::Db(msg),
+    }
+}
+
 /// The SQLSTATE for `unique_violation`, which `get_or_create` has to tell apart
 /// from a genuine failure when it loses a race.
 pub const UNIQUE_VIOLATION: &str = "23505";
+
+/// The SQLSTATE for `query_canceled` — what `statement_timeout` raises when it
+/// fires. [`classify_db`] turns it into [`Error::Timeout`].
+pub const QUERY_CANCELED: &str = "57014";
 
 /// Whether this error is a unique-constraint violation.
 pub fn is_unique_violation(e: &Error) -> bool {
@@ -145,6 +176,25 @@ mod tests {
             "ERROR [42P01]: relation does not exist".into()
         )));
         assert!(!is_unique_violation(&Error::Pool("timed out".into())));
+    }
+
+    #[test]
+    fn a_cancelled_statement_is_classified_as_a_timeout_not_a_generic_db_error() {
+        // This is the mapping ADR 0004 promises: `statement_timeout` fires,
+        // PostgreSQL raises SQLSTATE 57014, and the caller reads a named timeout.
+        let msg = "ERROR [57014]: canceling statement due to statement timeout".to_string();
+        match classify_db(QUERY_CANCELED, msg.clone()) {
+            Error::Timeout(m) => assert_eq!(m, msg),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_server_error_stays_a_db_error() {
+        match classify_db("42P01", "ERROR [42P01]: relation does not exist".into()) {
+            Error::Db(_) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
     }
 
     #[test]

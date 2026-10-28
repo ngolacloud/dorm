@@ -118,6 +118,11 @@ administrator, and non-interactive operation over secure channels.
 
 ## Phase 6 — DSNs and compatibility, documented
 
+- **Shipped (ADR 0004)**: TLS on PostgreSQL — `sslmode=require|verify-full`,
+  feature-gated rustls (default) / openssl backends, roots from `sslrootcert` or
+  the bundled Mozilla set, never a silent downgrade; and a server-side
+  `statement_timeout` surfaced as `Error::Timeout`. Follow-ups: `verify-ca`,
+  retry/reconnect, a recycle health check, and a wider `Value` set.
 - DSN formats per backend (PostgreSQL/MySQL URL forms; SQLite file/memory;
   SQL Server/Oracle per driver), covering percent-encoding, IPv6, TLS and
   certificate validation (never silently disabled), local sockets, timeouts,
