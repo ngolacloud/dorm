@@ -34,6 +34,7 @@ use dorm_core::value::Value;
 use serde_json::json;
 
 mod scaffold;
+mod studio;
 
 #[derive(Parser)]
 #[command(
@@ -99,6 +100,18 @@ enum CliCommand {
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+    /// Browse and edit the live database in your browser — DORM's Studio, in the
+    /// spirit of Prisma Studio. Native (reads `information_schema`); no project
+    /// build. Read-only unless `--write`.
+    Studio {
+        /// TCP port to serve on. Binds `127.0.0.1` only. Defaults to 5555.
+        #[arg(long, default_value_t = 5555)]
+        port: u16,
+        /// Allow writes — create, edit and delete rows. Off by default, mirroring
+        /// the shell; without it the Studio browses but refuses every edit.
+        #[arg(long)]
+        write: bool,
     },
     /// Generate and serve a read API (Axum + OpenAPI) over your models.
     Api {
@@ -259,6 +272,7 @@ fn main() -> ExitCode {
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
         CliCommand::Db { action } => on_runtime(run_db(action, json)),
+        CliCommand::Studio { port, write } => on_runtime(studio::serve(port, write)),
         CliCommand::Api { action } => match action {
             ApiAction::Generate { schema, out } => {
                 scaffold::api_generate(&schema, &out).map(|()| 0)

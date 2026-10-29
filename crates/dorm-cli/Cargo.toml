@@ -43,7 +43,12 @@ dorm-schema = { path = "../dorm-schema", version = "0.3.0" }
 clap = { workspace = true }
 clap_complete = "4"
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "signal"] }
 tokio-postgres = { workspace = true }
+# `dorm studio`: a browser UI over the live database (Prisma-Studio-shaped). The
+# generated read API uses the same version (see `scaffold.rs`), so a workspace
+# build shares one axum. `net`/`signal` on tokio above are for the listener and
+# the Ctrl-C graceful shutdown.
+axum = "0.7"
 # Only to render the ledger's `applied_unix` as a readable UTC timestamp.
 chrono = { workspace = true, features = ["alloc"] }
