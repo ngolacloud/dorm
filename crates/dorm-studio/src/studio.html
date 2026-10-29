@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DORM Studio</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f7f8; --border: #e3e3e6; --text: #1b1b1f;
+    --muted: #6b6b73; --accent: #4f46e5; --accent-fg: #ffffff;
+    --danger: #c0362c; --null: #9a9aa2; --row-hover: #f0f0ff; --key: #b78500;
+    --edit-bg: #fffbe6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a; --panel: #1f1f23; --border: #303036; --text: #e7e7ea;
+      --muted: #9a9aa2; --accent: #7c74ff; --accent-fg: #0b0b0d;
+      --danger: #ff6b5e; --null: #6b6b73; --row-hover: #26263a; --key: #e2b23a;
+      --edit-bg: #2a2a16;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--text); background: var(--bg); display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header .logo { font-weight: 700; letter-spacing: .3px; }
+  header .logo span { color: var(--accent); }
+  .badge {
+    font-size: 12px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.rw { color: var(--accent); border-color: var(--accent); }
+  .spacer { flex: 1; }
+  main { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 240px; border-right: 1px solid var(--border); background: var(--panel);
+    overflow-y: auto; flex-shrink: 0;
+  }
+  aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); margin: 14px 14px 6px; }
+  .table-item {
+    padding: 7px 14px; cursor: pointer; display: flex; justify-content: space-between;
+    gap: 8px; border-left: 2px solid transparent;
+  }
+  .table-item:hover { background: var(--row-hover); }
+  .table-item.active { background: var(--row-hover); border-left-color: var(--accent); font-weight: 600; }
+  .table-item .cols { color: var(--muted); font-size: 12px; }
+  section { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .toolbar .title { font-weight: 600; font-size: 15px; }
+  .toolbar .count { color: var(--muted); }
+  .hint-edit { color: var(--muted); font-size: 12px; }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button.danger { color: var(--danger); border-color: var(--danger); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input, select {
+    font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); min-width: 0;
+  }
+  .grid-wrap { flex: 1; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td {
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border);
+    white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+  }
+  th {
+    position: sticky; top: 0; background: var(--panel); cursor: pointer;
+    border-bottom: 2px solid var(--border); user-select: none;
+  }
+  th .type { color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 5px; }
+  th .key { color: var(--key); }
+  th .fk { color: var(--accent); }
+  tbody tr:hover { background: var(--row-hover); }
+  td.null { color: var(--null); font-style: italic; }
+  td.editable { cursor: cell; }
+  td.editing { background: var(--edit-bg); padding: 2px 4px; }
+  td.editing input { width: 100%; }
+  td .fk-jump {
+    color: var(--accent); cursor: pointer; margin-left: 6px; text-decoration: none;
+    font-weight: 700;
+  }
+  td .fk-jump:hover { text-decoration: underline; }
+  th.related { color: var(--muted); font-weight: 400; }
+  td.related a { color: var(--accent); cursor: pointer; margin-right: 10px; text-decoration: none; font-size: 12px; white-space: nowrap; }
+  td.related a:hover { text-decoration: underline; }
+  td.sel, th.sel { width: 1%; text-align: center; padding: 7px 8px; cursor: default; }
+  tr.selected td { background: var(--row-hover); }
+  tr.selected td.editing { background: var(--edit-bg); }
+  tr.new-row td { background: var(--edit-bg); }
+  tr.new-row input { width: 100%; }
+  tr.new-row td.actions { white-space: nowrap; }
+  tr.new-row td.actions button { margin-right: 4px; font-size: 12px; padding: 3px 9px; }
+  .pager { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+    border-top: 1px solid var(--border); color: var(--muted); }
+  .empty, .hint { padding: 40px; text-align: center; color: var(--muted); }
+  .filter { display: flex; gap: 6px; align-items: center; }
+  .toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--danger); color: #fff; padding: 10px 16px; border-radius: 8px;
+    max-width: 80vw; display: none; box-shadow: 0 6px 24px rgba(0,0,0,.3); z-index: 10;
+  }
+  .toast.show { display: block; }
+  .toast.ok { background: var(--accent); color: var(--accent-fg); }
+  .ro-note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">DORM <span>Studio</span></div>
+  <div id="mode" class="badge">…</div>
+  <div class="spacer"></div>
+  <div class="ro-note" id="ronote"></div>
+</header>
+<main>
+  <aside>
+    <h2>Tables</h2>
+    <div id="tables"></div>
+  </aside>
+  <section>
+    <div class="toolbar" id="toolbar" style="display:none">
+      <span class="title" id="tableName"></span>
+      <span class="count" id="rowCount"></span>
+      <span class="hint-edit" id="editHint"></span>
+      <div class="spacer"></div>
+      <button id="bulkDelete" class="danger" style="display:none">🗑 Delete</button>
+      <label for="search" style="position:absolute;left:-9999px">Search all columns</label>
+      <input id="search" placeholder="🔍 Search all columns…" size="18" />
+      <div class="filter">
+        <label for="filterCol" style="position:absolute;left:-9999px">Filter column</label>
+        <select id="filterCol"><option value="">(no filter)</option></select>
+        <label for="filterVal" style="position:absolute;left:-9999px">Filter value</label>
+        <input id="filterVal" placeholder="value" size="12" />
+        <button id="applyFilter">Filter</button>
+      </div>
+      <button id="refresh">Refresh</button>
+      <button id="newRow" class="primary" style="display:none">+ New row</button>
+    </div>
+    <div class="grid-wrap" id="gridWrap">
+      <div class="hint">Select a table on the left to browse its rows.</div>
+    </div>
+    <div class="pager" id="pager" style="display:none">
+      <button id="prev">‹ Prev</button>
+      <span id="pageInfo"></span>
+      <button id="next">Next ›</button>
+      <div class="spacer"></div>
+      <label>Rows: <select id="pageSize">
+        <option>25</option><option selected>50</option><option>100</option><option>250</option>
+      </select></label>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const state = { schema: null, writable: false, table: null, cols: [], hasPk: false,
+                offset: 0, limit: 50, total: 0, orderBy: null, dir: "asc",
+                filterCol: "", filterVal: "", search: "", lastRows: [], reverse: [],
+                editingCell: null, adding: false, selected: new Set() };
+
+const $ = (id) => document.getElementById(id);
+function toast(msg, ok) { const t = $("toast"); t.textContent = msg;
+  t.className = "toast show" + (ok ? " ok" : "");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 3500); }
+
+async function api(method, url, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const res = await fetch(url, opt);
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(data.error || (res.status + " " + res.statusText));
+  return data;
+}
+
+async function loadSchema() {
+  const s = await api("GET", "/api/schema");
+  state.schema = s; state.writable = s.writable;
+  $("mode").textContent = s.writable ? "read-write" : "read-only";
+  $("mode").className = "badge " + (s.writable ? "rw" : "");
+  $("ronote").textContent = s.writable ? "" : "Browsing only — restart with `dorm studio --write` to edit.";
+  const box = $("tables"); box.innerHTML = "";
+  if (!s.tables.length) { box.innerHTML = '<div class="hint">No tables in the public schema.</div>'; return; }
+  for (const t of s.tables) {
+    const el = document.createElement("div");
+    el.className = "table-item"; el.dataset.name = t.name;
+    el.innerHTML = `<span>${esc(t.name)}</span><span class="cols">${t.columns.length}</span>`;
+    el.onclick = () => selectTable(t.name);
+    box.appendChild(el);
+  }
+  selectTable(s.tables[0].name);
+}
+
+// Navigate to a table; `filter` = {col, val} applies an exact-match filter on arrival
+// (used when jumping along a foreign key to the referenced row).
+function selectTable(name, filter) {
+  const t = state.schema.tables.find((x) => x.name === name);
+  if (!t) { toast("no table " + name); return; }
+  state.table = name; state.cols = t.columns; state.hasPk = t.hasPk;
+  state.reverse = t.reverse || [];
+  state.offset = 0; state.orderBy = null; state.adding = false; state.editingCell = null;
+  state.filterCol = filter ? filter.col : ""; state.filterVal = filter ? filter.val : "";
+  state.search = ""; state.selected = new Set();
+  document.querySelectorAll(".table-item").forEach((e) =>
+    e.classList.toggle("active", e.dataset.name === name));
+  $("toolbar").style.display = "flex"; $("pager").style.display = "flex";
+  $("tableName").textContent = name;
+  $("newRow").style.display = state.writable ? "" : "none";
+  $("editHint").textContent = state.writable && t.hasPk ? "double-click a cell to edit" : "";
+  const fc = $("filterCol"); fc.innerHTML = '<option value="">(no filter)</option>';
+  for (const c of t.columns) { const o = document.createElement("option"); o.value = c.name; o.textContent = c.name; fc.appendChild(o); }
+  fc.value = state.filterCol; $("filterVal").value = state.filterVal; $("search").value = "";
+  loadRows();
+}
+
+function rowsUrl() {
+  const p = new URLSearchParams({ limit: state.limit, offset: state.offset });
+  if (state.orderBy) { p.set("orderBy", state.orderBy); p.set("dir", state.dir); }
+  if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
+  if (state.search) p.set("search", state.search);
+  return `/api/tables/${encodeURIComponent(state.table)}/rows?` + p;
+}
+
+async function loadRows() {
+  if (!state.table) return;
+  let data;
+  try { data = await api("GET", rowsUrl()); } catch (e) { toast(e.message); return; }
+  state.total = data.total; state.lastRows = data.rows; state.adding = false; state.editingCell = null;
+  renderGrid(data.columns, data.rows);
+  $("rowCount").textContent = `${data.total} row${data.total === 1 ? "" : "s"}`;
+  const from = data.total === 0 ? 0 : state.offset + 1;
+  const to = Math.min(state.offset + state.limit, data.total);
+  $("pageInfo").textContent = `${from}–${to} of ${data.total}`;
+  $("prev").disabled = state.offset === 0;
+  $("next").disabled = state.offset + state.limit >= data.total;
+}
+
+function colMeta(name) { return state.cols.find((c) => c.name === name); }
+function pkOf(row) { const pk = {}; for (const c of state.cols) if (c.pk) pk[c.name] = row[c.name]; return pk; }
+
+function renderGrid(columns, rows) {
+  const wrap = $("gridWrap");
+  const canEdit = state.writable && state.hasPk;
+  state.selected = new Set(); syncBulk();
+  const selHead = canEdit ? '<th class="sel"><input type="checkbox" id="selAll" title="select all" /></th>' : "";
+  const thead = columns.map((c) => {
+    const m = colMeta(c) || {};
+    const tag = m.pk ? ' <span class="key" title="primary key">🔑</span>'
+      : m.references ? ` <span class="fk" title="→ ${esc(m.references.table)}.${esc(m.references.column)}">↗</span>` : "";
+    return `<th data-col="${esc(c)}">${esc(c)}${tag}<span class="type">${esc(m.type || "")}</span></th>`;
+  }).join("");
+  const relHead = (state.reverse.length && state.hasPk) ? '<th class="related">related</th>' : "";
+  if (!rows.length && !state.writable) { wrap.innerHTML = '<div class="empty">No rows.</div>'; return; }
+  const body = rows.map((r, i) => renderRow(columns, r, i, canEdit)).join("");
+  wrap.innerHTML = `<table><thead><tr>${selHead}${thead}${relHead}</tr></thead><tbody>${body}</tbody></table>`;
+  const tbody = wrap.querySelector("tbody");
+  wrap.querySelectorAll("th[data-col]").forEach((th) => th.onclick = () => sortBy(th.dataset.col));
+  tbody.querySelectorAll("td.editable").forEach((td) =>
+    td.ondblclick = () => beginEdit(td, rows[+td.dataset.row], td.dataset.col));
+  tbody.querySelectorAll("a.fk-jump").forEach((a) => a.onclick = (e) => {
+    e.stopPropagation(); jumpFk(a.dataset.table, a.dataset.col, a.dataset.val); });
+  tbody.querySelectorAll("a.rev-jump").forEach((a) => a.onclick = () =>
+    jumpReverse(a.dataset.model, a.dataset.col, a.dataset.val));
+  tbody.querySelectorAll("input.rowsel").forEach((cb) =>
+    cb.onchange = () => toggleSel(+cb.dataset.row, cb.checked));
+  const all = $("selAll");
+  if (all) all.onchange = () => tbody.querySelectorAll("input.rowsel").forEach((cb) => {
+    cb.checked = all.checked; toggleSel(+cb.dataset.row, all.checked); });
+}
+
+function renderRow(columns, r, i, canEdit) {
+  const selTd = canEdit ? `<td class="sel"><input type="checkbox" class="rowsel" data-row="${i}" aria-label="select row" /></td>` : "";
+  const tds = columns.map((c) => {
+    const m = colMeta(c) || {};
+    const v = r[c];
+    const editable = canEdit && !m.pk;
+    const cls = [editable ? "editable" : "", v === null ? "null" : ""].filter(Boolean).join(" ");
+    const attrs = `data-row="${i}" data-col="${esc(c)}"${editable ? ' title="double-click to edit"' : ""}`;
+    if (v === null) return `<td class="${cls}" ${attrs}>NULL</td>`;
+    const jump = m.references
+      ? ` <a class="fk-jump" title="view ${esc(m.references.table)}.${esc(m.references.column)} = ${esc(v)}" data-table="${esc(m.references.table)}" data-col="${esc(m.references.column)}" data-val="${esc(v)}">↗</a>`
+      : "";
+    return `<td class="${cls}" ${attrs}><span class="val" title="${esc(v)}">${esc(v)}</span>${jump}</td>`;
+  }).join("");
+  let relTd = "";
+  if (state.reverse.length && state.hasPk) {
+    const key = pkFirstVal(r);
+    const links = key === null ? "" : state.reverse.map((rel) =>
+      `<a class="rev-jump" title="${esc(rel.model)} where ${esc(rel.column)} = ${esc(key)}" data-model="${esc(rel.model)}" data-col="${esc(rel.column)}" data-val="${esc(key)}">${esc(rel.name)} ↴</a>`).join("");
+    relTd = `<td class="related">${links}</td>`;
+  }
+  return `<tr data-row="${i}">${selTd}${tds}${relTd}</tr>`;
+}
+
+// The value of the first primary-key column of a row — what a reverse relation
+// filters the related table by (`apps` where `tenant = <this id>`).
+function pkFirstVal(row) {
+  const pk = state.cols.find((c) => c.pk);
+  return pk ? row[pk.name] : null;
+}
+function jumpReverse(model, col, val) {
+  if (!state.schema.tables.some((t) => t.name === model)) { toast("related model `" + model + "` is not browsable"); return; }
+  selectTable(model, { col, val });
+}
+
+// --- multi-select + bulk delete (checkboxes + trash), like Prisma Studio ---
+function toggleSel(i, on) {
+  if (on) state.selected.add(i); else state.selected.delete(i);
+  const tr = $("gridWrap").querySelector(`tr[data-row="${i}"]`);
+  if (tr) tr.classList.toggle("selected", on);
+  syncBulk();
+}
+function syncBulk() {
+  const b = $("bulkDelete"); if (!b) return;
+  const n = state.selected.size;
+  b.style.display = n > 0 ? "" : "none";
+  b.textContent = `🗑 Delete ${n}`;
+}
+async function bulkDelete() {
+  const n = state.selected.size; if (!n) return;
+  if (!confirm(`Delete ${n} row${n === 1 ? "" : "s"}? This cannot be undone.`)) return;
+  const keys = [...state.selected].map((i) => pkOf(state.lastRows[i]));
+  try {
+    const res = await api("DELETE", `/api/tables/${encodeURIComponent(state.table)}/rows`, { keys });
+    toast(`deleted ${res.affected} row${res.affected === 1 ? "" : "s"}`, true);
+    loadRows();
+  } catch (e) { toast(e.message); }
+}
+
+// --- inline cell editing (double-click), like Prisma Studio ---
+function beginEdit(td, row, col) {
+  if (state.editingCell) return; // one at a time
+  const m = colMeta(col);
+  const current = row[col];
+  state.editingCell = { td, row, col, html: td.innerHTML, cls: td.className };
+  td.className = "editing";
+  const input = document.createElement("input");
+  input.value = current === null ? "" : current;
+  input.placeholder = m.nullable ? "(empty = NULL)" : "";
+  td.innerHTML = ""; td.appendChild(input); input.focus(); input.select();
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") commitEdit(input.value);
+    else if (e.key === "Escape") cancelEdit();
+  };
+  input.onblur = () => commitEdit(input.value);
+}
+function cancelEdit() {
+  const e = state.editingCell; if (!e) return;
+  e.td.className = e.cls; e.td.innerHTML = e.html;
+  state.editingCell = null;
+  bindCell(e.td, e.row);
+}
+async function commitEdit(raw) {
+  const e = state.editingCell; if (!e) return;
+  state.editingCell = null;
+  const m = colMeta(e.col);
+  const was = e.row[e.col];
+  const next = (raw === "" && m.nullable) ? null : raw;
+  if (String(next) === String(was) || (next === null && was === null)) { // unchanged
+    e.td.className = e.cls; e.td.innerHTML = e.html; bindCell(e.td, e.row); return;
+  }
+  try {
+    await api("PATCH", `/api/tables/${encodeURIComponent(state.table)}/rows`,
+      { pk: pkOf(e.row), values: { [e.col]: next } });
+    e.row[e.col] = next; // keep the in-memory row in sync (pk unchanged)
+    e.td.className = (next === null ? "null " : "") + (m.pk ? "" : "editable");
+    const jump = m.references && next !== null
+      ? ` <a class="fk-jump" data-table="${esc(m.references.table)}" data-col="${esc(m.references.column)}" data-val="${esc(next)}">↗</a>` : "";
+    e.td.innerHTML = next === null ? "NULL" : `<span class="val">${esc(next)}</span>${jump}`;
+    bindCell(e.td, e.row);
+    toast("saved", true);
+  } catch (err) {
+    e.td.className = e.cls; e.td.innerHTML = e.html; bindCell(e.td, e.row);
+    toast(err.message);
+  }
+}
+// Re-attach the dblclick / fk-jump handlers to a cell after its innerHTML changed.
+function bindCell(td, row) {
+  if (td.classList.contains("editable")) td.ondblclick = () => beginEdit(td, row, td.dataset.col);
+  const a = td.querySelector("a.fk-jump");
+  if (a) a.onclick = (e) => { e.stopPropagation(); jumpFk(a.dataset.table, a.dataset.col, a.dataset.val); };
+}
+
+function jumpFk(table, col, val) {
+  if (!state.schema.tables.some((t) => t.name === table)) { toast("referenced table `" + table + "` is not browsable"); return; }
+  selectTable(table, { col, val });
+}
+
+function sortBy(col) {
+  if (state.orderBy === col) state.dir = state.dir === "asc" ? "desc" : "asc";
+  else { state.orderBy = col; state.dir = "asc"; }
+  state.offset = 0; loadRows();
+}
+
+// --- inline new row (no modal) ---
+function startNewRow() {
+  if (state.adding) return;
+  state.adding = true;
+  const table = $("gridWrap").querySelector("table");
+  if (!table) { loadRows().then(startNewRow); return; }
+  const tr = document.createElement("tr"); tr.className = "new-row";
+  // Lead with an empty cell under the selection column, so the inputs line up
+  // with their headers (the grid has a checkbox column whenever it is editable).
+  if (state.writable && state.hasPk) tr.appendChild(document.createElement("td")).className = "sel";
+  for (const c of state.cols) {
+    const td = document.createElement("td");
+    const input = document.createElement("input");
+    input.dataset.col = c.name;
+    input.placeholder = c.pk ? "(auto)" : c.default ? "(default)" : c.nullable ? "(null)" : c.type;
+    td.appendChild(input); tr.appendChild(td);
+  }
+  const act = document.createElement("td"); act.className = "actions";
+  act.innerHTML = '<button class="primary" id="saveNew">Save</button><button id="cancelNew">Cancel</button>';
+  tr.appendChild(act);
+  table.querySelector("tbody").prepend(tr);
+  tr.querySelector("input").focus();
+  $("saveNew").onclick = () => saveNewRow(tr);
+  $("cancelNew").onclick = () => { tr.remove(); state.adding = false; };
+  tr.querySelectorAll("input").forEach((i) => i.onkeydown = (e) => {
+    if (e.key === "Enter") saveNewRow(tr); else if (e.key === "Escape") { tr.remove(); state.adding = false; }
+  });
+}
+async function saveNewRow(tr) {
+  const values = {};
+  tr.querySelectorAll("input[data-col]").forEach((i) => {
+    if (i.value !== "") values[i.dataset.col] = i.value; // blanks → omitted → DB default/serial
+  });
+  if (Object.keys(values).length === 0) { toast("fill at least one column"); return; }
+  try {
+    await api("POST", `/api/tables/${encodeURIComponent(state.table)}/rows`, { values });
+    state.adding = false; loadRows(); toast("row created", true);
+  } catch (e) { toast(e.message); }
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+$("refresh").onclick = loadRows;
+$("newRow").onclick = startNewRow;
+$("bulkDelete").onclick = bulkDelete;
+let searchTimer;
+$("search").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  const v = e.target.value.trim();
+  searchTimer = setTimeout(() => { state.search = v; state.offset = 0; loadRows(); }, 300);
+});
+$("prev").onclick = () => { state.offset = Math.max(0, state.offset - state.limit); loadRows(); };
+$("next").onclick = () => { state.offset += state.limit; loadRows(); };
+$("pageSize").onchange = (e) => { state.limit = +e.target.value; state.offset = 0; loadRows(); };
+$("applyFilter").onclick = () => { state.filterCol = $("filterCol").value; state.filterVal = $("filterVal").value; state.offset = 0; loadRows(); };
+$("filterVal").addEventListener("keydown", (e) => { if (e.key === "Enter") $("applyFilter").click(); });
+
+loadSchema().catch((e) => toast("could not load schema: " + e.message));
+</script>
+</body>
+</html>

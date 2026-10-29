@@ -1,0 +1,34 @@
+[package]
+name = "dorm-studio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "DORM Studio — a Prisma-Studio-style web UI over your DORM models: browse, filter, search and (opt-in) edit the live database, with the models' own relations and types."
+readme = "README.md"
+keywords = ["orm", "postgres", "studio", "admin", "database"]
+categories = ["database", "web-programming"]
+# The example is a dev stand-in for a generated `src/bin/studio.rs`; it depends
+# on `dorm-models` (a `publish = false` crate), so it is left out of the package
+# rather than shipped broken to consumers.
+exclude = ["examples/*"]
+
+# The library a generated `src/bin/studio.rs` links: the project binary just
+# links its models (so the registry is populated) and calls `serve`, and this
+# crate does the rest — the server, the handlers over the typed value-row
+# terminals, and the single-page app. The same page `dorm-cli`'s native,
+# introspection-backed `dorm studio` serves (it re-exports `INDEX_HTML`), so the
+# two Studios share one UI.
+[dependencies]
+dorm-core = { path = "../dorm-core", version = "0.6.0" }
+axum = "0.7"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+
+[dev-dependencies]
+# For the example that stands the Studio up over the ORM's own models — the
+# in-workspace stand-in for a generated `src/bin/studio.rs`.
+dorm-models = { path = "../dorm-models" }
