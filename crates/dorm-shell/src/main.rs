@@ -10,8 +10,14 @@
 //! ## Commands
 //!
 //! * `:models` — list every registered model, its columns, and its relations.
+//! * `:begin` / `:commit` / `:rollback` — run several writes as one transaction:
+//!   `:begin`, then any number of `insert`/`update`/`delete` (and reads, which
+//!   see the uncommitted work), then `:commit` to persist all atomically or
+//!   `:rollback` to discard them. An error mid-transaction aborts it, so the
+//!   following `:rollback` leaves nothing written. See the note on why this is
+//!   held in the REPL loop rather than through `dorm_core::db::atomic`.
 //! * `:help`   — the command summary.
-//! * `:quit`   — leave (so does end-of-input).
+//! * `:quit`   — leave (so does end-of-input; an open transaction is rolled back).
 //! * `<Model> [field__lookup=value ...] [limit=N]` — run a query and print the
 //!   rows. `Tenant slug__startswith=ac limit=5`, or `Tenant` for everything (to
 //!   a default limit). Each `key=value` is one `filter_str`.
@@ -99,10 +105,17 @@ fn main() {
         ),
     }
 
+    // The transaction in scope, if `:begin` opened one. It is held here —
+    // outside any `block_on` — because the task-local that routes statements onto
+    // a transaction only lives for one future, and every REPL line is its own
+    // `block_on`; the handle survives between them, and each line is wrapped in
+    // its `scope` so the ordinary statements find it (see `dorm_core::db`).
+    let mut open_tx: Option<db::InteractiveTransaction> = None;
+
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
-        prompt();
+        prompt(open_tx.is_some());
         let Some(line) = lines.next() else { break };
         let line = match line {
             Ok(l) => l,
@@ -119,18 +132,61 @@ fn main() {
             ":quit" | ":q" | ":exit" => break,
             ":help" | ":h" => print_help(),
             ":models" | ":m" => print_models(),
+            ":begin" | ":begin;" => {
+                if open_tx.is_some() {
+                    eprintln!("error: already in a transaction; :commit or :rollback first");
+                    continue;
+                }
+                match rt.block_on(db::begin_interactive()) {
+                    Ok(tx) => {
+                        open_tx = Some(tx);
+                        println!("BEGIN");
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            ":commit" => match open_tx.take() {
+                None => eprintln!("error: no transaction open; :begin first"),
+                Some(tx) => match rt.block_on(tx.commit()) {
+                    Ok(()) => println!("COMMIT"),
+                    Err(e) => eprintln!("error: {e}"),
+                },
+            },
+            ":rollback" => match open_tx.take() {
+                None => eprintln!("error: no transaction open; :begin first"),
+                Some(tx) => match rt.block_on(tx.rollback()) {
+                    Ok(()) => println!("ROLLBACK"),
+                    Err(e) => eprintln!("error: {e}"),
+                },
+            },
             _ => {
-                if let Err(e) = rt.block_on(dispatch(line)) {
+                // Inside a transaction, the line runs with its connection in
+                // scope, so the write lands on the transaction and a failure
+                // leaves it open for the caller to `:rollback` — PostgreSQL has
+                // already aborted it, and the rollback is what discards the work.
+                let result = match &open_tx {
+                    Some(tx) => rt.block_on(tx.scope(dispatch(line))),
+                    None => rt.block_on(dispatch(line)),
+                };
+                if let Err(e) = result {
                     eprintln!("error: {e}");
                 }
             }
         }
     }
+    // A transaction still open at end-of-input is rolled back, not committed:
+    // dropping the handle closes PostgreSQL's connection (the server rolls back)
+    // or issues SQLite's `ROLLBACK`. Explicit, so the intent is on the page.
+    if open_tx.take().is_some() {
+        println!("(rolling back the open transaction)");
+    }
     println!("bye.");
 }
 
-fn prompt() {
-    print!("dorm> ");
+/// The prompt, marked `*` while a transaction is open so the session's state is
+/// visible on every line.
+fn prompt(in_tx: bool) {
+    print!("dorm{}> ", if in_tx { "*" } else { "" });
     let _ = io::stdout().flush();
 }
 
@@ -140,6 +196,7 @@ fn print_help() {
          \x20 :models                           list models, columns and relations\n\
          \x20 :sql <command>                    show a command's SQL and params, without running it\n\
          \x20 :raw <sql>                        run raw SQL (ADR 0005); writes need --write\n\
+         \x20 :begin / :commit / :rollback      run several writes as one transaction\n\
          \x20 :help                             this summary\n\
          \x20 :quit                             leave\n\
          reads:\n\
@@ -226,9 +283,6 @@ async fn dispatch(line: &str) -> dorm_core::Result<()> {
         "insert" => run_insert(line).await,
         "update" => run_update(line).await,
         "delete" => run_delete(line).await,
-        ":begin" | ":commit" | ":rollback" => Err(dorm_core::Error::Config(
-            "interactive transactions are not in this build yet (ADR 0006, brick 2)".into(),
-        )),
         _ => run_query(line).await,
     }
 }

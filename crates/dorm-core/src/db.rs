@@ -1109,6 +1109,70 @@ mod sqlite {
         }
     }
 
+    /// A SQLite transaction held open across calls for the interactive shell —
+    /// the SQLite side of [`super::InteractiveTransaction`].
+    ///
+    /// It owns [`TX_LOCK`] for the whole span (the guard lives in `_guard`), so
+    /// no other task can observe the single connection mid-transaction; and it
+    /// carries the [`SQLITE_TX`] state that [`scope_interactive`] re-enters for
+    /// each line, which is what tells the ordinary `fetch`/`run` they are already
+    /// inside a transaction and must not re-acquire the lock.
+    pub(super) struct InteractiveTx {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+        state: SqliteTxState,
+        done: std::cell::Cell<bool>,
+    }
+
+    impl Drop for InteractiveTx {
+        fn drop(&mut self) {
+            if self.done.get() {
+                return;
+            }
+            // Committed neither way: roll back, best-effort and synchronously —
+            // the same move [`RollbackOnPanic`] makes. Nothing an uncommitted
+            // interactive transaction wrote survives the handle being dropped.
+            if let Ok(c) = conn() {
+                if let Ok(guard) = c.lock() {
+                    let _ = guard.execute_batch("ROLLBACK");
+                }
+            }
+        }
+    }
+
+    pub(super) async fn begin_interactive() -> Result<InteractiveTx> {
+        let guard = tx_lock().lock_owned().await;
+        control("BEGIN").await?;
+        Ok(InteractiveTx {
+            _guard: guard,
+            state: SqliteTxState {
+                depth: Arc::new(Mutex::new(1)),
+            },
+            done: std::cell::Cell::new(false),
+        })
+    }
+
+    pub(super) async fn commit_interactive(tx: &InteractiveTx) -> Result<()> {
+        control("COMMIT").await?;
+        tx.done.set(true);
+        Ok(())
+    }
+
+    pub(super) async fn rollback_interactive(tx: &InteractiveTx) -> Result<()> {
+        control("ROLLBACK").await?;
+        tx.done.set(true);
+        Ok(())
+    }
+
+    /// Run `fut` with this transaction's [`SQLITE_TX`] state in scope, so the
+    /// statements inside it run on the connection the transaction already holds
+    /// rather than re-acquiring [`TX_LOCK`].
+    pub(super) async fn scope_interactive<Fut, T>(tx: &InteractiveTx, fut: Fut) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        SQLITE_TX.scope(tx.state.clone(), fut).await
+    }
+
     /// Run a blocking SQLite closure on tokio's blocking pool, flattening the
     /// join error into the ORM's.
     async fn blocking<T, F>(f: F) -> Result<T>
@@ -1303,6 +1367,185 @@ where
 /// identifiers and cannot be parameterised.
 fn savepoint_name(depth: usize) -> String {
     format!("orm_sp_{depth}")
+}
+
+// ------------------------------------------------- interactive transactions
+//
+// [`atomic`] brackets a *single* future: it begins, runs the closure, and ends
+// before it returns, because the transaction lives in a task-local that is only
+// in scope for that future. The shell cannot use it — each REPL line is its own
+// `block_on`, so a transaction begun on one line would be gone by the next, the
+// task-local dropped with the future that set it.
+//
+// So the shell gets a handle instead. [`begin_interactive`] takes the dedicated
+// connection and issues `BEGIN`, handing back an [`InteractiveTransaction`] the
+// caller keeps between lines; it wraps each following line in
+// [`InteractiveTransaction::scope`], which puts that same connection back in the
+// task-local so the *ordinary* routing (`query`/`execute`, and the SQLite
+// `fetch`/`run`) finds it unchanged; `commit`/`rollback` end the transaction and
+// return the connection. The statements in between are exactly the standalone
+// ones — the handle only controls *when* the transaction opens and closes.
+
+/// A transaction opened interactively and held open across calls — the
+/// counterpart to [`atomic`] for a session that spans more than one future,
+/// which is what a REPL's line-by-line `block_on` is.
+///
+/// Drop it without committing — on `:quit`, or a panic unwinding the shell — and
+/// the transaction is rolled back: PostgreSQL's connection is closed rather than
+/// recycled (an open transaction dying with its socket is rolled back by the
+/// server), and SQLite issues a best-effort `ROLLBACK`. Nothing a session began
+/// but did not commit is ever left written.
+pub struct InteractiveTransaction(TxHandle);
+
+enum TxHandle {
+    /// A dedicated pooled connection with an open `BEGIN`, kept out of the pool
+    /// for the transaction's life. The same `Shared` the task-local routing in
+    /// [`query_inner`]/[`execute_inner`] reads.
+    Postgres(Shared),
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite::InteractiveTx),
+}
+
+/// Open a transaction and hand back a handle that stays open until the caller
+/// commits or rolls back. See the section note for why the shell needs this
+/// rather than [`atomic`].
+///
+/// The backend is the DSN's, mirroring [`atomic`]: PostgreSQL takes a dedicated
+/// pooled connection and `BEGIN`s on it (`BEGIN READ ONLY` in a read-only
+/// session, so the server enforces what [`guard_write`] names); SQLite holds its
+/// single shared connection for the transaction's scope.
+pub async fn begin_interactive() -> Result<InteractiveTransaction> {
+    match backend()? {
+        Backend::Postgres => {
+            let conn = acquire().await?;
+            let start = if is_read_only() {
+                "BEGIN READ ONLY"
+            } else {
+                "BEGIN"
+            };
+            simple(&conn, start).await?;
+            let shared: Shared = Arc::new(tokio::sync::Mutex::new(TxState {
+                conn: Some(conn),
+                depth: 1,
+            }));
+            Ok(InteractiveTransaction(TxHandle::Postgres(shared)))
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => Ok(InteractiveTransaction(TxHandle::Sqlite(
+            sqlite::begin_interactive().await?,
+        ))),
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+impl InteractiveTransaction {
+    /// Run `fut` with this transaction's connection in scope, so the ordinary
+    /// statements inside it — a `fetch`, a `run`, a raw `sql` — route onto the
+    /// transaction instead of a fresh pooled connection. The shell wraps every
+    /// line it reads while a transaction is open in this.
+    pub async fn scope<Fut, T>(&self, fut: Fut) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        match &self.0 {
+            TxHandle::Postgres(shared) => CURRENT_TX.scope(shared.clone(), fut).await,
+            #[cfg(feature = "sqlite")]
+            TxHandle::Sqlite(tx) => sqlite::scope_interactive(tx, fut).await,
+        }
+    }
+
+    /// Commit, persisting every statement run since `begin` atomically, and
+    /// return the connection. Consumes the handle, so a committed transaction
+    /// cannot be used again.
+    pub async fn commit(self) -> Result<()> {
+        match &self.0 {
+            TxHandle::Postgres(shared) => {
+                let conn = shared
+                    .lock()
+                    .await
+                    .conn
+                    .take()
+                    .ok_or_else(|| Error::Db("the transaction's connection is gone".into()))?;
+                match simple(&conn, "COMMIT").await {
+                    // Clean after COMMIT — recycle it back into the pool.
+                    Ok(()) => {
+                        drop(conn);
+                        Ok(())
+                    }
+                    // Uncertain after a failed COMMIT — close it rather than
+                    // return a connection in an unknown state to the pool.
+                    Err(e) => {
+                        let _ = Object::take(conn);
+                        Err(e)
+                    }
+                }
+            }
+            #[cfg(feature = "sqlite")]
+            TxHandle::Sqlite(tx) => sqlite::commit_interactive(tx).await,
+        }
+        // `self` drops here: PostgreSQL's conn is already `None`, SQLite is
+        // marked done — so the `Drop` rollback is a no-op either way.
+    }
+
+    /// Roll back, discarding every statement run since `begin`, and return the
+    /// connection. Consumes the handle.
+    pub async fn rollback(self) -> Result<()> {
+        match &self.0 {
+            TxHandle::Postgres(shared) => {
+                let conn = shared
+                    .lock()
+                    .await
+                    .conn
+                    .take()
+                    .ok_or_else(|| Error::Db("the transaction's connection is gone".into()))?;
+                match simple(&conn, "ROLLBACK").await {
+                    Ok(()) => {
+                        drop(conn);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = Object::take(conn);
+                        Err(e)
+                    }
+                }
+            }
+            #[cfg(feature = "sqlite")]
+            TxHandle::Sqlite(tx) => sqlite::rollback_interactive(tx).await,
+        }
+    }
+
+    /// Which backend this transaction is running on.
+    pub fn backend(&self) -> Backend {
+        match &self.0 {
+            TxHandle::Postgres(_) => Backend::Postgres,
+            #[cfg(feature = "sqlite")]
+            TxHandle::Sqlite(_) => Backend::Sqlite,
+        }
+    }
+}
+
+impl Drop for InteractiveTransaction {
+    fn drop(&mut self) {
+        match &self.0 {
+            // A PostgreSQL transaction abandoned without commit/rollback: take
+            // the connection out of the pool so it is closed, not recycled with
+            // an open transaction — the server rolls it back when the socket
+            // closes. The same guarantee [`PanicGuard`] gives `atomic`. Already
+            // `None` after `commit`/`rollback`, so those paths do nothing here.
+            TxHandle::Postgres(shared) => {
+                if let Ok(mut state) = shared.try_lock() {
+                    if let Some(conn) = state.conn.take() {
+                        let _ = Object::take(conn);
+                    }
+                }
+            }
+            // SQLite's own handle drops right after this and rolls back there if
+            // it was not committed — see [`sqlite::InteractiveTx`].
+            #[cfg(feature = "sqlite")]
+            TxHandle::Sqlite(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
