@@ -20,7 +20,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the toolchain
         run: rustup toolchain install stable --component rustfmt --component clippy
       - uses: Swatinem/rust-cache@v2
@@ -38,7 +38,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the docs
@@ -67,7 +67,7 @@ jobs:
       DELONIX_ORM_DSN: host=127.0.0.1 port=5432 user=orm password=orm dbname=ormtest
       DELONIX_ORM_TEST_DSN: host=127.0.0.1 port=5432 user=orm password=orm dbname=ormtest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
       - name: Migrate (create the schema, then prove idempotence)
