@@ -9,12 +9,14 @@
     --bg: #ffffff; --panel: #f7f7f8; --border: #e3e3e6; --text: #1b1b1f;
     --muted: #6b6b73; --accent: #4f46e5; --accent-fg: #ffffff;
     --danger: #c0362c; --null: #9a9aa2; --row-hover: #f0f0ff; --key: #b78500;
+    --edit-bg: #fffbe6;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #17171a; --panel: #1f1f23; --border: #303036; --text: #e7e7ea;
       --muted: #9a9aa2; --accent: #7c74ff; --accent-fg: #0b0b0d;
       --danger: #ff6b5e; --null: #6b6b73; --row-hover: #26263a; --key: #e2b23a;
+      --edit-bg: #2a2a16;
     }
   }
   * { box-sizing: border-box; }
@@ -56,6 +58,7 @@
   }
   .toolbar .title { font-weight: 600; font-size: 15px; }
   .toolbar .count { color: var(--muted); }
+  .hint-edit { color: var(--muted); font-size: 12px; }
   button {
     font: inherit; padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border);
     background: var(--bg); color: var(--text); cursor: pointer;
@@ -83,36 +86,29 @@
   th .fk { color: var(--accent); }
   tbody tr:hover { background: var(--row-hover); }
   td.null { color: var(--null); font-style: italic; }
+  td.editable { cursor: cell; }
+  td.editing { background: var(--edit-bg); padding: 2px 4px; }
+  td.editing input { width: 100%; }
+  td .fk-jump {
+    color: var(--accent); cursor: pointer; margin-left: 6px; text-decoration: none;
+    font-weight: 700;
+  }
+  td .fk-jump:hover { text-decoration: underline; }
   td.actions { white-space: nowrap; }
   td.actions button { padding: 2px 8px; font-size: 12px; margin-right: 4px; }
+  tr.new-row td { background: var(--edit-bg); }
+  tr.new-row input { width: 100%; }
   .pager { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
     border-top: 1px solid var(--border); color: var(--muted); }
   .empty, .hint { padding: 40px; text-align: center; color: var(--muted); }
   .filter { display: flex; gap: 6px; align-items: center; }
-  /* modal */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
-    display: none; align-items: center; justify-content: center; padding: 20px; }
-  .overlay.open { display: flex; }
-  .modal {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
-    width: min(560px, 100%); max-height: 90vh; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,.3);
-  }
-  .modal h3 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--border); }
-  .modal .body { padding: 14px 18px; display: grid; gap: 12px; }
-  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
-  .field .label-name { color: var(--text); font-weight: 600; }
-  .field .row { display: flex; gap: 8px; align-items: center; }
-  .field .row input { flex: 1; }
-  .field .nullbox { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
-  .modal .foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 18px;
-    border-top: 1px solid var(--border); }
-  /* toast */
   .toast {
     position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
     background: var(--danger); color: #fff; padding: 10px 16px; border-radius: 8px;
     max-width: 80vw; display: none; box-shadow: 0 6px 24px rgba(0,0,0,.3); z-index: 10;
   }
   .toast.show { display: block; }
+  .toast.ok { background: var(--accent); color: var(--accent-fg); }
   .ro-note { color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -132,9 +128,12 @@
     <div class="toolbar" id="toolbar" style="display:none">
       <span class="title" id="tableName"></span>
       <span class="count" id="rowCount"></span>
+      <span class="hint-edit" id="editHint"></span>
       <div class="spacer"></div>
       <div class="filter">
+        <label for="filterCol" style="position:absolute;left:-9999px">Filter column</label>
         <select id="filterCol"><option value="">(no filter)</option></select>
+        <label for="filterVal" style="position:absolute;left:-9999px">Filter value</label>
         <input id="filterVal" placeholder="value" size="12" />
         <button id="applyFilter">Filter</button>
       </div>
@@ -155,26 +154,17 @@
     </div>
   </section>
 </main>
-
-<div class="overlay" id="overlay">
-  <div class="modal">
-    <h3 id="modalTitle">Edit row</h3>
-    <div class="body" id="modalBody"></div>
-    <div class="foot">
-      <button id="modalCancel">Cancel</button>
-      <button id="modalSave" class="primary">Save</button>
-    </div>
-  </div>
-</div>
 <div class="toast" id="toast"></div>
 
 <script>
 const state = { schema: null, writable: false, table: null, cols: [], hasPk: false,
-                offset: 0, limit: 50, total: 0, filterCol: "", filterVal: "", editing: null };
+                offset: 0, limit: 50, total: 0, orderBy: null, dir: "asc",
+                filterCol: "", filterVal: "", lastRows: [], editingCell: null, adding: false };
 
 const $ = (id) => document.getElementById(id);
-function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show");
-  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 4000); }
+function toast(msg, ok) { const t = $("toast"); t.textContent = msg;
+  t.className = "toast show" + (ok ? " ok" : "");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 3500); }
 
 async function api(method, url, body) {
   const opt = { method, headers: {} };
@@ -201,34 +191,41 @@ async function loadSchema() {
     el.onclick = () => selectTable(t.name);
     box.appendChild(el);
   }
-  // Open the first table straight away, so the Studio lands on data rather than
-  // an empty pane.
   selectTable(s.tables[0].name);
 }
 
-function selectTable(name) {
+// Navigate to a table; `filter` = {col, val} applies an exact-match filter on arrival
+// (used when jumping along a foreign key to the referenced row).
+function selectTable(name, filter) {
   const t = state.schema.tables.find((x) => x.name === name);
+  if (!t) { toast("no table " + name); return; }
   state.table = name; state.cols = t.columns; state.hasPk = t.hasPk;
-  state.offset = 0; state.filterCol = ""; state.filterVal = "";
+  state.offset = 0; state.orderBy = null; state.adding = false; state.editingCell = null;
+  state.filterCol = filter ? filter.col : ""; state.filterVal = filter ? filter.val : "";
   document.querySelectorAll(".table-item").forEach((e) =>
     e.classList.toggle("active", e.dataset.name === name));
   $("toolbar").style.display = "flex"; $("pager").style.display = "flex";
   $("tableName").textContent = name;
   $("newRow").style.display = state.writable ? "" : "none";
+  $("editHint").textContent = state.writable && t.hasPk ? "double-click a cell to edit" : "";
   const fc = $("filterCol"); fc.innerHTML = '<option value="">(no filter)</option>';
   for (const c of t.columns) { const o = document.createElement("option"); o.value = c.name; o.textContent = c.name; fc.appendChild(o); }
-  $("filterVal").value = "";
+  fc.value = state.filterCol; $("filterVal").value = state.filterVal;
   loadRows();
+}
+
+function rowsUrl() {
+  const p = new URLSearchParams({ limit: state.limit, offset: state.offset });
+  if (state.orderBy) { p.set("orderBy", state.orderBy); p.set("dir", state.dir); }
+  if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
+  return `/api/tables/${encodeURIComponent(state.table)}/rows?` + p;
 }
 
 async function loadRows() {
   if (!state.table) return;
-  const p = new URLSearchParams({ limit: state.limit, offset: state.offset });
-  if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
   let data;
-  try { data = await api("GET", `/api/tables/${encodeURIComponent(state.table)}/rows?` + p); }
-  catch (e) { toast(e.message); return; }
-  state.total = data.total;
+  try { data = await api("GET", rowsUrl()); } catch (e) { toast(e.message); return; }
+  state.total = data.total; state.lastRows = data.rows; state.adding = false; state.editingCell = null;
   renderGrid(data.columns, data.rows);
   $("rowCount").textContent = `${data.total} row${data.total === 1 ? "" : "s"}`;
   const from = data.total === 0 ? 0 : state.offset + 1;
@@ -239,97 +236,147 @@ async function loadRows() {
 }
 
 function colMeta(name) { return state.cols.find((c) => c.name === name); }
+function pkOf(row) { const pk = {}; for (const c of state.cols) if (c.pk) pk[c.name] = row[c.name]; return pk; }
 
 function renderGrid(columns, rows) {
   const wrap = $("gridWrap");
-  if (!rows.length) { wrap.innerHTML = '<div class="empty">No rows.</div>'; return; }
   const canEdit = state.writable && state.hasPk;
   const thead = columns.map((c) => {
     const m = colMeta(c) || {};
     const tag = m.pk ? ' <span class="key" title="primary key">🔑</span>'
-      : m.references ? ` <span class="fk" title="→ ${esc(m.references)}">↗</span>` : "";
-    return `<th data-col="${esc(c)}">${esc(c)}${tag}<span class="type">${esc((m.type || ""))}</span></th>`;
+      : m.references ? ` <span class="fk" title="→ ${esc(m.references.table)}.${esc(m.references.column)}">↗</span>` : "";
+    return `<th data-col="${esc(c)}">${esc(c)}${tag}<span class="type">${esc(m.type || "")}</span></th>`;
   }).join("");
   const actionsHead = canEdit ? "<th></th>" : "";
-  const body = rows.map((r, i) => {
-    const tds = columns.map((c) => {
-      const v = r[c];
-      if (v === null) return '<td class="null">NULL</td>';
-      return `<td title="${esc(v)}">${esc(v)}</td>`;
-    }).join("");
-    const act = canEdit
-      ? `<td class="actions"><button data-edit="${i}">Edit</button><button class="danger" data-del="${i}">Delete</button></td>`
-      : "";
-    return `<tr>${tds}${act}</tr>`;
-  }).join("");
+  if (!rows.length && !state.writable) { wrap.innerHTML = '<div class="empty">No rows.</div>'; return; }
+  const body = rows.map((r, i) => renderRow(columns, r, i, canEdit)).join("");
   wrap.innerHTML = `<table><thead><tr>${thead}${actionsHead}</tr></thead><tbody>${body}</tbody></table>`;
+  const tbody = wrap.querySelector("tbody");
   wrap.querySelectorAll("th[data-col]").forEach((th) => th.onclick = () => sortBy(th.dataset.col));
-  wrap.querySelectorAll("button[data-edit]").forEach((b) => b.onclick = () => openEditor(rows[+b.dataset.edit]));
-  wrap.querySelectorAll("button[data-del]").forEach((b) => b.onclick = () => removeRow(rows[+b.dataset.del]));
+  tbody.querySelectorAll("td.editable").forEach((td) =>
+    td.ondblclick = () => beginEdit(td, rows[+td.dataset.row], td.dataset.col));
+  tbody.querySelectorAll("a.fk-jump").forEach((a) => a.onclick = (e) => {
+    e.stopPropagation(); jumpFk(a.dataset.table, a.dataset.col, a.dataset.val); });
+  tbody.querySelectorAll("button[data-del]").forEach((b) =>
+    b.onclick = () => removeRow(rows[+b.dataset.del]));
+}
+
+function renderRow(columns, r, i, canEdit) {
+  const tds = columns.map((c) => {
+    const m = colMeta(c) || {};
+    const v = r[c];
+    const editable = canEdit && !m.pk;
+    const cls = [editable ? "editable" : "", v === null ? "null" : ""].filter(Boolean).join(" ");
+    const attrs = `data-row="${i}" data-col="${esc(c)}"${editable ? ' title="double-click to edit"' : ""}`;
+    if (v === null) return `<td class="${cls}" ${attrs}>NULL</td>`;
+    const jump = m.references
+      ? ` <a class="fk-jump" title="view ${esc(m.references.table)}.${esc(m.references.column)} = ${esc(v)}" data-table="${esc(m.references.table)}" data-col="${esc(m.references.column)}" data-val="${esc(v)}">↗</a>`
+      : "";
+    return `<td class="${cls}" ${attrs}><span class="val" title="${esc(v)}">${esc(v)}</span>${jump}</td>`;
+  }).join("");
+  const act = canEdit ? `<td class="actions"><button class="danger" data-del="${i}">Delete</button></td>` : "";
+  return `<tr>${tds}${act}</tr>`;
+}
+
+// --- inline cell editing (double-click), like Prisma Studio ---
+function beginEdit(td, row, col) {
+  if (state.editingCell) return; // one at a time
+  const m = colMeta(col);
+  const current = row[col];
+  state.editingCell = { td, row, col, html: td.innerHTML, cls: td.className };
+  td.className = "editing";
+  const input = document.createElement("input");
+  input.value = current === null ? "" : current;
+  input.placeholder = m.nullable ? "(empty = NULL)" : "";
+  td.innerHTML = ""; td.appendChild(input); input.focus(); input.select();
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") commitEdit(input.value);
+    else if (e.key === "Escape") cancelEdit();
+  };
+  input.onblur = () => commitEdit(input.value);
+}
+function cancelEdit() {
+  const e = state.editingCell; if (!e) return;
+  e.td.className = e.cls; e.td.innerHTML = e.html;
+  state.editingCell = null;
+  bindCell(e.td, e.row);
+}
+async function commitEdit(raw) {
+  const e = state.editingCell; if (!e) return;
+  state.editingCell = null;
+  const m = colMeta(e.col);
+  const was = e.row[e.col];
+  const next = (raw === "" && m.nullable) ? null : raw;
+  if (String(next) === String(was) || (next === null && was === null)) { // unchanged
+    e.td.className = e.cls; e.td.innerHTML = e.html; bindCell(e.td, e.row); return;
+  }
+  try {
+    await api("PATCH", `/api/tables/${encodeURIComponent(state.table)}/rows`,
+      { pk: pkOf(e.row), values: { [e.col]: next } });
+    e.row[e.col] = next; // keep the in-memory row in sync (pk unchanged)
+    e.td.className = (next === null ? "null " : "") + (m.pk ? "" : "editable");
+    const jump = m.references && next !== null
+      ? ` <a class="fk-jump" data-table="${esc(m.references.table)}" data-col="${esc(m.references.column)}" data-val="${esc(next)}">↗</a>` : "";
+    e.td.innerHTML = next === null ? "NULL" : `<span class="val">${esc(next)}</span>${jump}`;
+    bindCell(e.td, e.row);
+    toast("saved", true);
+  } catch (err) {
+    e.td.className = e.cls; e.td.innerHTML = e.html; bindCell(e.td, e.row);
+    toast(err.message);
+  }
+}
+// Re-attach the dblclick / fk-jump handlers to a cell after its innerHTML changed.
+function bindCell(td, row) {
+  if (td.classList.contains("editable")) td.ondblclick = () => beginEdit(td, row, td.dataset.col);
+  const a = td.querySelector("a.fk-jump");
+  if (a) a.onclick = (e) => { e.stopPropagation(); jumpFk(a.dataset.table, a.dataset.col, a.dataset.val); };
+}
+
+function jumpFk(table, col, val) {
+  if (!state.schema.tables.some((t) => t.name === table)) { toast("referenced table `" + table + "` is not browsable"); return; }
+  selectTable(table, { col, val });
 }
 
 function sortBy(col) {
   if (state.orderBy === col) state.dir = state.dir === "asc" ? "desc" : "asc";
   else { state.orderBy = col; state.dir = "asc"; }
-  const p = new URLSearchParams({ limit: state.limit, offset: state.offset, orderBy: col, dir: state.dir });
-  if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
-  api("GET", `/api/tables/${encodeURIComponent(state.table)}/rows?` + p)
-    .then((d) => { state.total = d.total; renderGrid(d.columns, d.rows); })
-    .catch((e) => toast(e.message));
+  state.offset = 0; loadRows();
 }
 
-function pkOf(row) { const pk = {}; for (const c of state.cols) if (c.pk) pk[c.name] = row[c.name]; return pk; }
-
-function openEditor(row) {
-  state.editing = row; // null for new
-  $("modalTitle").textContent = row ? "Edit row" : "New row";
-  const body = $("modalBody"); body.innerHTML = "";
+// --- inline new row (no modal) ---
+function startNewRow() {
+  if (state.adding) return;
+  state.adding = true;
+  const table = $("gridWrap").querySelector("table");
+  if (!table) { loadRows().then(startNewRow); return; }
+  const tr = document.createElement("tr"); tr.className = "new-row";
   for (const c of state.cols) {
-    const cur = row ? row[c.name] : null;
-    const isPkEdit = row && c.pk;
-    const field = document.createElement("div"); field.className = "field"; field.dataset.col = c.name;
-    const dflt = c.default ? ` · default ${esc(truncate(c.default, 24))}` : "";
-    field.innerHTML = `
-      <label><span class="label-name">${esc(c.name)}</span>
-        <span>${esc(c.type)}${c.nullable ? " · nullable" : ""}${c.pk ? " · pk" : ""}${dflt}</span></label>
-      <div class="row">
-        <input value="${row && cur !== null ? esc(cur) : ""}" ${isPkEdit ? "readonly" : ""}
-               placeholder="${!row && (c.default || c.nullable) ? "(leave blank for default/null)" : ""}" />
-        ${c.nullable && !isPkEdit ? `<label class="nullbox"><input type="checkbox" ${row && cur === null ? "checked" : ""}/> null</label>` : ""}
-      </div>`;
-    body.appendChild(field);
+    const td = document.createElement("td");
+    const input = document.createElement("input");
+    input.dataset.col = c.name;
+    input.placeholder = c.pk ? "(auto)" : c.default ? "(default)" : c.nullable ? "(null)" : c.type;
+    td.appendChild(input); tr.appendChild(td);
   }
-  $("overlay").classList.add("open");
+  const act = document.createElement("td"); act.className = "actions";
+  act.innerHTML = '<button class="primary" id="saveNew">Save</button><button id="cancelNew">Cancel</button>';
+  tr.appendChild(act);
+  table.querySelector("tbody").prepend(tr);
+  tr.querySelector("input").focus();
+  $("saveNew").onclick = () => saveNewRow(tr);
+  $("cancelNew").onclick = () => { tr.remove(); state.adding = false; };
+  tr.querySelectorAll("input").forEach((i) => i.onkeydown = (e) => {
+    if (e.key === "Enter") saveNewRow(tr); else if (e.key === "Escape") { tr.remove(); state.adding = false; }
+  });
 }
-function closeEditor() { $("overlay").classList.remove("open"); state.editing = null; }
-
-async function saveEditor() {
-  const row = state.editing;
+async function saveNewRow(tr) {
   const values = {};
-  for (const field of $("modalBody").querySelectorAll(".field")) {
-    const name = field.dataset.col; const c = colMeta(name);
-    const input = field.querySelector('input:not([type=checkbox])');
-    const nullbox = field.querySelector('input[type=checkbox]');
-    const isPkEdit = row && c.pk;
-    if (isPkEdit) continue; // the key identifies the row; it is not rewritten
-    if (nullbox && nullbox.checked) { values[name] = null; continue; }
-    const text = input.value;
-    if (!row) { // insert: skip untouched blanks so defaults/serials apply
-      if (text === "") continue;
-      values[name] = text;
-    } else { // update: send the field as shown
-      values[name] = text;
-    }
-  }
+  tr.querySelectorAll("input[data-col]").forEach((i) => {
+    if (i.value !== "") values[i.dataset.col] = i.value; // blanks → omitted → DB default/serial
+  });
+  if (Object.keys(values).length === 0) { toast("fill at least one column"); return; }
   try {
-    if (row) {
-      if (Object.keys(values).length === 0) { toast("nothing to update"); return; }
-      await api("PATCH", `/api/tables/${encodeURIComponent(state.table)}/rows`, { pk: pkOf(row), values });
-    } else {
-      if (Object.keys(values).length === 0) { toast("fill at least one column"); return; }
-      await api("POST", `/api/tables/${encodeURIComponent(state.table)}/rows`, { values });
-    }
-    closeEditor(); loadRows();
+    await api("POST", `/api/tables/${encodeURIComponent(state.table)}/rows`, { values });
+    state.adding = false; loadRows(); toast("row created", true);
   } catch (e) { toast(e.message); }
 }
 
@@ -337,23 +384,19 @@ async function removeRow(row) {
   if (!confirm("Delete this row? This cannot be undone.")) return;
   try {
     await api("DELETE", `/api/tables/${encodeURIComponent(state.table)}/rows`, { pk: pkOf(row) });
-    loadRows();
+    loadRows(); toast("row deleted", true);
   } catch (e) { toast(e.message); }
 }
 
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
-function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n) + "…" : s; }
 
 $("refresh").onclick = loadRows;
-$("newRow").onclick = () => openEditor(null);
+$("newRow").onclick = startNewRow;
 $("prev").onclick = () => { state.offset = Math.max(0, state.offset - state.limit); loadRows(); };
 $("next").onclick = () => { state.offset += state.limit; loadRows(); };
 $("pageSize").onchange = (e) => { state.limit = +e.target.value; state.offset = 0; loadRows(); };
 $("applyFilter").onclick = () => { state.filterCol = $("filterCol").value; state.filterVal = $("filterVal").value; state.offset = 0; loadRows(); };
 $("filterVal").addEventListener("keydown", (e) => { if (e.key === "Enter") $("applyFilter").click(); });
-$("modalCancel").onclick = closeEditor;
-$("modalSave").onclick = saveEditor;
-$("overlay").onclick = (e) => { if (e.target === $("overlay")) closeEditor(); };
 
 loadSchema().catch((e) => toast("could not load schema: " + e.message));
 </script>

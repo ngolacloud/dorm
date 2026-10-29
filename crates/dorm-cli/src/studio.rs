@@ -104,7 +104,9 @@ struct ColMeta {
     nullable: bool,
     default: Option<String>,
     pk: bool,
-    references: Option<String>,
+    /// The `(table, column)` a foreign key points at, so the UI can jump to the
+    /// referenced row. `None` when the column is not a foreign key.
+    references: Option<(String, String)>,
 }
 
 /// The base tables of the `public` schema, minus the migration ledger — the
@@ -149,9 +151,10 @@ async fn introspect_table(table: &str) -> dorm_core::Result<Option<Vec<ColMeta>>
     .map(|r| r.get::<_, String>(0))
     .collect();
 
-    let mut fk: HashMap<String, String> = HashMap::new();
+    let mut fk: HashMap<String, (String, String)> = HashMap::new();
     for r in db::query(
-        "SELECT kcu.column_name, ccu.table_name FROM information_schema.table_constraints tc \
+        "SELECT kcu.column_name, ccu.table_name, ccu.column_name \
+         FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name \
          JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name \
          WHERE tc.table_schema = 'public' AND tc.table_name = $1 AND tc.constraint_type = 'FOREIGN KEY'",
@@ -159,7 +162,10 @@ async fn introspect_table(table: &str) -> dorm_core::Result<Option<Vec<ColMeta>>
     )
     .await?
     {
-        fk.insert(r.get::<_, String>(0), r.get::<_, String>(1));
+        fk.insert(
+            r.get::<_, String>(0),
+            (r.get::<_, String>(1), r.get::<_, String>(2)),
+        );
     }
 
     Ok(Some(
@@ -196,7 +202,8 @@ async fn schema() -> Result<Json<JsonValue>, StudioError> {
                         "nullable": c.nullable,
                         "default": c.default,
                         "pk": c.pk,
-                        "references": c.references,
+                        "references": c.references.as_ref()
+                            .map(|(t, col)| json!({ "table": t, "column": col })),
                     })
                 })
                 .collect();
