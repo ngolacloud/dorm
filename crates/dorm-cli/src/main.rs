@@ -29,6 +29,8 @@ use std::process::{Command, ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use dorm_core::db;
+use dorm_core::row::Row;
+use dorm_core::value::Value;
 use serde_json::json;
 
 mod scaffold;
@@ -189,6 +191,45 @@ enum DbAction {
         /// Where to write the schema.
         #[arg(long, default_value = "dorm.schema")]
         out: String,
+    },
+    /// Run explicit SQL over the ADR 0005 raw-SQL valve. The statement text is
+    /// yours; every `--param` value is bound as `$1`, `$2`, … in the order given
+    /// and is never spliced into the SQL.
+    ///
+    /// Read-only by default. Without `--write` the statement must begin with a
+    /// read keyword (SELECT, WITH, VALUES, TABLE, SHOW, EXPLAIN); anything else is
+    /// refused before the database is touched, so a forgotten `--write` cannot
+    /// mutate. With `--write` the statement runs on the write path and reports the
+    /// rows affected — and is still refused by a read-only session with the same
+    /// `Error::ReadOnly` every compiled write gets.
+    ///
+    /// Parameters bind as text. PostgreSQL uses a text parameter directly wherever
+    /// it is compared against text (`WHERE name = $1`) or a column is cast to text
+    /// for the comparison (`WHERE id::text = $1`). For a non-text target the
+    /// parameter must be routed through text explicitly — `$1::text::int`,
+    /// `$1::text::uuid`, `VALUES ($1::text::int, $2)`; a bare `$1` into a non-text
+    /// column is rejected by the server. This is the honest limit of binding every
+    /// value as text, named rather than hidden.
+    ///
+    /// Only the closed set of column types the ORM knows is rendered — bool,
+    /// int2/int4/int8, text/varchar/char, numeric, timestamp(tz), uuid, json(b);
+    /// a column of any other type asks to be projected as text (`col::text`).
+    ///
+    /// The SQL is yours to own: DORM does not parse it and never quotes into it. A
+    /// string that reached this command from an untrusted source is your injection
+    /// to own, exactly as in hand-written Rust (ADR 0005).
+    Execute {
+        /// The SQL statement to run. A single statement; its text is used as-is.
+        sql: String,
+        /// A value to bind, repeatable: the first `--param` is `$1`, the second
+        /// `$2`, and so on. Bound as text — route it through text for a non-text
+        /// column (`$1::text::int`) or compare the column as text (`id::text = $1`).
+        #[arg(short = 'p', long = "param", value_name = "VALUE")]
+        params: Vec<String>,
+        /// Run a write (INSERT/UPDATE/DELETE/DDL). Required for any statement that
+        /// is not a plain read; honoured against the read-only guard.
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -495,7 +536,206 @@ async fn run_db(action: DbAction, json: bool) -> CliResult {
             filter,
         } => db_rows(&table, limit, filter.as_deref(), json).await,
         DbAction::Pull { out } => db_pull(&out).await,
+        DbAction::Execute { sql, params, write } => db_execute(&sql, &params, write, json).await,
     }
+}
+
+/// `dorm db execute`: the CLI surface over the ADR 0005 raw-SQL valve. Reads run
+/// through `db::sql` and print a table; writes run through `db::sql_execute`,
+/// which calls `guard_write` first — so a read-only session refuses them — and
+/// print the affected-row count. Every `--param` is a bound `$n`; the SQL text is
+/// never parsed, and no value is ever formatted into it.
+async fn db_execute(sql: &str, params: &[String], write: bool, json: bool) -> CliResult {
+    // Every user value binds as a text parameter. This is the whole point of the
+    // valve: the statement is opaque and the values travel as `$1`, `$2`, …,
+    // never spliced into the SQL. A text parameter is used directly where it meets
+    // text (a text column, or `col::text = $1`); for a non-text target the caller
+    // routes it through text (`$1::text::int`) — the limit the help names.
+    let bound: Vec<Value> = params.iter().map(|p| Value::Text(p.clone())).collect();
+
+    if write {
+        // The write path. `sql_execute` runs `guard_write` first, so a read-only
+        // session refuses this with `Error::ReadOnly`, exactly like a compiled
+        // write — the escape hatch does not escape the read-only rule.
+        let affected = db::sql_execute(sql, &bound).await?;
+        if json {
+            println!("{}", json!({ "affected": affected }));
+        } else {
+            println!(
+                "{affected} row{} affected",
+                if affected == 1 { "" } else { "s" }
+            );
+        }
+        return Ok(0);
+    }
+
+    // The read path. Refuse an obvious write *before* touching the database: the
+    // read path (`db::sql`) runs a `DELETE` just as readily as a `SELECT`, so a
+    // forgotten `--write` must be caught here, not discovered after it mutated.
+    // The check is lexical — see `looks_like_read` for what it does and does not
+    // promise.
+    if !looks_like_read(sql) {
+        return Err(format!(
+            "`{}` is not a read; re-run with --write to execute a write statement",
+            leading_keyword(sql)
+        )
+        .into());
+    }
+
+    let rows = db::sql(sql, &bound).await?;
+    if rows.is_empty() {
+        // With no rows there is no PostgreSQL metadata to name the columns from,
+        // so an empty read reports an empty result rather than inventing a header.
+        if json {
+            println!("{}", json!({ "columns": [], "rows": [], "count": 0 }));
+        } else {
+            println!("(0 rows)");
+        }
+        return Ok(0);
+    }
+
+    // Column names come from the PostgreSQL row itself. Only PostgreSQL carries
+    // this on the row; the other `dorm db` commands are PostgreSQL-only too (they
+    // read `information_schema`), so rendering PostgreSQL alone is consistent.
+    let names: Vec<String> = as_pg(&rows[0])?
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut line = Vec::with_capacity(names.len());
+        for idx in 0..names.len() {
+            line.push(render_pg_cell(row, idx)?);
+        }
+        cells.push(line);
+    }
+
+    if json {
+        let objs: Vec<_> = cells
+            .iter()
+            .map(|r| {
+                let m: serde_json::Map<String, serde_json::Value> = names
+                    .iter()
+                    .zip(r)
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({ "columns": names, "rows": objs, "count": cells.len() })
+        );
+        return Ok(0);
+    }
+
+    print_table(&names, &cells);
+    println!(
+        "({} row{})",
+        cells.len(),
+        if cells.len() == 1 { "" } else { "s" }
+    );
+    Ok(0)
+}
+
+/// The leading SQL keyword, upper-cased — the first run of ASCII letters after any
+/// leading whitespace or `(`. Used only to classify a statement for the `--write`
+/// gate and to name it in the refusal message.
+fn leading_keyword(sql: &str) -> String {
+    sql.trim_start()
+        .trim_start_matches('(')
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// Whether a statement reads, by its leading keyword alone: SELECT, WITH, VALUES,
+/// TABLE, SHOW and EXPLAIN are reads; everything else is treated as a write and
+/// needs `--write`.
+///
+/// This is a lexical convenience, not a parser, and it is honest about its limit.
+/// A write smuggled behind a read-shaped keyword — `WITH x AS (DELETE …) SELECT …`
+/// or `EXPLAIN ANALYZE DELETE …` — reads as a "read" here and would run on the
+/// read path. Per ADR 0005 the SQL text is the caller's to own; this guard catches
+/// the everyday `dorm db execute "DELETE …"` slip, it is not a safety boundary.
+fn looks_like_read(sql: &str) -> bool {
+    matches!(
+        leading_keyword(sql).as_str(),
+        "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN"
+    )
+}
+
+/// Render one PostgreSQL cell as a string, over the closed set of column types the
+/// ORM knows (the `Value` enum): bool, int2/int4/int8, text/varchar/char, numeric,
+/// timestamp(tz), uuid and json(b). A NULL in any of them is `NULL`.
+///
+/// The decode is the ORM's own (`value::read_column`), so a cell reads back exactly
+/// as the typed API would — except `int2`, which `read_column` does not cover (it
+/// reads i32/i64) and which is read here directly through `i16`'s built-in decode.
+/// A column of any other type is an error that asks the caller to project it as
+/// text (`col::text`): honest about the set the ORM actually supports, and never a
+/// silent wrong answer.
+/// The PostgreSQL row behind a [`Row`], or a clear error for a SQLite one. The
+/// `match` stays exhaustive whichever backends are compiled in: with the `sqlite`
+/// feature off `Row` has only the one variant, and the cfg'd arm is removed — so
+/// no irrefutable-pattern warning, and the code is ready if SQLite is ever linked.
+fn as_pg(row: &Row) -> Result<&tokio_postgres::Row, Box<dyn std::error::Error>> {
+    match row {
+        Row::Pg(pg) => Ok(pg),
+        #[cfg(feature = "sqlite")]
+        _ => Err("`dorm db execute` renders PostgreSQL results only".into()),
+    }
+}
+
+fn render_pg_cell(full: &Row, idx: usize) -> Result<String, Box<dyn std::error::Error>> {
+    use dorm_core::value::FieldType;
+    use tokio_postgres::types::Type;
+
+    let pg = as_pg(full)?;
+    let col = &pg.columns()[idx];
+    let name = col.name();
+    let ty = col.type_();
+
+    // `int2` is the one integer width `read_column` does not decode. `i16`'s
+    // `FromSql` is a tokio-postgres built-in, so read it straight.
+    if *ty == Type::INT2 {
+        let v: Option<i16> = pg.try_get(idx)?;
+        return Ok(v.map_or_else(|| "NULL".to_string(), |n| n.to_string()));
+    }
+
+    let field = match *ty {
+        Type::BOOL => FieldType::Bool,
+        Type::INT4 => FieldType::I32,
+        Type::INT8 => FieldType::I64,
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => FieldType::Text,
+        Type::NUMERIC => FieldType::Decimal,
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => FieldType::Timestamp,
+        Type::UUID => FieldType::Uuid,
+        Type::JSON | Type::JSONB => FieldType::Json,
+        _ => {
+            // Outside the ORM's set. Text is the escape a SELECT can always take,
+            // and the error names how: `col::text`.
+            return match pg.try_get::<_, Option<String>>(idx) {
+                Ok(v) => Ok(v.unwrap_or_else(|| "NULL".to_string())),
+                Err(_) => Err(format!(
+                    "column `{name}` has SQL type `{ty}`, which `dorm db execute` does not \
+                     render; project it as text in your SQL, e.g. `{name}::text`"
+                )
+                .into()),
+            };
+        }
+    };
+
+    let value = dorm_core::value::read_column(full, idx, field, name)?;
+    Ok(if value.is_null() {
+        "NULL".to_string()
+    } else {
+        value.to_string()
+    })
 }
 
 async fn db_tables(json: bool) -> CliResult {

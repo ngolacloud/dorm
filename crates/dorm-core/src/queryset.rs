@@ -105,6 +105,28 @@ impl<T: Model> Manager<T> {
         QuerySet::new().filter(q).get().await
     }
 
+    /// Run hand-written SQL and map each row back to `T` — Django's
+    /// `Model.objects.raw` (ADR 0005). The escape hatch for a query the compiler
+    /// cannot build (a CTE, a window function, a planner hint).
+    ///
+    /// The `SELECT` must return the model's columns in the model's field order:
+    /// `from_row` reads by position, not by name. Every `params` element is bound
+    /// as `$n`/`?n` — no value is formatted into the text, so the only injection
+    /// risk is one the caller writes into the SQL string itself.
+    ///
+    /// ```ignore
+    /// let active: Vec<Tenant> = Tenant::objects()
+    ///     .raw(
+    ///         "SELECT id, slug, name FROM tenants WHERE slug = $1",
+    ///         &["acme".to_value()],
+    ///     )
+    ///     .await?;
+    /// ```
+    pub async fn raw(&self, sql: &str, params: &[Value]) -> Result<Vec<T>> {
+        let rows = db::sql(sql, params).await?;
+        rows.iter().map(|row| T::from_row(row, 0)).collect()
+    }
+
     /// Insert one row and return it as stored, with database-generated columns
     /// filled in.
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
@@ -512,6 +534,40 @@ pub async fn fetch_value_rows(plan: &Plan) -> Result<Vec<ValueRow>> {
     let sql = compiler::compile_select_on(plan, db::dialect())?;
     let rows = run_query(&sql).await?;
     decode(&sql, &rows)
+}
+
+// The model-erased write path, next to `fetch_value_rows` — what the `dorm`
+// shell and the `db execute` CLI run when the model is only known as a string.
+// Every column name is validated against `meta` by the compiler (an unknown one
+// is `Error::UnknownField`, never interpolated), every value is bound, and each
+// refuses in a read-only session — so the dynamic front end keeps exactly the
+// guarantees the typed one has.
+
+/// Insert string-keyed rows and return them decoded, with database-generated
+/// columns filled in (the serial key, `auto_now_add` defaults).
+pub async fn insert_value_rows(
+    meta: &'static crate::meta::ModelMeta,
+    rows: &[Vec<(String, Value)>],
+) -> Result<Vec<ValueRow>> {
+    db::guard_write("insert")?;
+    let sql = compiler::compile_insert_on(meta, rows, db::dialect())?;
+    let returned = run_query(&sql).await?;
+    decode(&sql, &returned)
+}
+
+/// Update the rows `plan` selects, applying each assignment; returns the number
+/// of rows changed.
+pub async fn update_value_rows(plan: &Plan, assignments: &[Assignment]) -> Result<u64> {
+    db::guard_write("update")?;
+    let sql = compiler::compile_update_on(plan, assignments, db::dialect())?;
+    run_execute(&sql).await
+}
+
+/// Delete the rows `plan` selects; returns the number removed.
+pub async fn delete_value_rows(plan: &Plan) -> Result<u64> {
+    db::guard_write("delete")?;
+    let sql = compiler::compile_delete_on(plan, db::dialect())?;
+    run_execute(&sql).await
 }
 
 /// Decode rows against the column plan the compiler produced.

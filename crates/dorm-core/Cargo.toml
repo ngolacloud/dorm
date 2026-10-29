@@ -41,18 +41,51 @@ tokio-postgres = { workspace = true, features = [
 ] }
 deadpool-postgres = { workspace = true }
 inventory = { workspace = true }
+# Observability (ADR 0008): one `tracing` event per statement in `db.rs`, plus
+# the slow-query warning. A no-op without a subscriber, so it is always on
+# rather than feature-gated — see the ADR for why a gate would only cost us.
+tracing = { workspace = true }
 # The SQLite driver, opt-in behind the `sqlite` feature (ADR 0003). `bundled`
 # compiles SQLite in, so a user who turns the feature on needs no system
 # library; a user who leaves it off pulls neither this crate nor SQLite.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
+# TLS for the PostgreSQL connection (ADR 0004). Both optional; `tls-rustls` is in
+# the default set. Each is pulled only when its feature is on.
+tokio-postgres-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+postgres-openssl = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+
 # A process talks to one backend, chosen by the DSN (ADR 0003). PostgreSQL is
 # the default so a user who names no feature gets today's behaviour unchanged
-# and pulls no SQLite; `sqlite` adds the second backend.
+# and pulls no SQLite; `sqlite` adds the second backend. `tls-rustls` is default
+# so TLS works out of the box; `tls-openssl` is the opt-in system-libssl backend
+# (ADR 0004). With both on, rustls wins; with neither, a TLS DSN is an error.
 [features]
-default = ["postgres"]
+default = ["postgres", "tls-rustls"]
 postgres = []
 sqlite = ["dep:rusqlite"]
+tls-rustls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+tls-openssl = ["dep:postgres-openssl", "dep:openssl"]
 
 [dev-dependencies]
 insta = { workspace = true }
+# ADR 0007 benchmarks. `async_tokio` lets a `&Runtime` drive the measured
+# future so each iteration is a real round trip to PostgreSQL; the models the
+# benchmark queries come from the derive, exactly as a user's would.
+criterion = { version = "0.5", features = ["async_tokio"] }
+dorm-derive = { path = "../dorm-derive" }
+# ADR 0008's live proof installs a capturing subscriber to witness the
+# slow-query `warn!` event. Test-only — the library never installs a subscriber.
+tracing-subscriber = { workspace = true }
+
+# The prepared-statement-cache proof (ADR 0007): typed DORM vs raw
+# `tokio-postgres`, and ad-hoc vs cached preparation. `harness = false` hands the
+# `main` to criterion; the bench no-ops unless `DELONIX_ORM_DSN` points at a
+# throwaway PostgreSQL.
+[[bench]]
+name = "prepared_cache"
+harness = false

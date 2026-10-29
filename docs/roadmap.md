@@ -90,6 +90,12 @@ system-provided or bundled.
 
 ## Phase 4 — Shell inspired by Django
 
+**Shipped (ADR 0006, brick 1)**: write DML through the compiler — `insert`,
+`update`, `delete` from string-keyed input — plus `:sql` to preview a command's
+SQL and bound params, and `:raw` for the ADR 0005 escape hatch; read-only by
+default, `--write` to opt in, unfiltered `delete` refused unless `all`. Next:
+interactive transactions (`:begin`/`:commit`), autocomplete and history.
+
 `dorm shell` loads the project's models and config and offers: discovery of
 models/fields/relations, CRUD, explicit transactions, SQL inspection,
 connection/context inspection (no secrets), reproducible scripts, autocomplete
@@ -118,6 +124,11 @@ administrator, and non-interactive operation over secure channels.
 
 ## Phase 6 — DSNs and compatibility, documented
 
+- **Shipped (ADR 0004)**: TLS on PostgreSQL — `sslmode=require|verify-full`,
+  feature-gated rustls (default) / openssl backends, roots from `sslrootcert` or
+  the bundled Mozilla set, never a silent downgrade; and a server-side
+  `statement_timeout` surfaced as `Error::Timeout`. Follow-ups: `verify-ca`,
+  retry/reconnect, a recycle health check, and a wider `Value` set.
 - DSN formats per backend (PostgreSQL/MySQL URL forms; SQLite file/memory;
   SQL Server/Oracle per driver), covering percent-encoding, IPv6, TLS and
   certificate validation (never silently disabled), local sockets, timeouts,

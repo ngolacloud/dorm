@@ -33,7 +33,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm migrate deploy` (= `dorm migrate`) | Apply reviewed migrations (the initial migration). | 0/1 | **partial** | Applies version 1; multi-version authoring is `migrate dev` (planned). |
 | `dorm migrate status` | Applied-versions ledger. | 0/1 | **done** | Native; `--json`; readable UTC timestamps. |
 | `dorm migrate diff` | Show the additive changes `push` would apply, without touching the DB. | 0/1 | **done** | Cargo lane; read-only; `--json`. |
-| `dorm shell` | Open the project REPL. | 0/1 | **partial** | Query + `:models`; admin ops and transactions are [roadmap](roadmap.md). |
+| `dorm shell` | Open the project REPL. | 0/1 | **partial** | Query + `:models` + **DML** `insert`/`update`/`delete` through the compiler, `:sql` preview and `:raw` (ADR 0006), read-only unless `--write`. Interactive transactions and admin ops are [roadmap](roadmap.md). |
 | `dorm db tables\|show\|count\|rows` | Browse the live database, read-only. | 0/1 | **done** | Native; `--json`; `rows --where col=value` (bound param, column validated). |
 | `dorm completions <shell>` | Print a completion script. | 0 | **done** | |
 | `dorm generate` | Compile `dorm.schema` → `src/models.rs`. | 0/1 | **done** | Native; the declarative schema compiled to `#[derive(Model)]` — see [schema.md](schema.md), [ADR 0001](adr/0001-declarative-schema.md). |
@@ -41,7 +41,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm db pull [--out]` | Introspect a live PostgreSQL schema into `dorm.schema`. | 0/1 | **done** | Native; recovers tables, columns, types, serial/PK, nullability, foreign keys (with `@@map`). Approximate — not unique/index/length/check/ordering or relation `onDelete`; the file says so. Round-trips through `dorm generate`. |
 | `dorm api generate` / `dorm api serve` | Generate (`src/bin/api.rs`) and serve an Axum CRUD API + OpenAPI over the models. | 0/1 | **done** | Full CRUD: `GET`/`POST /<table>`, `GET`/`PATCH`/`DELETE /<table>/{id}`, `/openapi.json`, `/health`. Handlers go through the `QuerySet`; `DORM_API_ADDR` sets host:port. Generated code — see ADR 0001. |
 | `dorm db seed` | Run configured seeds. | — | **planned** | |
-| `dorm db execute` | Run explicit SQL with parameters. | — | **planned** | |
+| `dorm db execute "<SQL>" [-p VALUE]... [--write]` | Run explicit SQL with bound parameters. | 0/1 | **done** | Native; `--json`. The CLI surface over the ADR 0005 valve (`db::sql` / `db::sql_execute`). Read-only by default — a write needs `--write` and still passes the read-only guard. Every `-p` value is bound as `$n`, never spliced. Renders the closed set of types the ORM knows; project others as `::text`. |
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
 | `dorm migrate resolve` | Reconcile ledger after manual recovery. | — | **planned** | Must never mark applied without evidence. |
 | `dorm dbshell` | Open the native DB client (`psql`, …). | — | **planned** | Per-backend. |

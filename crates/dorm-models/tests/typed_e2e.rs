@@ -199,6 +199,37 @@ e2e!(
     }
 );
 
+// ADR 0005: the raw escape hatch maps hand-written SQL back to the typed model,
+// and binds its parameters rather than formatting them.
+e2e!(raw_sql_maps_rows_back_to_the_model, "acme-raw", |t, _p| {
+    let found: Vec<Tenant> = Tenant::objects()
+        .raw(
+            "SELECT id, slug, name, created_at FROM tenants WHERE slug = $1",
+            &[Value::Text(t.slug.clone())],
+        )
+        .await
+        .expect("the raw query runs and maps");
+
+    assert_eq!(found.len(), 1, "exactly the seeded tenant comes back");
+    assert_eq!(found[0].id, t.id, "the primary key decodes");
+    assert_eq!(found[0].slug, t.slug, "the text column decodes");
+
+    // The value was bound, not interpolated: a slug carrying SQL syntax is
+    // matched literally and simply finds nothing, rather than changing the
+    // query.
+    let nobody: Vec<Tenant> = Tenant::objects()
+        .raw(
+            "SELECT id, slug, name, created_at FROM tenants WHERE slug = $1",
+            &[Value::Text("' OR '1'='1".into())],
+        )
+        .await
+        .expect("the raw query runs");
+    assert!(
+        nobody.is_empty(),
+        "the parameter is bound, so injection is inert"
+    );
+});
+
 e2e!(
     an_f_expression_increments_atomically,
     "acme-fexpr",

@@ -25,6 +25,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "dorm"
 path = "src/main.rs"
 
+[features]
+# Forward the SQLite backend to `dorm-core`, exactly as `dorm-migrations` and
+# `dorm-models` do. Off by default — the installed `dorm` binary is PostgreSQL
+# (the `db …` commands read `information_schema`). The feature exists so that a
+# workspace build with every feature on stays coherent: when `dorm-core/sqlite`
+# is linked, `Row` gains its `Sqlite` variant and the match in `db execute` that
+# handles it is compiled too.
+sqlite = ["dorm-core/sqlite"]
+
 [dependencies]
 # Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
 # A path alongside the version so an in-workspace build uses the local crate and

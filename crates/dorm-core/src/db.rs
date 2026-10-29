@@ -25,9 +25,10 @@
 //! PostgreSQL itself. That is a stronger guarantee than a best-effort
 //! `ROLLBACK`, because it also covers the process being killed.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::types::ToSql;
@@ -48,12 +49,38 @@ pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
 pub const POOL_MAX_ENV: &str = "DELONIX_ORM_POOL_MAX";
 /// How long a caller waits for a connection before giving up.
 pub const POOL_ACQUIRE_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_POOL_ACQUIRE_TIMEOUT_MS";
+/// Statements slower than this many milliseconds are logged at `warn` (ADR 0008).
+/// Absent — or zero — disables the slow-query log entirely, which is the default:
+/// production opts *in* to the noise, it is never surprised by it.
+pub const SLOW_QUERY_MS_ENV: &str = "DELONIX_ORM_SLOW_QUERY_MS";
+/// Server-side `statement_timeout`, in milliseconds. `0`/unset means no timeout
+/// (ADR 0004). When set, PostgreSQL cancels an over-running statement and the
+/// ORM surfaces [`Error::Timeout`].
+pub const STATEMENT_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_STATEMENT_TIMEOUT_MS";
+/// Overrides the DSN's `sslmode` (ADR 0004): `disable`, `require`, `verify-full`.
+pub const SSLMODE_ENV: &str = "DELONIX_ORM_SSLMODE";
+/// Overrides the DSN's `sslrootcert`: a PEM file of roots to trust.
+pub const SSLROOTCERT_ENV: &str = "DELONIX_ORM_SSLROOTCERT";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
 
+/// How much SQL a log line carries before it is truncated. Long enough to read
+/// the shape of a statement, short enough that a 50-line generated query does
+/// not flood the log. The full SQL is never a secret — the *parameters* are, and
+/// those are never here (see [`observe`]).
+const SQL_LOG_MAX: usize = 300;
+
 static POOL: OnceLock<Pool> = OnceLock::new();
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// The slow-query threshold, read from the environment exactly once.
+///
+/// Like the pool sizing, this is process configuration set at launch, not a
+/// per-call knob — so it is resolved on first use and cached, keeping the hot
+/// path free of an env lookup (and its lock + allocation) on every statement.
+/// `None` means the slow-query log is off; `Some(d)` is the threshold.
+static SLOW_QUERY: OnceLock<Option<Duration>> = OnceLock::new();
 
 /// Read the configured DSN.
 pub fn dsn() -> Result<String> {
@@ -74,6 +101,132 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+// ------------------------------------------------------- observability (ADR 0008)
+//
+// Every statement that runs through `query`/`execute` emits one `tracing` event
+// with its timing and shape, and — when a threshold is configured — a `warn`
+// when it runs long. The whole thing is a no-op without a subscriber, which is
+// why it is always compiled in rather than feature-gated: `tracing`'s disabled
+// path is a relaxed atomic load, so a process that installs no subscriber pays
+// essentially nothing. See ADR 0008.
+//
+// SECURITY — this is the invariant the whole module keeps: a log line carries
+// the SQL *text* (which holds `$n` placeholders, never literals) and metadata.
+// It NEVER carries the bound parameter values, because those are exactly the
+// data most likely to be sensitive — a password being hashed, an email, a token.
+// `observe` is given the SQL and a row count, never `params`, so there is no path
+// by which a value can reach the log.
+
+/// The configured slow-query threshold, resolved once. See [`SLOW_QUERY`].
+fn slow_query_threshold() -> Option<Duration> {
+    *SLOW_QUERY.get_or_init(|| {
+        std::env::var(SLOW_QUERY_MS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+/// Shorten SQL for a log line, on a UTF-8 boundary, tagging the original length
+/// when it is cut. Only the SQL text is ever summarised — never a parameter
+/// value, which does not pass through here (see the module note above).
+fn summarize_sql(sql: &str) -> Cow<'_, str> {
+    let trimmed = sql.trim();
+    if trimmed.len() <= SQL_LOG_MAX {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut end = SQL_LOG_MAX;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}… [{} bytes]", &trimmed[..end], trimmed.len()))
+}
+
+/// Emit the per-statement trace event and, past the configured threshold, the
+/// slow-query warning.
+///
+/// `rows` is `Some(n)` when the statement succeeded — rows returned for a query,
+/// rows affected for an execute — and `None` when it failed; the failure itself
+/// still propagates to the caller as an `Err`, this only records that it ran.
+/// `params` is deliberately not a parameter of this function: values never log.
+fn observe(op: &'static str, sql: &str, elapsed: Duration, rows: Option<u64>, in_tx: bool) {
+    let duration_ms = elapsed.as_secs_f64() * 1e3;
+    let sql = summarize_sql(sql);
+
+    // The normal case, at debug: one line per statement for anyone who turns the
+    // `dorm::db` target up, invisible (and nearly free) to everyone else.
+    tracing::debug!(
+        target: "dorm::db",
+        op,
+        rows = ?rows,
+        duration_ms,
+        in_tx,
+        sql = %sql,
+        "statement finished"
+    );
+
+    if let Some(threshold) = slow_query_threshold() {
+        if elapsed >= threshold {
+            // A separate `warn` so slow queries surface on a default subscriber
+            // without having to opt into the per-statement debug stream.
+            tracing::warn!(
+                target: "dorm::db",
+                op,
+                duration_ms,
+                threshold_ms = threshold.as_millis() as u64,
+                in_tx,
+                sql = %sql,
+                "slow query"
+            );
+        }
+    }
+}
+
+/// A point-in-time snapshot of the connection pool's occupancy (ADR 0008).
+///
+/// This mirrors deadpool's own `Status` but is a type DORM owns, so the pool
+/// implementation does not leak into the public API — a caller can serialize it
+/// into a metrics endpoint or a health check without taking a deadpool
+/// dependency, and we can change pools underneath without breaking them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolStats {
+    /// The configured ceiling — `DELONIX_ORM_POOL_MAX`, or the built-in default.
+    pub max_size: usize,
+    /// Connections currently managed by the pool (idle plus checked-out).
+    pub size: usize,
+    /// Idle connections available to hand out right now, as deadpool reports it.
+    pub available: usize,
+    /// Callers currently blocked waiting for a connection.
+    pub waiting: usize,
+}
+
+/// A snapshot of the pool's current occupancy, for a metrics endpoint or health
+/// check (ADR 0008). Errors only if no pool can be built — i.e. no DSN is set.
+///
+/// It is a snapshot, not a subscription: the numbers are already stale by the
+/// time the caller reads them, which is all a pool gauge ever is. Cheap enough
+/// to call per scrape.
+pub fn pool_stats() -> Result<PoolStats> {
+    let status = pool()?.status();
+    Ok(PoolStats {
+        max_size: status.max_size,
+        size: status.size,
+        available: status.available,
+        waiting: status.waiting,
+    })
+}
+
+/// A non-negative millisecond count from the environment, `default` when unset
+/// or unparseable. Unlike [`env_usize`], `0` is a legitimate value here — it is
+/// how `statement_timeout` is turned off.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -117,22 +270,29 @@ pub fn pool() -> Result<&'static Pool> {
     if let Some(p) = POOL.get() {
         return Ok(p);
     }
-    let dsn = dsn()?;
-    let config: Config = dsn
+    let raw = dsn()?;
+    // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
+    // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
+    // the parse; verification is done by the connector, not the driver.
+    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(&raw);
+    let mut config: Config = cleaned
         .parse()
         .map_err(|e| Error::Config(format!("the DSN is not usable: {e}")))?;
 
-    // `Fast` recycling: the pool hands back a connection without a round trip.
-    // It is safe here because a connection is only ever returned to the pool
-    // with no transaction open — `atomic` takes it out of the pool instead of
-    // returning a dirty one.
-    let manager = Manager::from_config(
-        config,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
+    // Server-side `statement_timeout` (ADR 0004): injected as a libpq option so
+    // PostgreSQL itself cancels an over-running statement. `0` leaves it off.
+    if let Some(opts) =
+        merge_statement_timeout(config.get_options(), env_u64(STATEMENT_TIMEOUT_MS_ENV, 0))
+    {
+        config.options(opts);
+    }
+
+    // TLS selection: env overrides the DSN, which overrides "disable".
+    let mode = std::env::var(SSLMODE_ENV).ok().or(dsn_mode);
+    let root = std::env::var(SSLROOTCERT_ENV).ok().or(dsn_root);
+    let requirement = ssl_requirement(mode.as_deref())?;
+
+    let manager = build_manager(config, requirement, root.as_deref())?;
     let pool = Pool::builder(manager)
         // Required because the timeouts below are set: deadpool needs a runtime
         // to arm them against, and without this it refuses to build with
@@ -148,6 +308,299 @@ pub fn pool() -> Result<&'static Pool> {
         .map_err(|e| Error::Pool(e.to_string()))?;
 
     Ok(POOL.get_or_init(|| pool))
+}
+
+// --------------------------------------------------------------------- TLS
+//
+// ADR 0004. TLS is feature-gated: `tls-rustls` (default, pure Rust) and
+// `tls-openssl` (system libssl). The DSN's `sslmode` picks the strictness; the
+// driver only learns "request TLS or not", because the certificate check lives
+// in the connector, not in `tokio-postgres`.
+
+/// What the DSN asks of the connection's TLS, from its `sslmode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslRequirement {
+    /// Plaintext — `NoTls`, whatever TLS features are compiled in.
+    Disable,
+    /// Encrypt, but do not verify the server certificate (libpq `require`).
+    Require,
+    /// Encrypt and verify the certificate chain **and** the hostname.
+    VerifyFull,
+}
+
+/// Map an `sslmode` token to a [`SslRequirement`], or refuse one this release
+/// does not implement. `None` and the opportunistic modes are `Disable`: DORM
+/// never silently half-encrypts — ask for `require` or `verify-full` to get TLS.
+pub fn ssl_requirement(mode: Option<&str>) -> Result<SslRequirement> {
+    match mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("disable") | Some("prefer") | Some("allow") => {
+            Ok(SslRequirement::Disable)
+        }
+        Some("require") => Ok(SslRequirement::Require),
+        Some("verify-full") => Ok(SslRequirement::VerifyFull),
+        Some("verify-ca") => Err(Error::Tls(
+            "sslmode=verify-ca is not implemented yet; use verify-full (chain + \
+             hostname) or require (no verification)"
+                .into(),
+        )),
+        Some(other) => Err(Error::Tls(format!(
+            "unknown sslmode `{other}`; use disable, require, or verify-full"
+        ))),
+    }
+}
+
+/// Pull the TLS keys DORM handles itself (`sslmode`, `sslrootcert`) out of the
+/// DSN, returning `(dsn_without_them, sslmode, sslrootcert)`. Handles both the
+/// libpq keyword form (`host=… sslmode=require`) and the URL query form
+/// (`postgres://…?sslmode=verify-full`). Pure, so it is unit-tested.
+fn extract_tls_params(dsn: &str) -> (String, Option<String>, Option<String>) {
+    let (mut mode, mut root) = (None, None);
+    let take = |key: &str, tok: &str, slot: &mut Option<String>| -> bool {
+        if let Some(v) = tok.strip_prefix(key) {
+            *slot = Some(v.to_string());
+            true
+        } else {
+            false
+        }
+    };
+
+    if let Some((base, query)) = dsn.split_once('?').filter(|_| dsn.contains("://")) {
+        let kept: Vec<&str> = query
+            .split('&')
+            .filter(|pair| {
+                !(take("sslmode=", pair, &mut mode)
+                    || take("sslrootcert=", pair, &mut root)
+                    || pair.is_empty())
+            })
+            .collect();
+        let rebuilt = if kept.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", kept.join("&"))
+        };
+        (rebuilt, mode, root)
+    } else {
+        let kept: Vec<&str> = dsn
+            .split_whitespace()
+            .filter(|tok| {
+                !(take("sslmode=", tok, &mut mode) || take("sslrootcert=", tok, &mut root))
+            })
+            .collect();
+        (kept.join(" "), mode, root)
+    }
+}
+
+/// Fold a server-side `statement_timeout` into libpq `options`. `ms == 0` is
+/// "no timeout" and leaves the options untouched. Pure, so it is unit-tested.
+fn merge_statement_timeout(options: Option<&str>, ms: u64) -> Option<String> {
+    if ms == 0 {
+        return options.map(str::to_string);
+    }
+    let clause = format!("-c statement_timeout={ms}");
+    Some(match options {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing} {clause}"),
+        _ => clause,
+    })
+}
+
+/// Build the pool's `Manager`, choosing the TLS connector from the requirement
+/// and the compiled features. `deadpool`'s `Manager` is not generic over the TLS
+/// type — it erases it — so every arm returns the same `Manager` and the process
+/// pool stays one concrete type.
+// The `return`s are needed: exactly one of the TLS arms below compiles per
+// feature set, so to the lint each looks like a needless tail return.
+#[allow(clippy::needless_return)]
+fn build_manager(
+    mut config: Config,
+    requirement: SslRequirement,
+    root: Option<&str>,
+) -> Result<Manager> {
+    // `Fast` recycling: the pool hands back a connection without a round trip.
+    // It is safe here because a connection is only ever returned to the pool
+    // with no transaction open — `atomic` takes it out of the pool instead of
+    // returning a dirty one.
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+
+    if requirement == SslRequirement::Disable {
+        config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+        return Ok(Manager::from_config(config, NoTls, mgr_config));
+    }
+
+    // TLS wanted: make the driver actually offer it. The connector decides how
+    // strictly the certificate is checked.
+    config.ssl_mode(tokio_postgres::config::SslMode::Require);
+
+    #[cfg(feature = "tls-rustls")]
+    {
+        return Ok(Manager::from_config(
+            config,
+            tls_rustls::connector(requirement, root)?,
+            mgr_config,
+        ));
+    }
+    #[cfg(all(feature = "tls-openssl", not(feature = "tls-rustls")))]
+    {
+        return Ok(Manager::from_config(
+            config,
+            tls_openssl::connector(requirement, root)?,
+            mgr_config,
+        ));
+    }
+    #[cfg(not(any(feature = "tls-rustls", feature = "tls-openssl")))]
+    {
+        let _ = (root, mgr_config);
+        Err(Error::Tls(
+            "the DSN asks for TLS (sslmode=require or verify-full) but this build \
+             has no TLS backend; rebuild dorm-core with --features tls-rustls (or \
+             tls-openssl), or set sslmode=disable"
+                .into(),
+        ))
+    }
+}
+
+/// The rustls TLS backend (default). Pure Rust over the ring provider.
+#[cfg(feature = "tls-rustls")]
+mod tls_rustls {
+    use std::sync::Arc;
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+    use tokio_postgres_rustls::MakeRustlsConnect;
+
+    use super::{Error, Result, SslRequirement};
+
+    pub(super) fn connector(req: SslRequirement, root: Option<&str>) -> Result<MakeRustlsConnect> {
+        // `ClientConfig::builder()` reads the process-default crypto provider;
+        // install ring's if nothing installed one already (a second install is
+        // an error we can ignore — it means a provider is present).
+        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+        let config = match req {
+            SslRequirement::VerifyFull => ClientConfig::builder()
+                .with_root_certificates(load_roots(root)?)
+                .with_no_client_auth(),
+            SslRequirement::Require => ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify::new()))
+                .with_no_client_auth(),
+            SslRequirement::Disable => unreachable!("Disable never reaches the TLS connector"),
+        };
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    fn load_roots(root: Option<&str>) -> Result<RootCertStore> {
+        let mut store = RootCertStore::empty();
+        match root {
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|e| Error::Tls(format!("cannot read sslrootcert `{path}`: {e}")))?;
+                for cert in rustls_pemfile::certs(&mut &pem[..]) {
+                    let cert =
+                        cert.map_err(|e| Error::Tls(format!("bad certificate in `{path}`: {e}")))?;
+                    store.add(cert).map_err(|e| {
+                        Error::Tls(format!("cannot trust a certificate in `{path}`: {e}"))
+                    })?;
+                }
+            }
+            None => store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        Ok(store)
+    }
+
+    /// `sslmode=require`: the handshake still proves the server holds the key for
+    /// the certificate it presents (the signatures are verified), but the chain
+    /// and hostname are not checked. That is exactly libpq's `require`.
+    #[derive(Debug)]
+    struct NoVerify(Arc<CryptoProvider>);
+
+    impl NoVerify {
+        fn new() -> Self {
+            Self(Arc::new(rustls::crypto::ring::default_provider()))
+        }
+    }
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+}
+
+/// The OpenSSL TLS backend (opt-in). Uses the system libssl.
+#[cfg(all(feature = "tls-openssl", not(feature = "tls-rustls")))]
+mod tls_openssl {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use postgres_openssl::MakeTlsConnector;
+
+    use super::{Error, Result, SslRequirement};
+
+    pub(super) fn connector(req: SslRequirement, root: Option<&str>) -> Result<MakeTlsConnector> {
+        let mut builder = SslConnector::builder(SslMethod::tls())
+            .map_err(|e| Error::Tls(format!("cannot build the TLS connector: {e}")))?;
+        if let Some(path) = root {
+            builder
+                .set_ca_file(path)
+                .map_err(|e| Error::Tls(format!("cannot load sslrootcert `{path}`: {e}")))?;
+        }
+        match req {
+            SslRequirement::Require => builder.set_verify(SslVerifyMode::NONE),
+            SslRequirement::VerifyFull => builder.set_verify(SslVerifyMode::PEER),
+            SslRequirement::Disable => unreachable!("Disable never reaches the TLS connector"),
+        }
+        let mut make = MakeTlsConnector::new(builder.build());
+        if req == SslRequirement::Require {
+            // `require` must not check the hostname either; the connector would
+            // otherwise verify it and reject a mismatch.
+            make.set_callback(|cfg, _domain| {
+                cfg.set_verify_hostname(false);
+                Ok(())
+            });
+        }
+        Ok(make)
+    }
 }
 
 /// The connection a transaction is running on, plus its savepoint depth.
@@ -177,27 +630,78 @@ async fn acquire() -> Result<Object> {
 /// and the raw callers (the CLI, the migrator, the shell) consume them with the
 /// driver's own API. The typed `QuerySet` goes through the backend-agnostic
 /// [`fetch`] instead, which wraps these rows in a [`Row`].
+///
+/// ## Why `prepare_cached` and not `conn.query(sql, …)`
+///
+/// `Client::query(&str, …)` prepares an unnamed statement on every call — a
+/// Parse round trip the server throws away each time. `prepare_cached` keeps a
+/// named statement per connection (deadpool's `StatementCache`, ADR 0007), so
+/// the same SQL — and the ORM emits the same text with `$n` placeholders for a
+/// given query — pays Parse once and is Bind/Execute-only thereafter. The win
+/// grows with repetition, which is the ORM's whole access pattern.
 pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    // Observed end to end (ADR 0008): the clock spans Parse-or-cache-hit plus
+    // Bind/Execute, which is the latency the caller actually pays. `in_tx` is
+    // read up front so the event records the routing even on the error path.
+    let in_tx = in_transaction();
+    let start = Instant::now();
+    let result = query_inner(sql, params).await;
+    observe(
+        "query",
+        sql,
+        start.elapsed(),
+        result.as_ref().ok().map(|rows| rows.len() as u64),
+        in_tx,
+    );
+    result
+}
+
+async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        return conn.query(sql, params).await.map_err(from_pg);
+        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+        return conn.query(&stmt, params).await.map_err(from_pg);
     }
-    acquire().await?.query(sql, params).await.map_err(from_pg)
+    let conn = acquire().await?;
+    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+    conn.query(&stmt, params).await.map_err(from_pg)
 }
 
 /// Run a statement and report how many rows it touched.
+///
+/// Statements are cached per connection exactly as in [`query`]; see its note
+/// on `prepare_cached` (ADR 0007).
 pub async fn execute(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+    // Observed exactly as `query` is (ADR 0008); here the recorded row count is
+    // rows *affected* rather than returned.
+    let in_tx = in_transaction();
+    let start = Instant::now();
+    let result = execute_inner(sql, params).await;
+    observe(
+        "execute",
+        sql,
+        start.elapsed(),
+        result.as_ref().ok().copied(),
+        in_tx,
+    );
+    result
+}
+
+async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        return conn.execute(sql, params).await.map_err(from_pg);
+        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+        return conn.execute(&stmt, params).await.map_err(from_pg);
     }
-    acquire().await?.execute(sql, params).await.map_err(from_pg)
+    let conn = acquire().await?;
+    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+    conn.execute(&stmt, params).await.map_err(from_pg)
 }
 
 /// Run a statement for its effect only, outside any result set.
@@ -292,6 +796,33 @@ pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
     }
+}
+
+// ------------------------------------------------------- raw SQL (ADR 0005)
+//
+// The sanctioned escape hatch for a query the compiler cannot build. Every
+// value is still a bound parameter; the text between the placeholders is the
+// caller's. These route through the same backend seam as the typed path, so a
+// raw statement observes the transaction in scope, the pool, the statement
+// timeout, TLS and the read-only guard — nothing steps outside those.
+
+/// Raw read: run hand-written SQL and get untyped [`Row`]s back.
+///
+/// For a result that maps onto a model, use `Manager::raw` instead, which runs
+/// this and decodes each row with `from_row`. Every `params` element is bound as
+/// `$n`/`?n`; the SQL text is the caller's (ADR 0005).
+pub async fn sql(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    fetch(sql, params).await
+}
+
+/// Raw write: run hand-written DML and report the rows affected.
+///
+/// Refused under [`set_read_only`] like every other write, with a named
+/// [`Error::ReadOnly`] — so a read-only session stays read-only even through the
+/// escape hatch (ADR 0005).
+pub async fn sql_execute(sql: &str, params: &[Value]) -> Result<u64> {
+    guard_write("sql_execute")?;
+    run(sql, params).await
 }
 
 /// Run DDL — one or more parameterless statements — against the configured
@@ -832,11 +1363,128 @@ mod tests {
         assert!(guard_write("delete").is_ok());
     }
 
+    #[tokio::test]
+    async fn raw_execute_is_refused_in_a_read_only_session() {
+        // The read-only guard must cover the escape hatch too (ADR 0005), or a
+        // read-only session is only read-only until someone drops to raw SQL.
+        set_read_only(true);
+        let err = sql_execute("delete from whatever", &[]).await.unwrap_err();
+        assert!(matches!(err, Error::ReadOnly("sql_execute")), "{err}");
+        set_read_only(false);
+    }
+
     #[test]
     fn a_transaction_handle_knows_whether_it_is_a_savepoint() {
         assert!(!Tx { depth: 1 }.is_savepoint());
         assert!(Tx { depth: 2 }.is_savepoint());
         assert_eq!(Tx { depth: 3 }.depth(), 3);
+    }
+
+    #[test]
+    fn a_short_statement_is_logged_whole_and_trimmed() {
+        let s = summarize_sql("  SELECT 1  ");
+        assert_eq!(s, "SELECT 1");
+        assert!(matches!(s, Cow::Borrowed(_)), "no allocation for short SQL");
+    }
+
+    #[test]
+    fn a_long_statement_is_truncated_on_a_char_boundary_and_tagged() {
+        // A multi-byte char straddling the cut must not panic or split a scalar.
+        let long = format!("SELECT '{}'", "é".repeat(SQL_LOG_MAX));
+        let s = summarize_sql(&long);
+        assert!(s.ends_with(&format!("[{} bytes]", long.len())), "{s}");
+        assert!(s.contains('…'), "{s}");
+        // Still valid UTF-8 up to the ellipsis — the assertion is that building
+        // it did not panic, which a mid-char cut would have.
+        assert!(s.len() < long.len());
+    }
+
+    #[test]
+    fn pool_stats_serializes_to_the_documented_shape() {
+        // The public snapshot type must round-trip through serde with stable,
+        // metrics-friendly field names and no deadpool type leaking out.
+        let snap = PoolStats {
+            max_size: 8,
+            size: 3,
+            available: 1,
+            waiting: 2,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize PoolStats");
+        assert_eq!(json, r#"{"max_size":8,"size":3,"available":1,"waiting":2}"#);
+        let back: PoolStats = serde_json::from_str(&json).expect("deserialize PoolStats");
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn sslmode_maps_to_a_requirement_or_a_named_refusal() {
+        assert_eq!(ssl_requirement(None).unwrap(), SslRequirement::Disable);
+        assert_eq!(
+            ssl_requirement(Some("disable")).unwrap(),
+            SslRequirement::Disable
+        );
+        // The opportunistic modes are Disable: DORM does not half-encrypt.
+        assert_eq!(
+            ssl_requirement(Some("prefer")).unwrap(),
+            SslRequirement::Disable
+        );
+        assert_eq!(
+            ssl_requirement(Some("require")).unwrap(),
+            SslRequirement::Require
+        );
+        assert_eq!(
+            ssl_requirement(Some(" Verify-Full ")).unwrap(),
+            SslRequirement::VerifyFull
+        );
+        // verify-ca is a documented gap, and it says so.
+        let e = ssl_requirement(Some("verify-ca")).unwrap_err().to_string();
+        assert!(e.contains("verify-ca"), "{e}");
+        assert!(ssl_requirement(Some("banana")).is_err());
+    }
+
+    #[test]
+    fn tls_params_are_pulled_out_of_the_keyword_dsn_leaving_the_rest() {
+        let (cleaned, mode, root) = extract_tls_params(
+            "host=/var/run/postgresql user=me sslmode=verify-full sslrootcert=/etc/ca.pem dbname=x",
+        );
+        assert_eq!(cleaned, "host=/var/run/postgresql user=me dbname=x");
+        assert_eq!(mode.as_deref(), Some("verify-full"));
+        assert_eq!(root.as_deref(), Some("/etc/ca.pem"));
+    }
+
+    #[test]
+    fn tls_params_are_pulled_out_of_the_url_dsn_leaving_the_rest() {
+        let (cleaned, mode, root) =
+            extract_tls_params("postgres://me@db:5432/app?sslmode=require&application_name=dorm");
+        assert_eq!(cleaned, "postgres://me@db:5432/app?application_name=dorm");
+        assert_eq!(mode.as_deref(), Some("require"));
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn a_dsn_without_tls_keys_is_unchanged() {
+        let (cleaned, mode, root) = extract_tls_params("host=db user=me dbname=x");
+        assert_eq!(cleaned, "host=db user=me dbname=x");
+        assert_eq!(mode, None);
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn statement_timeout_is_merged_into_options_and_zero_is_off() {
+        assert_eq!(merge_statement_timeout(None, 0), None);
+        assert_eq!(
+            merge_statement_timeout(None, 5000).as_deref(),
+            Some("-c statement_timeout=5000")
+        );
+        // An existing options string is preserved, not clobbered.
+        assert_eq!(
+            merge_statement_timeout(Some("-c search_path=app"), 5000).as_deref(),
+            Some("-c search_path=app -c statement_timeout=5000")
+        );
+        // Zero leaves existing options alone.
+        assert_eq!(
+            merge_statement_timeout(Some("-c search_path=app"), 0).as_deref(),
+            Some("-c search_path=app")
+        );
     }
 
     #[test]
