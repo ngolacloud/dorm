@@ -52,6 +52,9 @@ jobs:
           publish dorm-migrations
           publish dorm-schema
           publish dorm-sqlite
+          # dorm-studio depends on dorm-core (above) and dorm-cli depends on
+          # dorm-studio, so it publishes between them.
+          publish dorm-studio
           publish dorm-cli
 
       - name: GitHub Release

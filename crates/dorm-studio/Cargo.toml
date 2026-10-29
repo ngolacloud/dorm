@@ -11,6 +11,10 @@ description = "DORM Studio — a Prisma-Studio-style web UI over your DORM model
 readme = "README.md"
 keywords = ["orm", "postgres", "studio", "admin", "database"]
 categories = ["database", "web-programming"]
+# The example is a dev stand-in for a generated `src/bin/studio.rs`; it depends
+# on `dorm-models` (a `publish = false` crate), so it is left out of the package
+# rather than shipped broken to consumers.
+exclude = ["examples/*"]
 
 # The library a generated `src/bin/studio.rs` links: the project binary just
 # links its models (so the registry is populated) and calls `serve`, and this
