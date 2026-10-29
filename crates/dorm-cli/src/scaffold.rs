@@ -72,6 +72,7 @@ pub fn init(name: Option<&str>) -> CliResult {
     println!("  dorm migrate make <name>       # or: author a versioned migration");
     println!("  dorm migrate deploy            #      and apply the recorded chain");
     println!("  dorm shell                     # a REPL over your models");
+    println!("  dorm studio                    # browse & edit the database in your browser");
     println!("  dorm api generate && dorm api serve   # an Axum read API + OpenAPI");
     Ok(())
 }
@@ -240,10 +241,16 @@ export DELONIX_ORM_DSN='host=/var/run/postgresql user=me dbname=__APP_CRATE__'
 dorm push                       # create tables/columns to match your models
 dorm shell                      # a REPL over your models (= cargo run --bin shell)
 dorm db tables                  # browse the live database
+dorm studio                     # browse & edit the database in your browser
 ```
 
 Add a model with `dorm new model <Name>` (appends to `dorm.schema`) or by editing
 `dorm.schema` directly, then `dorm generate` and `dorm push`.
+
+`dorm studio` opens a Prisma-Studio-style web UI over the live database — browse,
+filter and page every table, follow foreign keys, and (with `--write`) create,
+edit and delete rows. It is native: it reads the live schema, so it needs no
+build and works the moment the tables exist.
 
 For versioned, reviewable migrations instead of `push`, use the history in
 `migrations/`:
