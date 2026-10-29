@@ -79,7 +79,11 @@ fn the_shell_inserts_updates_and_deletes_with_write_and_refuses_without_it() {
     let slug = "shell-dml-probe";
 
     // Start clean — a previous failed run may have left the row behind.
-    drive(&dsn, &["--write"], &format!("delete Tenant slug={slug} all\n:quit\n"));
+    drive(
+        &dsn,
+        &["--write"],
+        &format!("delete Tenant slug={slug} all\n:quit\n"),
+    );
 
     // The full write cycle, read back at each step.
     let script = format!(
@@ -93,16 +97,38 @@ fn the_shell_inserts_updates_and_deletes_with_write_and_refuses_without_it() {
     );
     let out = drive(&dsn, &["--write"], &script);
 
-    assert!(out.contains("inserted 1 row"), "insert reports success:\n{out}");
-    assert!(out.contains("name=Original"), "the inserted row reads back:\n{out}");
-    assert!(out.contains("updated 1 row"), "update reports success:\n{out}");
-    assert!(out.contains("name=Renamed"), "the update is visible:\n{out}");
-    assert!(out.contains("deleted 1 row"), "delete reports success:\n{out}");
+    assert!(
+        out.contains("inserted 1 row"),
+        "insert reports success:\n{out}"
+    );
+    assert!(
+        out.contains("name=Original"),
+        "the inserted row reads back:\n{out}"
+    );
+    assert!(
+        out.contains("updated 1 row"),
+        "update reports success:\n{out}"
+    );
+    assert!(
+        out.contains("name=Renamed"),
+        "the update is visible:\n{out}"
+    );
+    assert!(
+        out.contains("deleted 1 row"),
+        "delete reports success:\n{out}"
+    );
     // The final read after the delete finds nothing.
-    assert!(out.contains("(0 rows)"), "the row is gone after delete:\n{out}");
+    assert!(
+        out.contains("(0 rows)"),
+        "the row is gone after delete:\n{out}"
+    );
 
     // Without --write, the same insert is refused by name, before any SQL.
-    let refused = drive(&dsn, &[], &format!("insert Tenant slug={slug}-ro name=No\n:quit\n"));
+    let refused = drive(
+        &dsn,
+        &[],
+        &format!("insert Tenant slug={slug}-ro name=No\n:quit\n"),
+    );
     assert!(
         refused.contains("read-only") && refused.contains("insert"),
         "a write without --write is refused by name:\n{refused}"
@@ -119,6 +145,12 @@ fn sql_preview_shows_bound_parameters_without_running() {
     // `:sql` needs no schema — it compiles, it does not run.
     let out = drive(&dsn, &[], ":sql Tenant slug=acme\n:quit\n");
     assert!(out.contains("SELECT"), "the preview shows the SQL:\n{out}");
-    assert!(out.contains("$1"), "the value is a bound placeholder, not inlined:\n{out}");
-    assert!(out.contains("params:"), "the bound params are listed:\n{out}");
+    assert!(
+        out.contains("$1"),
+        "the value is a bound placeholder, not inlined:\n{out}"
+    );
+    assert!(
+        out.contains("params:"),
+        "the bound params are listed:\n{out}"
+    );
 }
