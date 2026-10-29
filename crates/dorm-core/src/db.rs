@@ -53,6 +53,14 @@ pub const POOL_ACQUIRE_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_POOL_ACQUIRE_TIMEOUT_
 /// Absent — or zero — disables the slow-query log entirely, which is the default:
 /// production opts *in* to the noise, it is never surprised by it.
 pub const SLOW_QUERY_MS_ENV: &str = "DELONIX_ORM_SLOW_QUERY_MS";
+/// Server-side `statement_timeout`, in milliseconds. `0`/unset means no timeout
+/// (ADR 0004). When set, PostgreSQL cancels an over-running statement and the
+/// ORM surfaces [`Error::Timeout`].
+pub const STATEMENT_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_STATEMENT_TIMEOUT_MS";
+/// Overrides the DSN's `sslmode` (ADR 0004): `disable`, `require`, `verify-full`.
+pub const SSLMODE_ENV: &str = "DELONIX_ORM_SSLMODE";
+/// Overrides the DSN's `sslrootcert`: a PEM file of roots to trust.
+pub const SSLROOTCERT_ENV: &str = "DELONIX_ORM_SSLROOTCERT";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
@@ -212,6 +220,16 @@ pub fn pool_stats() -> Result<PoolStats> {
     })
 }
 
+/// A non-negative millisecond count from the environment, `default` when unset
+/// or unparseable. Unlike [`env_usize`], `0` is a legitimate value here — it is
+/// how `statement_timeout` is turned off.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 /// Mark this process as read-only. Every write refuses before it reaches SQL.
 ///
 /// The session is *also* opened `READ ONLY` at the server, which is the real
@@ -252,22 +270,29 @@ pub fn pool() -> Result<&'static Pool> {
     if let Some(p) = POOL.get() {
         return Ok(p);
     }
-    let dsn = dsn()?;
-    let config: Config = dsn
+    let raw = dsn()?;
+    // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
+    // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
+    // the parse; verification is done by the connector, not the driver.
+    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(&raw);
+    let mut config: Config = cleaned
         .parse()
         .map_err(|e| Error::Config(format!("the DSN is not usable: {e}")))?;
 
-    // `Fast` recycling: the pool hands back a connection without a round trip.
-    // It is safe here because a connection is only ever returned to the pool
-    // with no transaction open — `atomic` takes it out of the pool instead of
-    // returning a dirty one.
-    let manager = Manager::from_config(
-        config,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
+    // Server-side `statement_timeout` (ADR 0004): injected as a libpq option so
+    // PostgreSQL itself cancels an over-running statement. `0` leaves it off.
+    if let Some(opts) =
+        merge_statement_timeout(config.get_options(), env_u64(STATEMENT_TIMEOUT_MS_ENV, 0))
+    {
+        config.options(opts);
+    }
+
+    // TLS selection: env overrides the DSN, which overrides "disable".
+    let mode = std::env::var(SSLMODE_ENV).ok().or(dsn_mode);
+    let root = std::env::var(SSLROOTCERT_ENV).ok().or(dsn_root);
+    let requirement = ssl_requirement(mode.as_deref())?;
+
+    let manager = build_manager(config, requirement, root.as_deref())?;
     let pool = Pool::builder(manager)
         // Required because the timeouts below are set: deadpool needs a runtime
         // to arm them against, and without this it refuses to build with
@@ -283,6 +308,299 @@ pub fn pool() -> Result<&'static Pool> {
         .map_err(|e| Error::Pool(e.to_string()))?;
 
     Ok(POOL.get_or_init(|| pool))
+}
+
+// --------------------------------------------------------------------- TLS
+//
+// ADR 0004. TLS is feature-gated: `tls-rustls` (default, pure Rust) and
+// `tls-openssl` (system libssl). The DSN's `sslmode` picks the strictness; the
+// driver only learns "request TLS or not", because the certificate check lives
+// in the connector, not in `tokio-postgres`.
+
+/// What the DSN asks of the connection's TLS, from its `sslmode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslRequirement {
+    /// Plaintext — `NoTls`, whatever TLS features are compiled in.
+    Disable,
+    /// Encrypt, but do not verify the server certificate (libpq `require`).
+    Require,
+    /// Encrypt and verify the certificate chain **and** the hostname.
+    VerifyFull,
+}
+
+/// Map an `sslmode` token to a [`SslRequirement`], or refuse one this release
+/// does not implement. `None` and the opportunistic modes are `Disable`: DORM
+/// never silently half-encrypts — ask for `require` or `verify-full` to get TLS.
+pub fn ssl_requirement(mode: Option<&str>) -> Result<SslRequirement> {
+    match mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("disable") | Some("prefer") | Some("allow") => {
+            Ok(SslRequirement::Disable)
+        }
+        Some("require") => Ok(SslRequirement::Require),
+        Some("verify-full") => Ok(SslRequirement::VerifyFull),
+        Some("verify-ca") => Err(Error::Tls(
+            "sslmode=verify-ca is not implemented yet; use verify-full (chain + \
+             hostname) or require (no verification)"
+                .into(),
+        )),
+        Some(other) => Err(Error::Tls(format!(
+            "unknown sslmode `{other}`; use disable, require, or verify-full"
+        ))),
+    }
+}
+
+/// Pull the TLS keys DORM handles itself (`sslmode`, `sslrootcert`) out of the
+/// DSN, returning `(dsn_without_them, sslmode, sslrootcert)`. Handles both the
+/// libpq keyword form (`host=… sslmode=require`) and the URL query form
+/// (`postgres://…?sslmode=verify-full`). Pure, so it is unit-tested.
+fn extract_tls_params(dsn: &str) -> (String, Option<String>, Option<String>) {
+    let (mut mode, mut root) = (None, None);
+    let take = |key: &str, tok: &str, slot: &mut Option<String>| -> bool {
+        if let Some(v) = tok.strip_prefix(key) {
+            *slot = Some(v.to_string());
+            true
+        } else {
+            false
+        }
+    };
+
+    if let Some((base, query)) = dsn.split_once('?').filter(|_| dsn.contains("://")) {
+        let kept: Vec<&str> = query
+            .split('&')
+            .filter(|pair| {
+                !(take("sslmode=", pair, &mut mode)
+                    || take("sslrootcert=", pair, &mut root)
+                    || pair.is_empty())
+            })
+            .collect();
+        let rebuilt = if kept.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", kept.join("&"))
+        };
+        (rebuilt, mode, root)
+    } else {
+        let kept: Vec<&str> = dsn
+            .split_whitespace()
+            .filter(|tok| {
+                !(take("sslmode=", tok, &mut mode) || take("sslrootcert=", tok, &mut root))
+            })
+            .collect();
+        (kept.join(" "), mode, root)
+    }
+}
+
+/// Fold a server-side `statement_timeout` into libpq `options`. `ms == 0` is
+/// "no timeout" and leaves the options untouched. Pure, so it is unit-tested.
+fn merge_statement_timeout(options: Option<&str>, ms: u64) -> Option<String> {
+    if ms == 0 {
+        return options.map(str::to_string);
+    }
+    let clause = format!("-c statement_timeout={ms}");
+    Some(match options {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing} {clause}"),
+        _ => clause,
+    })
+}
+
+/// Build the pool's `Manager`, choosing the TLS connector from the requirement
+/// and the compiled features. `deadpool`'s `Manager` is not generic over the TLS
+/// type — it erases it — so every arm returns the same `Manager` and the process
+/// pool stays one concrete type.
+// The `return`s are needed: exactly one of the TLS arms below compiles per
+// feature set, so to the lint each looks like a needless tail return.
+#[allow(clippy::needless_return)]
+fn build_manager(
+    mut config: Config,
+    requirement: SslRequirement,
+    root: Option<&str>,
+) -> Result<Manager> {
+    // `Fast` recycling: the pool hands back a connection without a round trip.
+    // It is safe here because a connection is only ever returned to the pool
+    // with no transaction open — `atomic` takes it out of the pool instead of
+    // returning a dirty one.
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+
+    if requirement == SslRequirement::Disable {
+        config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+        return Ok(Manager::from_config(config, NoTls, mgr_config));
+    }
+
+    // TLS wanted: make the driver actually offer it. The connector decides how
+    // strictly the certificate is checked.
+    config.ssl_mode(tokio_postgres::config::SslMode::Require);
+
+    #[cfg(feature = "tls-rustls")]
+    {
+        return Ok(Manager::from_config(
+            config,
+            tls_rustls::connector(requirement, root)?,
+            mgr_config,
+        ));
+    }
+    #[cfg(all(feature = "tls-openssl", not(feature = "tls-rustls")))]
+    {
+        return Ok(Manager::from_config(
+            config,
+            tls_openssl::connector(requirement, root)?,
+            mgr_config,
+        ));
+    }
+    #[cfg(not(any(feature = "tls-rustls", feature = "tls-openssl")))]
+    {
+        let _ = (root, mgr_config);
+        Err(Error::Tls(
+            "the DSN asks for TLS (sslmode=require or verify-full) but this build \
+             has no TLS backend; rebuild dorm-core with --features tls-rustls (or \
+             tls-openssl), or set sslmode=disable"
+                .into(),
+        ))
+    }
+}
+
+/// The rustls TLS backend (default). Pure Rust over the ring provider.
+#[cfg(feature = "tls-rustls")]
+mod tls_rustls {
+    use std::sync::Arc;
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+    use tokio_postgres_rustls::MakeRustlsConnect;
+
+    use super::{Error, Result, SslRequirement};
+
+    pub(super) fn connector(req: SslRequirement, root: Option<&str>) -> Result<MakeRustlsConnect> {
+        // `ClientConfig::builder()` reads the process-default crypto provider;
+        // install ring's if nothing installed one already (a second install is
+        // an error we can ignore — it means a provider is present).
+        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+        let config = match req {
+            SslRequirement::VerifyFull => ClientConfig::builder()
+                .with_root_certificates(load_roots(root)?)
+                .with_no_client_auth(),
+            SslRequirement::Require => ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify::new()))
+                .with_no_client_auth(),
+            SslRequirement::Disable => unreachable!("Disable never reaches the TLS connector"),
+        };
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    fn load_roots(root: Option<&str>) -> Result<RootCertStore> {
+        let mut store = RootCertStore::empty();
+        match root {
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .map_err(|e| Error::Tls(format!("cannot read sslrootcert `{path}`: {e}")))?;
+                for cert in rustls_pemfile::certs(&mut &pem[..]) {
+                    let cert =
+                        cert.map_err(|e| Error::Tls(format!("bad certificate in `{path}`: {e}")))?;
+                    store.add(cert).map_err(|e| {
+                        Error::Tls(format!("cannot trust a certificate in `{path}`: {e}"))
+                    })?;
+                }
+            }
+            None => store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        Ok(store)
+    }
+
+    /// `sslmode=require`: the handshake still proves the server holds the key for
+    /// the certificate it presents (the signatures are verified), but the chain
+    /// and hostname are not checked. That is exactly libpq's `require`.
+    #[derive(Debug)]
+    struct NoVerify(Arc<CryptoProvider>);
+
+    impl NoVerify {
+        fn new() -> Self {
+            Self(Arc::new(rustls::crypto::ring::default_provider()))
+        }
+    }
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+}
+
+/// The OpenSSL TLS backend (opt-in). Uses the system libssl.
+#[cfg(all(feature = "tls-openssl", not(feature = "tls-rustls")))]
+mod tls_openssl {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use postgres_openssl::MakeTlsConnector;
+
+    use super::{Error, Result, SslRequirement};
+
+    pub(super) fn connector(req: SslRequirement, root: Option<&str>) -> Result<MakeTlsConnector> {
+        let mut builder = SslConnector::builder(SslMethod::tls())
+            .map_err(|e| Error::Tls(format!("cannot build the TLS connector: {e}")))?;
+        if let Some(path) = root {
+            builder
+                .set_ca_file(path)
+                .map_err(|e| Error::Tls(format!("cannot load sslrootcert `{path}`: {e}")))?;
+        }
+        match req {
+            SslRequirement::Require => builder.set_verify(SslVerifyMode::NONE),
+            SslRequirement::VerifyFull => builder.set_verify(SslVerifyMode::PEER),
+            SslRequirement::Disable => unreachable!("Disable never reaches the TLS connector"),
+        }
+        let mut make = MakeTlsConnector::new(builder.build());
+        if req == SslRequirement::Require {
+            // `require` must not check the hostname either; the connector would
+            // otherwise verify it and reject a mismatch.
+            make.set_callback(|cfg, _domain| {
+                cfg.set_verify_hostname(false);
+                Ok(())
+            });
+        }
+        Ok(make)
+    }
 }
 
 /// The connection a transaction is running on, plus its savepoint depth.
@@ -1095,6 +1413,78 @@ mod tests {
         assert_eq!(json, r#"{"max_size":8,"size":3,"available":1,"waiting":2}"#);
         let back: PoolStats = serde_json::from_str(&json).expect("deserialize PoolStats");
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn sslmode_maps_to_a_requirement_or_a_named_refusal() {
+        assert_eq!(ssl_requirement(None).unwrap(), SslRequirement::Disable);
+        assert_eq!(
+            ssl_requirement(Some("disable")).unwrap(),
+            SslRequirement::Disable
+        );
+        // The opportunistic modes are Disable: DORM does not half-encrypt.
+        assert_eq!(
+            ssl_requirement(Some("prefer")).unwrap(),
+            SslRequirement::Disable
+        );
+        assert_eq!(
+            ssl_requirement(Some("require")).unwrap(),
+            SslRequirement::Require
+        );
+        assert_eq!(
+            ssl_requirement(Some(" Verify-Full ")).unwrap(),
+            SslRequirement::VerifyFull
+        );
+        // verify-ca is a documented gap, and it says so.
+        let e = ssl_requirement(Some("verify-ca")).unwrap_err().to_string();
+        assert!(e.contains("verify-ca"), "{e}");
+        assert!(ssl_requirement(Some("banana")).is_err());
+    }
+
+    #[test]
+    fn tls_params_are_pulled_out_of_the_keyword_dsn_leaving_the_rest() {
+        let (cleaned, mode, root) = extract_tls_params(
+            "host=/var/run/postgresql user=me sslmode=verify-full sslrootcert=/etc/ca.pem dbname=x",
+        );
+        assert_eq!(cleaned, "host=/var/run/postgresql user=me dbname=x");
+        assert_eq!(mode.as_deref(), Some("verify-full"));
+        assert_eq!(root.as_deref(), Some("/etc/ca.pem"));
+    }
+
+    #[test]
+    fn tls_params_are_pulled_out_of_the_url_dsn_leaving_the_rest() {
+        let (cleaned, mode, root) =
+            extract_tls_params("postgres://me@db:5432/app?sslmode=require&application_name=dorm");
+        assert_eq!(cleaned, "postgres://me@db:5432/app?application_name=dorm");
+        assert_eq!(mode.as_deref(), Some("require"));
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn a_dsn_without_tls_keys_is_unchanged() {
+        let (cleaned, mode, root) = extract_tls_params("host=db user=me dbname=x");
+        assert_eq!(cleaned, "host=db user=me dbname=x");
+        assert_eq!(mode, None);
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn statement_timeout_is_merged_into_options_and_zero_is_off() {
+        assert_eq!(merge_statement_timeout(None, 0), None);
+        assert_eq!(
+            merge_statement_timeout(None, 5000).as_deref(),
+            Some("-c statement_timeout=5000")
+        );
+        // An existing options string is preserved, not clobbered.
+        assert_eq!(
+            merge_statement_timeout(Some("-c search_path=app"), 5000).as_deref(),
+            Some("-c search_path=app -c statement_timeout=5000")
+        );
+        // Zero leaves existing options alone.
+        assert_eq!(
+            merge_statement_timeout(Some("-c search_path=app"), 0).as_deref(),
+            Some("-c search_path=app")
+        );
     }
 
     #[test]

@@ -50,6 +50,15 @@ uuid = { version = "1" }
 chrono = { version = "0.4", default-features = false }
 tokio-postgres = { version = "0.7" }
 deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
+# TLS backends for the PostgreSQL connection (ADR 0004), both optional and
+# selected by a dorm-core feature. rustls is pure Rust (ring provider → no C,
+# builds offline/static); openssl uses the system libssl for DBAs who prefer it.
+tokio-postgres-rustls = { version = "0.13" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = { version = "2" }
+webpki-roots = { version = "0.26" }
+postgres-openssl = { version = "0.5" }
+openssl = { version = "0.10" }
 inventory = { version = "0.3" }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 # Observability (ADR 0008). `tracing` is a facade: with no subscriber installed
