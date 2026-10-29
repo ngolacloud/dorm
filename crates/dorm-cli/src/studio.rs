@@ -239,17 +239,39 @@ async fn get_rows(
         .max(0);
 
     // A WHERE shared by the page query and its count, so the total matches the
-    // filtered view. The value is the one bound parameter; the column is quoted
+    // filtered view. Values are the only bound parameters; a column is quoted
     // only after being checked against the table's own columns.
-    let mut where_clause = String::new();
+    let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
+    // An exact-match column filter (the filter box / a foreign-key jump).
     if let (Some(col), Some(val)) = (q.get("filterCol"), q.get("filterVal")) {
         if !names.contains(&col.as_str()) {
             return Err(StudioError::bad(format!("no column `{col}` on `{table}`")));
         }
-        where_clause = format!(" WHERE {}::text = $1", quote_ident(col));
         params.push(val.clone());
+        conds.push(format!("{}::text = ${}", quote_ident(col), params.len()));
     }
+    // A global search: a case-insensitive substring match against every column,
+    // the Studio's "search any field". The term is escaped so its own `%`/`_`
+    // are literal, then bound once and reused across the columns' `ILIKE`s.
+    if let Some(term) = q.get("search").filter(|s| !s.is_empty()) {
+        let esc = term
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        params.push(format!("%{esc}%"));
+        let n = params.len();
+        let ors: Vec<String> = names
+            .iter()
+            .map(|c| format!("{}::text ILIKE ${n} ESCAPE '\\'", quote_ident(c)))
+            .collect();
+        conds.push(format!("({})", ors.join(" OR ")));
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
 
     let order_clause = match q.get("orderBy").filter(|c| names.contains(&c.as_str())) {
         Some(col) => {
@@ -406,8 +428,14 @@ async fn update_row(
     Ok(Json(json!({ "affected": affected })))
 }
 
-/// `DELETE /api/tables/:table/rows` — delete the row the key identifies, from
-/// `{ "pk": {col: …} }`. Refused with no key.
+/// `DELETE /api/tables/:table/rows` — delete the row(s) a key identifies. Takes
+/// either one key, `{ "pk": {col: …} }`, or many, `{ "keys": [{col: …}, …] }`
+/// for a bulk delete. A key with no columns is refused, so a table is never
+/// wiped by a slip.
+///
+/// A bulk delete runs inside a single [`db::atomic`] transaction: either every
+/// selected row goes or none does, so a failure partway (a foreign-key
+/// restriction on one row) leaves the set untouched rather than half-deleted.
 async fn delete_row(
     Path(table): Path<String>,
     Json(body): Json<JsonValue>,
@@ -416,15 +444,44 @@ async fn delete_row(
     let cols = require_table(&table).await?;
     let by_name = index_by_name(&cols);
 
-    let pk = object(&body, "pk")?;
-    if pk.is_empty() {
-        return Err(StudioError::bad("refusing a delete with no key"));
+    // One `pk` or many `keys` — normalised to a list either way.
+    let keys: Vec<&serde_json::Map<String, JsonValue>> =
+        if let Some(arr) = body.get("keys").and_then(JsonValue::as_array) {
+            arr.iter().filter_map(JsonValue::as_object).collect()
+        } else if let Some(pk) = body.get("pk").and_then(JsonValue::as_object) {
+            vec![pk]
+        } else {
+            return Err(StudioError::bad(
+                "body needs a `pk` object or a `keys` array",
+            ));
+        };
+    if keys.is_empty() {
+        return Err(StudioError::bad("no rows to delete"));
     }
 
-    let mut params: Vec<Value> = Vec::new();
-    let where_clause = key_filter(&table, &by_name, pk, &mut params)?;
-    let sql = format!("DELETE FROM {} WHERE {}", quote_ident(&table), where_clause);
-    let affected = db::sql_execute(&sql, &params).await?;
+    // Build (and validate) every statement up front, so a bad key is a 400
+    // before any row is touched; only database errors remain for the transaction.
+    let mut stmts: Vec<(String, Vec<Value>)> = Vec::new();
+    for &key in &keys {
+        if key.is_empty() {
+            return Err(StudioError::bad("refusing a delete with no key"));
+        }
+        let mut params: Vec<Value> = Vec::new();
+        let where_clause = key_filter(&table, &by_name, key, &mut params)?;
+        stmts.push((
+            format!("DELETE FROM {} WHERE {}", quote_ident(&table), where_clause),
+            params,
+        ));
+    }
+
+    let affected = db::atomic(|_tx| async move {
+        let mut total = 0u64;
+        for (sql, params) in &stmts {
+            total += db::sql_execute(sql, params).await?;
+        }
+        Ok(total)
+    })
+    .await?;
     Ok(Json(json!({ "affected": affected })))
 }
 

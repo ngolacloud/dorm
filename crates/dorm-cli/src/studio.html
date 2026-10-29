@@ -94,10 +94,13 @@
     font-weight: 700;
   }
   td .fk-jump:hover { text-decoration: underline; }
-  td.actions { white-space: nowrap; }
-  td.actions button { padding: 2px 8px; font-size: 12px; margin-right: 4px; }
+  td.sel, th.sel { width: 1%; text-align: center; padding: 7px 8px; cursor: default; }
+  tr.selected td { background: var(--row-hover); }
+  tr.selected td.editing { background: var(--edit-bg); }
   tr.new-row td { background: var(--edit-bg); }
   tr.new-row input { width: 100%; }
+  tr.new-row td.actions { white-space: nowrap; }
+  tr.new-row td.actions button { margin-right: 4px; font-size: 12px; padding: 3px 9px; }
   .pager { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
     border-top: 1px solid var(--border); color: var(--muted); }
   .empty, .hint { padding: 40px; text-align: center; color: var(--muted); }
@@ -130,6 +133,9 @@
       <span class="count" id="rowCount"></span>
       <span class="hint-edit" id="editHint"></span>
       <div class="spacer"></div>
+      <button id="bulkDelete" class="danger" style="display:none">🗑 Delete</button>
+      <label for="search" style="position:absolute;left:-9999px">Search all columns</label>
+      <input id="search" placeholder="🔍 Search all columns…" size="18" />
       <div class="filter">
         <label for="filterCol" style="position:absolute;left:-9999px">Filter column</label>
         <select id="filterCol"><option value="">(no filter)</option></select>
@@ -159,7 +165,8 @@
 <script>
 const state = { schema: null, writable: false, table: null, cols: [], hasPk: false,
                 offset: 0, limit: 50, total: 0, orderBy: null, dir: "asc",
-                filterCol: "", filterVal: "", lastRows: [], editingCell: null, adding: false };
+                filterCol: "", filterVal: "", search: "", lastRows: [],
+                editingCell: null, adding: false, selected: new Set() };
 
 const $ = (id) => document.getElementById(id);
 function toast(msg, ok) { const t = $("toast"); t.textContent = msg;
@@ -202,6 +209,7 @@ function selectTable(name, filter) {
   state.table = name; state.cols = t.columns; state.hasPk = t.hasPk;
   state.offset = 0; state.orderBy = null; state.adding = false; state.editingCell = null;
   state.filterCol = filter ? filter.col : ""; state.filterVal = filter ? filter.val : "";
+  state.search = ""; state.selected = new Set();
   document.querySelectorAll(".table-item").forEach((e) =>
     e.classList.toggle("active", e.dataset.name === name));
   $("toolbar").style.display = "flex"; $("pager").style.display = "flex";
@@ -210,7 +218,7 @@ function selectTable(name, filter) {
   $("editHint").textContent = state.writable && t.hasPk ? "double-click a cell to edit" : "";
   const fc = $("filterCol"); fc.innerHTML = '<option value="">(no filter)</option>';
   for (const c of t.columns) { const o = document.createElement("option"); o.value = c.name; o.textContent = c.name; fc.appendChild(o); }
-  fc.value = state.filterCol; $("filterVal").value = state.filterVal;
+  fc.value = state.filterCol; $("filterVal").value = state.filterVal; $("search").value = "";
   loadRows();
 }
 
@@ -218,6 +226,7 @@ function rowsUrl() {
   const p = new URLSearchParams({ limit: state.limit, offset: state.offset });
   if (state.orderBy) { p.set("orderBy", state.orderBy); p.set("dir", state.dir); }
   if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
+  if (state.search) p.set("search", state.search);
   return `/api/tables/${encodeURIComponent(state.table)}/rows?` + p;
 }
 
@@ -241,27 +250,32 @@ function pkOf(row) { const pk = {}; for (const c of state.cols) if (c.pk) pk[c.n
 function renderGrid(columns, rows) {
   const wrap = $("gridWrap");
   const canEdit = state.writable && state.hasPk;
+  state.selected = new Set(); syncBulk();
+  const selHead = canEdit ? '<th class="sel"><input type="checkbox" id="selAll" title="select all" /></th>' : "";
   const thead = columns.map((c) => {
     const m = colMeta(c) || {};
     const tag = m.pk ? ' <span class="key" title="primary key">🔑</span>'
       : m.references ? ` <span class="fk" title="→ ${esc(m.references.table)}.${esc(m.references.column)}">↗</span>` : "";
     return `<th data-col="${esc(c)}">${esc(c)}${tag}<span class="type">${esc(m.type || "")}</span></th>`;
   }).join("");
-  const actionsHead = canEdit ? "<th></th>" : "";
   if (!rows.length && !state.writable) { wrap.innerHTML = '<div class="empty">No rows.</div>'; return; }
   const body = rows.map((r, i) => renderRow(columns, r, i, canEdit)).join("");
-  wrap.innerHTML = `<table><thead><tr>${thead}${actionsHead}</tr></thead><tbody>${body}</tbody></table>`;
+  wrap.innerHTML = `<table><thead><tr>${selHead}${thead}</tr></thead><tbody>${body}</tbody></table>`;
   const tbody = wrap.querySelector("tbody");
   wrap.querySelectorAll("th[data-col]").forEach((th) => th.onclick = () => sortBy(th.dataset.col));
   tbody.querySelectorAll("td.editable").forEach((td) =>
     td.ondblclick = () => beginEdit(td, rows[+td.dataset.row], td.dataset.col));
   tbody.querySelectorAll("a.fk-jump").forEach((a) => a.onclick = (e) => {
     e.stopPropagation(); jumpFk(a.dataset.table, a.dataset.col, a.dataset.val); });
-  tbody.querySelectorAll("button[data-del]").forEach((b) =>
-    b.onclick = () => removeRow(rows[+b.dataset.del]));
+  tbody.querySelectorAll("input.rowsel").forEach((cb) =>
+    cb.onchange = () => toggleSel(+cb.dataset.row, cb.checked));
+  const all = $("selAll");
+  if (all) all.onchange = () => tbody.querySelectorAll("input.rowsel").forEach((cb) => {
+    cb.checked = all.checked; toggleSel(+cb.dataset.row, all.checked); });
 }
 
 function renderRow(columns, r, i, canEdit) {
+  const selTd = canEdit ? `<td class="sel"><input type="checkbox" class="rowsel" data-row="${i}" aria-label="select row" /></td>` : "";
   const tds = columns.map((c) => {
     const m = colMeta(c) || {};
     const v = r[c];
@@ -274,8 +288,31 @@ function renderRow(columns, r, i, canEdit) {
       : "";
     return `<td class="${cls}" ${attrs}><span class="val" title="${esc(v)}">${esc(v)}</span>${jump}</td>`;
   }).join("");
-  const act = canEdit ? `<td class="actions"><button class="danger" data-del="${i}">Delete</button></td>` : "";
-  return `<tr>${tds}${act}</tr>`;
+  return `<tr data-row="${i}">${selTd}${tds}</tr>`;
+}
+
+// --- multi-select + bulk delete (checkboxes + trash), like Prisma Studio ---
+function toggleSel(i, on) {
+  if (on) state.selected.add(i); else state.selected.delete(i);
+  const tr = $("gridWrap").querySelector(`tr[data-row="${i}"]`);
+  if (tr) tr.classList.toggle("selected", on);
+  syncBulk();
+}
+function syncBulk() {
+  const b = $("bulkDelete"); if (!b) return;
+  const n = state.selected.size;
+  b.style.display = n > 0 ? "" : "none";
+  b.textContent = `🗑 Delete ${n}`;
+}
+async function bulkDelete() {
+  const n = state.selected.size; if (!n) return;
+  if (!confirm(`Delete ${n} row${n === 1 ? "" : "s"}? This cannot be undone.`)) return;
+  const keys = [...state.selected].map((i) => pkOf(state.lastRows[i]));
+  try {
+    const res = await api("DELETE", `/api/tables/${encodeURIComponent(state.table)}/rows`, { keys });
+    toast(`deleted ${res.affected} row${res.affected === 1 ? "" : "s"}`, true);
+    loadRows();
+  } catch (e) { toast(e.message); }
 }
 
 // --- inline cell editing (double-click), like Prisma Studio ---
@@ -350,6 +387,9 @@ function startNewRow() {
   const table = $("gridWrap").querySelector("table");
   if (!table) { loadRows().then(startNewRow); return; }
   const tr = document.createElement("tr"); tr.className = "new-row";
+  // Lead with an empty cell under the selection column, so the inputs line up
+  // with their headers (the grid has a checkbox column whenever it is editable).
+  if (state.writable && state.hasPk) tr.appendChild(document.createElement("td")).className = "sel";
   for (const c of state.cols) {
     const td = document.createElement("td");
     const input = document.createElement("input");
@@ -380,18 +420,17 @@ async function saveNewRow(tr) {
   } catch (e) { toast(e.message); }
 }
 
-async function removeRow(row) {
-  if (!confirm("Delete this row? This cannot be undone.")) return;
-  try {
-    await api("DELETE", `/api/tables/${encodeURIComponent(state.table)}/rows`, { pk: pkOf(row) });
-    loadRows(); toast("row deleted", true);
-  } catch (e) { toast(e.message); }
-}
-
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
 $("refresh").onclick = loadRows;
 $("newRow").onclick = startNewRow;
+$("bulkDelete").onclick = bulkDelete;
+let searchTimer;
+$("search").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  const v = e.target.value.trim();
+  searchTimer = setTimeout(() => { state.search = v; state.offset = 0; loadRows(); }, 300);
+});
 $("prev").onclick = () => { state.offset = Math.max(0, state.offset - state.limit); loadRows(); };
 $("next").onclick = () => { state.offset += state.limit; loadRows(); };
 $("pageSize").onchange = (e) => { state.limit = +e.target.value; state.offset = 0; loadRows(); };
