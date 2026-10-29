@@ -52,5 +52,14 @@ tokio-postgres = { version = "0.7" }
 deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
 inventory = { version = "0.3" }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+# Observability (ADR 0008). `tracing` is a facade: with no subscriber installed
+# every macro compiles to a cheap disabled check, so an always-on direct
+# dependency costs the ~nothing a library should when nobody is listening — no
+# feature gate buys us anything here. It already rides in as a transitive dep of
+# tokio-postgres; naming it directly just lets `db.rs` emit its own spans.
+tracing = { version = "0.1" }
+# Test-only: a capturing subscriber for the live observability proof. Never a
+# runtime dependency — a library must not choose anyone's subscriber.
+tracing-subscriber = { version = "0.3" }
 insta = { version = "1" }
 clap = { version = "4", features = ["derive"] }

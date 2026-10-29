@@ -25,9 +25,10 @@
 //! PostgreSQL itself. That is a stronger guarantee than a best-effort
 //! `ROLLBACK`, because it also covers the process being killed.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::types::ToSql;
@@ -48,12 +49,30 @@ pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
 pub const POOL_MAX_ENV: &str = "DELONIX_ORM_POOL_MAX";
 /// How long a caller waits for a connection before giving up.
 pub const POOL_ACQUIRE_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_POOL_ACQUIRE_TIMEOUT_MS";
+/// Statements slower than this many milliseconds are logged at `warn` (ADR 0008).
+/// Absent — or zero — disables the slow-query log entirely, which is the default:
+/// production opts *in* to the noise, it is never surprised by it.
+pub const SLOW_QUERY_MS_ENV: &str = "DELONIX_ORM_SLOW_QUERY_MS";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
 
+/// How much SQL a log line carries before it is truncated. Long enough to read
+/// the shape of a statement, short enough that a 50-line generated query does
+/// not flood the log. The full SQL is never a secret — the *parameters* are, and
+/// those are never here (see [`observe`]).
+const SQL_LOG_MAX: usize = 300;
+
 static POOL: OnceLock<Pool> = OnceLock::new();
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// The slow-query threshold, read from the environment exactly once.
+///
+/// Like the pool sizing, this is process configuration set at launch, not a
+/// per-call knob — so it is resolved on first use and cached, keeping the hot
+/// path free of an env lookup (and its lock + allocation) on every statement.
+/// `None` means the slow-query log is off; `Some(d)` is the threshold.
+static SLOW_QUERY: OnceLock<Option<Duration>> = OnceLock::new();
 
 /// Read the configured DSN.
 pub fn dsn() -> Result<String> {
@@ -75,6 +94,122 @@ fn env_usize(key: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+// ------------------------------------------------------- observability (ADR 0008)
+//
+// Every statement that runs through `query`/`execute` emits one `tracing` event
+// with its timing and shape, and — when a threshold is configured — a `warn`
+// when it runs long. The whole thing is a no-op without a subscriber, which is
+// why it is always compiled in rather than feature-gated: `tracing`'s disabled
+// path is a relaxed atomic load, so a process that installs no subscriber pays
+// essentially nothing. See ADR 0008.
+//
+// SECURITY — this is the invariant the whole module keeps: a log line carries
+// the SQL *text* (which holds `$n` placeholders, never literals) and metadata.
+// It NEVER carries the bound parameter values, because those are exactly the
+// data most likely to be sensitive — a password being hashed, an email, a token.
+// `observe` is given the SQL and a row count, never `params`, so there is no path
+// by which a value can reach the log.
+
+/// The configured slow-query threshold, resolved once. See [`SLOW_QUERY`].
+fn slow_query_threshold() -> Option<Duration> {
+    *SLOW_QUERY.get_or_init(|| {
+        std::env::var(SLOW_QUERY_MS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+/// Shorten SQL for a log line, on a UTF-8 boundary, tagging the original length
+/// when it is cut. Only the SQL text is ever summarised — never a parameter
+/// value, which does not pass through here (see the module note above).
+fn summarize_sql(sql: &str) -> Cow<'_, str> {
+    let trimmed = sql.trim();
+    if trimmed.len() <= SQL_LOG_MAX {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut end = SQL_LOG_MAX;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}… [{} bytes]", &trimmed[..end], trimmed.len()))
+}
+
+/// Emit the per-statement trace event and, past the configured threshold, the
+/// slow-query warning.
+///
+/// `rows` is `Some(n)` when the statement succeeded — rows returned for a query,
+/// rows affected for an execute — and `None` when it failed; the failure itself
+/// still propagates to the caller as an `Err`, this only records that it ran.
+/// `params` is deliberately not a parameter of this function: values never log.
+fn observe(op: &'static str, sql: &str, elapsed: Duration, rows: Option<u64>, in_tx: bool) {
+    let duration_ms = elapsed.as_secs_f64() * 1e3;
+    let sql = summarize_sql(sql);
+
+    // The normal case, at debug: one line per statement for anyone who turns the
+    // `dorm::db` target up, invisible (and nearly free) to everyone else.
+    tracing::debug!(
+        target: "dorm::db",
+        op,
+        rows = ?rows,
+        duration_ms,
+        in_tx,
+        sql = %sql,
+        "statement finished"
+    );
+
+    if let Some(threshold) = slow_query_threshold() {
+        if elapsed >= threshold {
+            // A separate `warn` so slow queries surface on a default subscriber
+            // without having to opt into the per-statement debug stream.
+            tracing::warn!(
+                target: "dorm::db",
+                op,
+                duration_ms,
+                threshold_ms = threshold.as_millis() as u64,
+                in_tx,
+                sql = %sql,
+                "slow query"
+            );
+        }
+    }
+}
+
+/// A point-in-time snapshot of the connection pool's occupancy (ADR 0008).
+///
+/// This mirrors deadpool's own `Status` but is a type DORM owns, so the pool
+/// implementation does not leak into the public API — a caller can serialize it
+/// into a metrics endpoint or a health check without taking a deadpool
+/// dependency, and we can change pools underneath without breaking them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolStats {
+    /// The configured ceiling — `DELONIX_ORM_POOL_MAX`, or the built-in default.
+    pub max_size: usize,
+    /// Connections currently managed by the pool (idle plus checked-out).
+    pub size: usize,
+    /// Idle connections available to hand out right now, as deadpool reports it.
+    pub available: usize,
+    /// Callers currently blocked waiting for a connection.
+    pub waiting: usize,
+}
+
+/// A snapshot of the pool's current occupancy, for a metrics endpoint or health
+/// check (ADR 0008). Errors only if no pool can be built — i.e. no DSN is set.
+///
+/// It is a snapshot, not a subscription: the numbers are already stale by the
+/// time the caller reads them, which is all a pool gauge ever is. Cheap enough
+/// to call per scrape.
+pub fn pool_stats() -> Result<PoolStats> {
+    let status = pool()?.status();
+    Ok(PoolStats {
+        max_size: status.max_size,
+        size: status.size,
+        available: status.available,
+        waiting: status.waiting,
+    })
 }
 
 /// Mark this process as read-only. Every write refuses before it reaches SQL.
@@ -187,6 +322,23 @@ async fn acquire() -> Result<Object> {
 /// given query — pays Parse once and is Bind/Execute-only thereafter. The win
 /// grows with repetition, which is the ORM's whole access pattern.
 pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    // Observed end to end (ADR 0008): the clock spans Parse-or-cache-hit plus
+    // Bind/Execute, which is the latency the caller actually pays. `in_tx` is
+    // read up front so the event records the routing even on the error path.
+    let in_tx = in_transaction();
+    let start = Instant::now();
+    let result = query_inner(sql, params).await;
+    observe(
+        "query",
+        sql,
+        start.elapsed(),
+        result.as_ref().ok().map(|rows| rows.len() as u64),
+        in_tx,
+    );
+    result
+}
+
+async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
@@ -205,6 +357,22 @@ pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRo
 /// Statements are cached per connection exactly as in [`query`]; see its note
 /// on `prepare_cached` (ADR 0007).
 pub async fn execute(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+    // Observed exactly as `query` is (ADR 0008); here the recorded row count is
+    // rows *affected* rather than returned.
+    let in_tx = in_transaction();
+    let start = Instant::now();
+    let result = execute_inner(sql, params).await;
+    observe(
+        "execute",
+        sql,
+        start.elapsed(),
+        result.as_ref().ok().copied(),
+        in_tx,
+    );
+    result
+}
+
+async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
@@ -892,6 +1060,41 @@ mod tests {
         assert!(!Tx { depth: 1 }.is_savepoint());
         assert!(Tx { depth: 2 }.is_savepoint());
         assert_eq!(Tx { depth: 3 }.depth(), 3);
+    }
+
+    #[test]
+    fn a_short_statement_is_logged_whole_and_trimmed() {
+        let s = summarize_sql("  SELECT 1  ");
+        assert_eq!(s, "SELECT 1");
+        assert!(matches!(s, Cow::Borrowed(_)), "no allocation for short SQL");
+    }
+
+    #[test]
+    fn a_long_statement_is_truncated_on_a_char_boundary_and_tagged() {
+        // A multi-byte char straddling the cut must not panic or split a scalar.
+        let long = format!("SELECT '{}'", "é".repeat(SQL_LOG_MAX));
+        let s = summarize_sql(&long);
+        assert!(s.ends_with(&format!("[{} bytes]", long.len())), "{s}");
+        assert!(s.contains('…'), "{s}");
+        // Still valid UTF-8 up to the ellipsis — the assertion is that building
+        // it did not panic, which a mid-char cut would have.
+        assert!(s.len() < long.len());
+    }
+
+    #[test]
+    fn pool_stats_serializes_to_the_documented_shape() {
+        // The public snapshot type must round-trip through serde with stable,
+        // metrics-friendly field names and no deadpool type leaking out.
+        let snap = PoolStats {
+            max_size: 8,
+            size: 3,
+            available: 1,
+            waiting: 2,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize PoolStats");
+        assert_eq!(json, r#"{"max_size":8,"size":3,"available":1,"waiting":2}"#);
+        let back: PoolStats = serde_json::from_str(&json).expect("deserialize PoolStats");
+        assert_eq!(back, snap);
     }
 
     #[test]
