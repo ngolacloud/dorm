@@ -485,9 +485,9 @@ async fn delete_row(
     Ok(Json(json!({ "affected": affected })))
 }
 
-/// `GET /` — the single-page Studio.
+/// `GET /` — the single-page Studio, shared with the typed Studio crate.
 async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+    Html(dorm_studio::INDEX_HTML)
 }
 
 // ---------------------------------------------------------------------- helpers
@@ -647,6 +647,3 @@ impl IntoResponse for StudioError {
         (code, Json(json!({ "error": msg }))).into_response()
     }
 }
-
-/// The single-page app: all HTML, CSS and JS inline, served from `/`.
-const INDEX_HTML: &str = include_str!("studio.html");

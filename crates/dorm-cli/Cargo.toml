@@ -40,6 +40,10 @@ sqlite = ["dorm-core/sqlite"]
 # crates.io resolves the published one.
 dorm-core = { path = "../dorm-core", version = "0.6.0" }
 dorm-schema = { path = "../dorm-schema", version = "0.3.0" }
+# The Studio's single-page app lives here and is shared: the native `dorm studio`
+# (introspection-backed, in this crate) serves `dorm_studio::INDEX_HTML`, the
+# same page a generated typed Studio serves.
+dorm-studio = { path = "../dorm-studio", version = "0.1.0" }
 clap = { workspace = true }
 clap_complete = "4"
 serde_json = { workspace = true }

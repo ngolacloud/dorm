@@ -583,6 +583,7 @@ dependencies = [
  "clap_complete",
  "dorm-core",
  "dorm-schema",
+ "dorm-studio",
  "serde_json",
  "tokio",
  "tokio-postgres",
@@ -690,6 +691,17 @@ dependencies = [
  "rust_decimal",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "dorm-studio"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dorm-core",
+ "dorm-models",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

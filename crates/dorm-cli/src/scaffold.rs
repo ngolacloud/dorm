@@ -55,6 +55,7 @@ pub fn init(name: Option<&str>) -> CliResult {
     write(root.join("src/bin/diff.rs"), &render(DIFF_RS))?;
     write(root.join("src/bin/validate.rs"), &render(VALIDATE_RS))?;
     write(root.join("src/bin/shell.rs"), &render(SHELL_RS))?;
+    write(root.join("src/bin/studio.rs"), &render(STUDIO_RS))?;
 
     println!("created `{name}`.\n");
     println!("next:");
@@ -72,7 +73,8 @@ pub fn init(name: Option<&str>) -> CliResult {
     println!("  dorm migrate make <name>       # or: author a versioned migration");
     println!("  dorm migrate deploy            #      and apply the recorded chain");
     println!("  dorm shell                     # a REPL over your models");
-    println!("  dorm studio                    # browse & edit the database in your browser");
+    println!("  cargo run --bin studio         # DORM Studio — a web UI over your models (--write to edit)");
+    println!("  dorm studio                    # the same, native (any database, no build)");
     println!("  dorm api generate && dorm api serve   # an Axum read API + OpenAPI");
     Ok(())
 }
@@ -105,6 +107,26 @@ pub fn api_generate(schema_path: &str, out_path: &str) -> CliResult {
     );
     println!(
         "run `dorm api serve` to serve it (needs `axum` in Cargo.toml — `dorm init` adds it)."
+    );
+    Ok(())
+}
+
+/// `dorm studio generate` — (re)write `src/bin/studio.rs`, a typed Studio over
+/// the project's models. The file is fixed (all the logic is in `dorm-studio`),
+/// so this just stamps the crate name in; `dorm init` already writes it.
+pub fn studio_generate(out_path: &str) -> CliResult {
+    let krate = package_name()?;
+    let rust = STUDIO_RS.replace("__APP_CRATE__", &krate);
+    if let Some(parent) = Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    write(out_path, &rust)?;
+    println!("generated {out_path}.");
+    println!(
+        "run `cargo run --bin studio` to open it (add `--write` to edit; needs \
+         `dorm-studio` in Cargo.toml — `dorm init` adds it)."
     );
     Ok(())
 }
@@ -223,6 +245,8 @@ rust_decimal = "1"
 uuid = { version = "1", features = ["v4"] }
 # For the API `dorm api generate` writes (`src/bin/api.rs`).
 axum = "0.7"
+# For `cargo run --bin studio` — DORM Studio over your typed models.
+dorm-studio = "0.1"
 "#;
 
 const GITIGNORE: &str = "/target\n**/*.rs.bk\n.env\n";
@@ -241,16 +265,21 @@ export DELONIX_ORM_DSN='host=/var/run/postgresql user=me dbname=__APP_CRATE__'
 dorm push                       # create tables/columns to match your models
 dorm shell                      # a REPL over your models (= cargo run --bin shell)
 dorm db tables                  # browse the live database
-dorm studio                     # browse & edit the database in your browser
+cargo run --bin studio -- --write   # DORM Studio — browse & edit in your browser
 ```
 
 Add a model with `dorm new model <Name>` (appends to `dorm.schema`) or by editing
 `dorm.schema` directly, then `dorm generate` and `dorm push`.
 
-`dorm studio` opens a Prisma-Studio-style web UI over the live database — browse,
-filter and page every table, follow foreign keys, and (with `--write`) create,
-edit and delete rows. It is native: it reads the live schema, so it needs no
-build and works the moment the tables exist.
+**DORM Studio** is a Prisma-Studio-style web UI over the live database: browse,
+filter, search and page every table, follow relations both ways, and (with
+`--write`) create, edit and delete rows. Two ways to run it:
+
+* `cargo run --bin studio` — the **typed** Studio over this project's models, so
+  it knows your relations by name (`Tenant.apps`) and your declared types. Regenerate
+  the binary with `dorm studio generate`.
+* `dorm studio` — the **native** Studio, which reads the live schema instead, so
+  it needs no build and works against any PostgreSQL.
 
 For versioned, reviewable migrations instead of `push`, use the history in
 `migrations/`:
@@ -435,6 +464,30 @@ fn main() {
         println!("validate: {errors} error(s)");
     }
     std::process::exit(if errors > 0 { 3 } else { 0 });
+}
+"#;
+
+const STUDIO_RS: &str = r#"//! `cargo run --bin studio` runs this: DORM Studio over THIS project's models —
+//! a Prisma-Studio-style web UI to browse and (with `--write`) edit the live
+//! database, with your models' own relations and declared types. `--port N`
+//! chooses the port (default 5555); all the logic lives in `dorm-studio`.
+
+#[tokio::main]
+async fn main() {
+    // Link the models into the registry so the Studio can enumerate them.
+    let _ = __APP_CRATE__::all_models();
+    let args: Vec<String> = std::env::args().collect();
+    let writable = args.iter().any(|a| a == "--write");
+    let port = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5555);
+    if let Err(e) = dorm_studio::serve(port, writable).await {
+        eprintln!("studio: {e}");
+        std::process::exit(1);
+    }
 }
 "#;
 

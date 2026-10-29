@@ -102,9 +102,13 @@ enum CliCommand {
         action: DbAction,
     },
     /// Browse and edit the live database in your browser — DORM's Studio, in the
-    /// spirit of Prisma Studio. Native (reads `information_schema`); no project
-    /// build. Read-only unless `--write`.
+    /// spirit of Prisma Studio. With no subcommand it serves the native Studio
+    /// (reads `information_schema`; no project build). `dorm studio generate`
+    /// writes a typed Studio (`src/bin/studio.rs`) over your models instead.
+    /// Read-only unless `--write`.
     Studio {
+        #[command(subcommand)]
+        action: Option<StudioAction>,
         /// TCP port to serve on. Binds `127.0.0.1` only. Defaults to 5555.
         #[arg(long, default_value_t = 5555)]
         port: u16,
@@ -139,6 +143,18 @@ enum ApiAction {
     },
     /// Build and run the generated API. (`cargo run --bin api`.)
     Serve,
+}
+
+#[derive(Subcommand)]
+enum StudioAction {
+    /// Write `src/bin/studio.rs` — a typed Studio over your models, run with
+    /// `cargo run --bin studio`. Native; `dorm init` already writes it, so this
+    /// is for regenerating it.
+    Generate {
+        /// Where to write the Studio binary.
+        #[arg(long, default_value = "src/bin/studio.rs")]
+        out: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -272,7 +288,14 @@ fn main() -> ExitCode {
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
         CliCommand::Db { action } => on_runtime(run_db(action, json)),
-        CliCommand::Studio { port, write } => on_runtime(studio::serve(port, write)),
+        CliCommand::Studio {
+            action,
+            port,
+            write,
+        } => match action {
+            None => on_runtime(studio::serve(port, write)),
+            Some(StudioAction::Generate { out }) => scaffold::studio_generate(&out).map(|()| 0),
+        },
         CliCommand::Api { action } => match action {
             ApiAction::Generate { schema, out } => {
                 scaffold::api_generate(&schema, &out).map(|()| 0)
