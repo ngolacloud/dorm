@@ -56,3 +56,16 @@ sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 insta = { workspace = true }
+# ADR 0007 benchmarks. `async_tokio` lets a `&Runtime` drive the measured
+# future so each iteration is a real round trip to PostgreSQL; the models the
+# benchmark queries come from the derive, exactly as a user's would.
+criterion = { version = "0.5", features = ["async_tokio"] }
+dorm-derive = { path = "../dorm-derive" }
+
+# The prepared-statement-cache proof (ADR 0007): typed DORM vs raw
+# `tokio-postgres`, and ad-hoc vs cached preparation. `harness = false` hands the
+# `main` to criterion; the bench no-ops unless `DELONIX_ORM_DSN` points at a
+# throwaway PostgreSQL.
+[[bench]]
+name = "prepared_cache"
+harness = false

@@ -177,27 +177,45 @@ async fn acquire() -> Result<Object> {
 /// and the raw callers (the CLI, the migrator, the shell) consume them with the
 /// driver's own API. The typed `QuerySet` goes through the backend-agnostic
 /// [`fetch`] instead, which wraps these rows in a [`Row`].
+///
+/// ## Why `prepare_cached` and not `conn.query(sql, …)`
+///
+/// `Client::query(&str, …)` prepares an unnamed statement on every call — a
+/// Parse round trip the server throws away each time. `prepare_cached` keeps a
+/// named statement per connection (deadpool's [`StatementCache`], ADR 0007), so
+/// the same SQL — and the ORM emits the same text with `$n` placeholders for a
+/// given query — pays Parse once and is Bind/Execute-only thereafter. The win
+/// grows with repetition, which is the ORM's whole access pattern.
 pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        return conn.query(sql, params).await.map_err(from_pg);
+        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+        return conn.query(&stmt, params).await.map_err(from_pg);
     }
-    acquire().await?.query(sql, params).await.map_err(from_pg)
+    let conn = acquire().await?;
+    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+    conn.query(&stmt, params).await.map_err(from_pg)
 }
 
 /// Run a statement and report how many rows it touched.
+///
+/// Statements are cached per connection exactly as in [`query`]; see its note
+/// on `prepare_cached` (ADR 0007).
 pub async fn execute(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        return conn.execute(sql, params).await.map_err(from_pg);
+        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+        return conn.execute(&stmt, params).await.map_err(from_pg);
     }
-    acquire().await?.execute(sql, params).await.map_err(from_pg)
+    let conn = acquire().await?;
+    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
+    conn.execute(&stmt, params).await.map_err(from_pg)
 }
 
 /// Run a statement for its effect only, outside any result set.
