@@ -26,6 +26,9 @@ members = [
     "crates/dorm-cli",
     # The `dorm.schema` parser + code generator (Prisma-style schema → Rust).
     "crates/dorm-schema",
+    # DORM Studio: a Prisma-Studio-style web UI over the typed models. A generated
+    # `src/bin/studio.rs` links the project's models and calls `serve`.
+    "crates/dorm-studio",
     # The SQLite executor: run the ORM's SQLite-dialect compiled SQL (ADR 0002).
     "crates/dorm-sqlite",
 ]
