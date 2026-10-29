@@ -635,7 +635,7 @@ async fn acquire() -> Result<Object> {
 ///
 /// `Client::query(&str, …)` prepares an unnamed statement on every call — a
 /// Parse round trip the server throws away each time. `prepare_cached` keeps a
-/// named statement per connection (deadpool's [`StatementCache`], ADR 0007), so
+/// named statement per connection (deadpool's `StatementCache`, ADR 0007), so
 /// the same SQL — and the ORM emits the same text with `$n` placeholders for a
 /// given query — pays Parse once and is Bind/Execute-only thereafter. The win
 /// grows with repetition, which is the ORM's whole access pattern.
