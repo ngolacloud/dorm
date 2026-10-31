@@ -15,7 +15,7 @@ The connection string is read from an environment variable:
 
 Both the libpq keyword form and the URL form work:
 
-```console
+```sh
 $ export DELONIX_ORM_DSN='host=/var/run/postgresql user=me dbname=blog'
 $ export DELONIX_ORM_DSN='postgresql://me:secret@localhost:5432/blog'
 ```
@@ -45,7 +45,7 @@ plaintext; ask for `require` or `verify-full` to get TLS.
 | `verify-full` | Encrypt **and** verify the chain and hostname. Roots come from `sslrootcert` if set, else the bundled Mozilla roots. | supported |
 | `verify-ca` | Verify the chain, not the hostname. | not yet — use `verify-full` or `require` |
 
-```console
+```sh
 $ export DELONIX_ORM_DSN='postgresql://me@db.internal:5432/blog?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem'
 ```
 

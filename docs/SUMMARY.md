@@ -2,22 +2,25 @@
 
 [Introduction](introduction.md)
 
-# Guide
+# Getting started
 
-- [Getting started](getting-started.md)
+- [Installation](installation.md)
+- [Start a new project](quickstart.md)
+- [Use DORM in an existing project](existing-project.md)
+
+# Using DORM
+
 - [The schema](schema.md)
 - [Models](models.md)
 - [Making queries](queries.md)
 - [Migrations](migrations.md)
 - [Connection & transactions](connection-and-transactions.md)
-
-# Tools
-
-- [The CLI](cli-contract.md)
+- [Managing your database](managing-the-database.md)
 - [DORM Studio](studio.md)
 
 # Reference
 
+- [CLI reference](cli-contract.md)
 - [API reference (docs.rs)](api-reference.md)
 - [Roadmap](roadmap.md)
 - [Architecture decisions](adr/0001-declarative-schema.md)

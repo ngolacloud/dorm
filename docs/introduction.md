@@ -32,7 +32,8 @@ let newest = Author::objects()
 ## Two faces, one model set
 
 - **The library** — `dorm-core` + `dorm-derive`: the typed `QuerySet` your
-  application code calls. Start at [Getting started](getting-started.md), then
+  application code calls. Start at [Installation](installation.md) and
+  [Use DORM in an existing project](existing-project.md), then
   [Models](models.md) and [Making queries](queries.md).
 - **The CLI** — `dorm` (`cargo install dorm-cli`): scaffolds a project, compiles
   a Prisma-style [`dorm.schema`](schema.md) to Rust models, runs
@@ -63,7 +64,9 @@ and `dorm-studio`.
 
 ## Where to go next
 
-- **[Getting started](getting-started.md)** — empty crate to working query.
+- **[Installation](installation.md)** — install the CLI and the library.
+- **[Start a new project](quickstart.md)** — scaffold with `dorm init`.
+- **[Use DORM in an existing project](existing-project.md)** — add DORM as a crate.
 - **[The schema](schema.md)** — the `dorm.schema` reference.
 - **[Making queries](queries.md)** — the whole `QuerySet` API.
 - **[Migrations](migrations.md)** — version and apply schema changes.
