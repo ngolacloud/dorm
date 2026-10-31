@@ -12,13 +12,13 @@ publish = false
 # proof: the shell never names a column or a table, only reads them back from the
 # registry the derive macro populated.
 
+# The installable CLI (`dorm-cli`) owns the `dorm` binary name; this REPL is an
+# internal/example crate (`publish = false`), so its binary is `dorm-shell` to
+# avoid the output-filename collision that two `dorm` targets caused under
+# `cargo build --workspace` and `cargo doc`.
 [[bin]]
-name = "dorm"
+name = "dorm-shell"
 path = "src/main.rs"
-# Both this REPL and `dorm-cli` build a binary named `dorm`; `cargo doc` writes
-# both to the same path and refuses the collision. The CLI is the one whose docs
-# matter, so the REPL opts out — the binary itself is unaffected.
-doc = false
 
 [dependencies]
 dorm-core = { path = "../dorm-core" }
