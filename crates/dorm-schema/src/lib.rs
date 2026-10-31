@@ -42,11 +42,13 @@
 
 mod codegen;
 mod codegen_api;
+mod format;
 mod lexer;
 mod parser;
 
 pub use codegen::generate_rust;
 pub use codegen_api::generate_axum;
+pub use format::format;
 pub use parser::{parse, ParseError};
 
 /// A parsed `dorm.schema`.

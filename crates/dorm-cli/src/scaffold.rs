@@ -93,6 +93,35 @@ pub fn generate(schema_path: &str, out_path: &str) -> CliResult {
     Ok(())
 }
 
+/// `dorm format` — rewrite `dorm.schema` in DORM's canonical form, in place.
+///
+/// Lossless: it formats the text, not the parsed AST, so comments, every field
+/// and block-level attribute and the `datasource` block all survive — only
+/// layout changes. With `check`, it writes nothing and signals formattedness
+/// through the exit code: 0 when already canonical, 3 when it would change.
+pub fn format(schema_path: &str, check: bool) -> Result<i32, Box<dyn std::error::Error>> {
+    let src = fs::read_to_string(schema_path)
+        .map_err(|e| format!("reading {schema_path}: {e} (run `dorm init` first?)"))?;
+    let formatted = dorm_schema::format(&src);
+
+    if check {
+        if src == formatted {
+            println!("{schema_path} is already formatted.");
+            Ok(0)
+        } else {
+            eprintln!("{schema_path} is not formatted (run `dorm format`).");
+            Ok(3)
+        }
+    } else if src == formatted {
+        println!("{schema_path} is already formatted.");
+        Ok(0)
+    } else {
+        write(schema_path, &formatted)?;
+        println!("formatted {schema_path}.");
+        Ok(0)
+    }
+}
+
 /// `dorm api generate` — write an Axum read API (`src/bin/api.rs`) from the schema.
 pub fn api_generate(schema_path: &str, out_path: &str) -> CliResult {
     let src = fs::read_to_string(schema_path)
