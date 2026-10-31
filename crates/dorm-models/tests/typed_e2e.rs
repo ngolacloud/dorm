@@ -653,3 +653,74 @@ e2e!(
         app.delete().await.expect("cleanup");
     }
 );
+
+// Regression for DBA-01/H3: a unique violation inside `get_or_create` must not
+// poison the transaction the caller wrapped around it. Before the fix, the
+// doomed `INSERT` aborted the whole `atomic` block and the recovery read came
+// back with `25P02 current transaction is aborted`; after it, the insert runs
+// in its own `SAVEPOINT`, so the outer transaction stays usable.
+//
+// Deterministic (no concurrency): the lookup slug never exists, so
+// `get_or_create` always reaches the `INSERT`, and the inserted slug collides
+// with a row committed *before* the block — a guaranteed `23505`.
+e2e!(
+    get_or_create_unique_violation_does_not_poison_the_outer_transaction,
+    "acme-savepoint",
+    |t, _p| {
+        let _ = t;
+        let dup_slug = "acme-savepoint-dup";
+        let miss_slug = "acme-savepoint-miss";
+
+        // Seed the conflicting row, committed, outside any transaction.
+        Tenant::objects()
+            .get_or_create(
+                tenant::slug.eq(dup_slug),
+                NewTenant {
+                    slug: dup_slug.into(),
+                    name: "Dup".into(),
+                },
+            )
+            .await
+            .expect("the conflicting row is committed");
+
+        let survived: Result<Option<Tenant>> = db::atomic(|_tx| async move {
+            // Lookup misses -> go to INSERT; INSERT collides with the committed
+            // `dup` row -> 23505. The call itself reports an error either way
+            // (the lookup never matches the row that exists); what matters is
+            // whether the transaction is still alive after it.
+            let doomed = Tenant::objects()
+                .get_or_create(
+                    tenant::slug.eq(miss_slug),
+                    NewTenant {
+                        slug: dup_slug.into(),
+                        name: "Doomed".into(),
+                    },
+                )
+                .await;
+            assert!(
+                doomed.is_err(),
+                "the doomed insert must surface an error, got {doomed:?}"
+            );
+
+            // The proof: a further read on the SAME transaction still works.
+            // Before the fix this is `25P02`; after it, `Ok(Some(dup))`.
+            Tenant::objects()
+                .filter(tenant::slug.eq(dup_slug))
+                .first()
+                .await
+        })
+        .await;
+
+        let found = survived.expect("the outer transaction survived the unique violation");
+        assert!(
+            found.is_some(),
+            "the committed dup row is visible from the still-alive transaction"
+        );
+
+        Tenant::objects()
+            .filter(tenant::slug.eq(dup_slug))
+            .delete()
+            .await
+            .expect("cleanup");
+    }
+);

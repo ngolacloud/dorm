@@ -166,11 +166,14 @@ impl<T: Model> Manager<T> {
         if let Some(found) = QuerySet::<T>::new().filter(lookup.clone()).first().await? {
             return Ok((found, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: the row the other caller inserted is the right
-                // answer, and reporting `created = false` is accurate.
+                // answer, and reporting `created = false` is accurate. The insert
+                // ran inside its own savepoint (`create_savepointed`), so the
+                // unique violation rolled back only that attempt — this recovery
+                // read runs on a transaction that is still usable.
                 let found = QuerySet::<T>::new()
                     .filter(lookup)
                     .first()
@@ -180,6 +183,25 @@ impl<T: Model> Manager<T> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Insert `new` so that a unique violation rolls back only its own attempt,
+    /// never a transaction the caller may already be inside.
+    ///
+    /// The bug this closes: `get_or_create`/`update_or_create` run
+    /// `SELECT → INSERT → SELECT`. When the caller wraps the whole thing in
+    /// [`db::atomic`](crate::db::atomic), all three share one dedicated
+    /// connection. A bare `INSERT` that loses the race fails with `23505` and
+    /// **aborts that transaction**, so the recovery `SELECT` comes back with
+    /// `25P02 current transaction is aborted` instead of the winner's row — the
+    /// promised idempotence is false inside a transaction.
+    ///
+    /// Wrapping the insert in a nested `atomic` makes it a `SAVEPOINT` when there
+    /// is an outer transaction: the `23505` only does `ROLLBACK TO SAVEPOINT`,
+    /// leaving the outer transaction usable for the recovery read. With no outer
+    /// transaction it is a trivial `BEGIN`/`COMMIT` around the single insert.
+    async fn create_savepointed<N: NewRow<T>>(&self, new: N) -> Result<T> {
+        db::atomic(|_tx| async move { self.create(new).await }).await
     }
 
     /// Fetch the row matching `lookup` and apply `updates` to it, or insert `new`
@@ -205,10 +227,12 @@ impl<T: Model> Manager<T> {
         {
             return Ok((self.apply_and_fetch(lookup, updates).await?, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: update the row the winner inserted and return it.
+                // The insert ran in its own savepoint, so the outer transaction
+                // (if any) survives the unique violation and this update can run.
                 Ok((self.apply_and_fetch(lookup, updates).await?, false))
             }
             Err(e) => Err(e),
