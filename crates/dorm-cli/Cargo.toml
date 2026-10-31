@@ -5,7 +5,8 @@ name = "dorm-cli"
 # workflow publishes per-crate and skips versions already on the index.
 # 0.12.0: adds `dorm studio` (native + typed, over `dorm-studio`).
 # 0.12.1: Studio CSV export and foreign-key relation editing.
-version = "0.12.1"
+# 0.12.2: `dorm db shell` (psql) and `dorm db seed`.
+version = "0.12.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

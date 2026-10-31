@@ -260,6 +260,16 @@ enum DbAction {
         #[arg(long)]
         write: bool,
     },
+    /// Open the native PostgreSQL client (`psql`) on the configured database.
+    /// Hands you straight to `psql` with the DSN; everything after is `psql`.
+    Shell,
+    /// Run a SQL seed file against the database (every statement in it). The
+    /// file is yours — plain `INSERT`s, or any setup you want applied.
+    Seed {
+        /// The SQL file to run. Defaults to `seeds.sql`.
+        #[arg(long, default_value = "seeds.sql")]
+        file: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -574,7 +584,38 @@ async fn run_db(action: DbAction, json: bool) -> CliResult {
         } => db_rows(&table, limit, filter.as_deref(), json).await,
         DbAction::Pull { out } => db_pull(&out).await,
         DbAction::Execute { sql, params, write } => db_execute(&sql, &params, write, json).await,
+        DbAction::Shell => db_shell(),
+        DbAction::Seed { file } => db_seed(&file, json).await,
     }
+}
+
+/// `dorm db shell`: open the native PostgreSQL client on the configured database.
+/// We resolve the DSN and hand it to `psql` as a conninfo argument — it accepts
+/// both the libpq keyword form and the URL form — then inherit its streams so the
+/// session is `psql`'s. The exit code is `psql`'s.
+fn db_shell() -> CliResult {
+    let dsn = db::dsn()?;
+    let status = Command::new("psql").arg(&dsn).status().map_err(|e| {
+        format!("could not run `psql`: {e} (is PostgreSQL's client installed and on PATH?)")
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// `dorm db seed`: run every statement in a SQL file against the database. The
+/// file is applied as one batch (so it may contain multiple statements, a
+/// function body, a transaction). Writes — it is a seed — so it runs on the write
+/// path; a read-only session still refuses it.
+async fn db_seed(file: &str, json: bool) -> CliResult {
+    let sql = std::fs::read_to_string(file)
+        .map_err(|e| format!("reading {file}: {e} (create it, or pass --file)"))?;
+    db::guard_write("seed")?;
+    db::run_ddl(&sql).await?;
+    if json {
+        println!("{}", json!({ "seeded": file }));
+    } else {
+        println!("seeded from {file}");
+    }
+    Ok(0)
 }
 
 /// `dorm db execute`: the CLI surface over the ADR 0005 raw-SQL valve. Reads run

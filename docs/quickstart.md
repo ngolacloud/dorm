@@ -38,7 +38,7 @@ they live in your project.
 
 Open `dorm.schema`. It starts with a datasource and two example models:
 
-```prisma
+```dorm
 datasource db {
   provider = "postgresql"
   url      = env("DELONIX_ORM_DSN")
