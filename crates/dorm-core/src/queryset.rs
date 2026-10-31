@@ -141,20 +141,47 @@ impl<T: Model> Manager<T> {
         T::from_row(row, 0)
     }
 
-    /// Insert many rows in one statement.
+    /// Insert many rows, chunked to stay under the wire protocol's parameter
+    /// limit.
     ///
-    /// One statement, not a loop: the round trips are what makes a per-row loop
-    /// slow, and a single `INSERT … VALUES (…), (…)` is also one transaction
-    /// without needing an explicit one.
+    /// One `INSERT … VALUES (…), (…)` per chunk, not a per-row loop: the round
+    /// trips are what make a loop slow. But a single statement carries at most
+    /// **65 535 bound parameters** (the protocol's `u16` parameter count), and a
+    /// row contributes one parameter per column, so one statement tops out at
+    /// `floor(65535 / columns)` rows — past that `tokio-postgres` overflows and
+    /// the insert fails outright. We chunk at that ceiling. When the rows fit in
+    /// a single chunk (the common case) the statement is its own transaction, as
+    /// before; when they span several chunks we wrap them in one `atomic` so the
+    /// call stays all-or-nothing.
     pub async fn bulk_create<N: NewRow<T>>(&self, rows: Vec<N>) -> Result<Vec<T>> {
         db::guard_write("bulk_create")?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
         let values: Vec<Vec<(String, Value)>> = rows.iter().map(NewRow::column_values).collect();
-        let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
-        let returned = run_query(&sql).await?;
-        returned.iter().map(|r| T::from_row(r, 0)).collect()
+        let cols = values[0].len().max(1);
+        let per_chunk = (65_535 / cols).max(1);
+
+        // Single chunk: unchanged behaviour (one statement, implicit transaction).
+        if values.len() <= per_chunk {
+            let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
+            let returned = run_query(&sql).await?;
+            return returned.iter().map(|r| T::from_row(r, 0)).collect();
+        }
+
+        // Several chunks: one statement each, all in one transaction.
+        db::atomic(|_tx| async move {
+            let mut out = Vec::with_capacity(values.len());
+            for chunk in values.chunks(per_chunk) {
+                let sql = compiler::compile_insert_on(T::meta(), chunk, db::dialect())?;
+                let returned = run_query(&sql).await?;
+                for r in &returned {
+                    out.push(T::from_row(r, 0)?);
+                }
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Fetch the row matching `lookup`, inserting `new` if there is none.

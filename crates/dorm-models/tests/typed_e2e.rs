@@ -724,3 +724,45 @@ e2e!(
             .expect("cleanup");
     }
 );
+
+// Regression for PERF-02/H9: `bulk_create` of more rows than a single statement
+// can carry must succeed by chunking. 70 000 tenants × 2 columns = 140 000 bound
+// parameters, well over the protocol's 65 535 `u16` ceiling — one statement
+// overflows and fails; chunked, it is three statements in one transaction.
+e2e!(bulk_create_of_70000_rows_succeeds, "acme-bulk", |_t, _p| {
+    let prefix = "acme-bulk-row-";
+
+    // Clear leftovers from any prior interrupted run (slug is unique).
+    Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .delete()
+        .await
+        .expect("pre-clean");
+
+    let n: usize = 70_000;
+    let rows: Vec<NewTenant> = (0..n)
+        .map(|i| NewTenant {
+            slug: format!("{prefix}{i}"),
+            name: format!("Bulk {i}"),
+        })
+        .collect();
+
+    let created = Tenant::objects()
+        .bulk_create(rows)
+        .await
+        .expect("70k rows insert by chunking under the parameter ceiling");
+    assert_eq!(created.len(), n, "every inserted row is returned");
+
+    let count = Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .count()
+        .await
+        .expect("count the inserted rows");
+    assert_eq!(count as usize, n, "all rows are persisted");
+
+    Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .delete()
+        .await
+        .expect("cleanup");
+});
