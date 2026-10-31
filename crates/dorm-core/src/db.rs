@@ -61,6 +61,16 @@ pub const STATEMENT_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_STATEMENT_TIMEOUT_MS";
 pub const SSLMODE_ENV: &str = "DELONIX_ORM_SSLMODE";
 /// Overrides the DSN's `sslrootcert`: a PEM file of roots to trust.
 pub const SSLROOTCERT_ENV: &str = "DELONIX_ORM_SSLROOTCERT";
+/// When truthy (`1`/`true`/`yes`/`on`), statements are sent unprepared —
+/// `conn.query(sql, …)` instead of `prepare_cached` (ADR 0007).
+///
+/// This is the switch for **PgBouncer in `transaction` pooling mode**: there a
+/// named prepared statement lives on a server connection that PgBouncer may
+/// hand to a different client on the next transaction, so a cached handle comes
+/// back as `prepared statement "sN" does not exist` (`26000`). Unprepared
+/// execution has no named handle to lose. It costs a Parse round trip per call —
+/// the price of running behind a transaction-mode pooler (DBA-03/H2).
+pub const NO_PREPARE_ENV: &str = "DELONIX_ORM_NO_PREPARE";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
@@ -81,6 +91,27 @@ static READ_ONLY: AtomicBool = AtomicBool::new(false);
 /// path free of an env lookup (and its lock + allocation) on every statement.
 /// `None` means the slow-query log is off; `Some(d)` is the threshold.
 static SLOW_QUERY: OnceLock<Option<Duration>> = OnceLock::new();
+
+/// Whether to skip `prepare_cached`, read from the environment exactly once.
+///
+/// Process configuration set at launch (for a transaction-mode pooler), not a
+/// per-call knob, so it is resolved on first use and cached off the hot path —
+/// like [`SLOW_QUERY`]. See [`NO_PREPARE_ENV`].
+static NO_PREPARE: OnceLock<bool> = OnceLock::new();
+
+/// `true` when statements must be sent unprepared (see [`NO_PREPARE_ENV`]).
+fn no_prepare() -> bool {
+    *NO_PREPARE.get_or_init(|| {
+        std::env::var(NO_PREPARE_ENV)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Read the configured DSN.
 pub fn dsn() -> Result<String> {
@@ -662,10 +693,16 @@ async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Pg
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
+        if no_prepare() {
+            return conn.query(sql, params).await.map_err(from_pg);
+        }
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.query(&stmt, params).await.map_err(from_pg);
     }
     let conn = acquire().await?;
+    if no_prepare() {
+        return conn.query(sql, params).await.map_err(from_pg);
+    }
     let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
     conn.query(&stmt, params).await.map_err(from_pg)
 }
@@ -696,10 +733,16 @@ async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64>
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
+        if no_prepare() {
+            return conn.execute(sql, params).await.map_err(from_pg);
+        }
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.execute(&stmt, params).await.map_err(from_pg);
     }
     let conn = acquire().await?;
+    if no_prepare() {
+        return conn.execute(sql, params).await.map_err(from_pg);
+    }
     let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
     conn.execute(&stmt, params).await.map_err(from_pg)
 }
