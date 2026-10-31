@@ -33,6 +33,7 @@ use dorm_core::row::Row;
 use dorm_core::value::Value;
 use serde_json::json;
 
+mod accounts;
 mod scaffold;
 mod studio;
 
@@ -147,10 +148,79 @@ enum CliCommand {
         #[command(subcommand)]
         action: ApiAction,
     },
+    /// Create an administrator account (`is_superuser`), Django-style. Native —
+    /// writes a hashed password into the `orm_accounts` table (created on demand),
+    /// never the plaintext. Prompts without echo; `--password`/`--password-stdin`
+    /// make it scriptable. See ADR 0009.
+    Createsuperuser {
+        /// The login name. Prompted for if omitted.
+        #[arg(long)]
+        username: Option<String>,
+        /// An optional email address. Left unset (NULL) if omitted.
+        #[arg(long)]
+        email: Option<String>,
+        /// The password. Visible to `ps` and shell history — prefer
+        /// `--password-stdin` or the interactive prompt for anything real.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the password from one line of stdin (no confirmation prompt).
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// Change a user's password. Native; prompts without echo (confirmed twice),
+    /// or takes `--password`/`--password-stdin`. See ADR 0009.
+    Changepassword {
+        /// The username whose password to change.
+        username: String,
+        /// The new password. See the note on `createsuperuser --password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the new password from one line of stdin.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// Administer accounts in the `orm_accounts` table. See ADR 0009.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
     /// Print a shell completion script to stdout (bash, zsh, fish, …).
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// List the accounts (read-only; never prints a hash). Honours `--json`.
+    List,
+    /// Create an account — a plain user unless `--superuser`.
+    Create {
+        /// The login name. Prompted for if omitted.
+        #[arg(long)]
+        username: Option<String>,
+        /// An optional email address.
+        #[arg(long)]
+        email: Option<String>,
+        /// The password. See the note on `createsuperuser --password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the password from one line of stdin.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+        /// Grant administrator rights (`is_superuser`).
+        #[arg(long)]
+        superuser: bool,
+    },
+    /// Delete an account by username. Confirms in a terminal; needs `--yes`
+    /// otherwise.
+    Delete {
+        /// The username to delete.
+        username: String,
+        /// Delete without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -372,6 +442,48 @@ fn main() -> ExitCode {
                 scaffold::api_generate(&schema, &out).map(|()| 0)
             }
             ApiAction::Serve => cargo_run("api", false),
+        },
+        CliCommand::Createsuperuser {
+            username,
+            email,
+            password,
+            password_stdin,
+        } => on_runtime(accounts::createsuperuser(
+            username,
+            email,
+            password,
+            password_stdin,
+            json,
+        )),
+        CliCommand::Changepassword {
+            username,
+            password,
+            password_stdin,
+        } => on_runtime(accounts::changepassword(
+            username,
+            password,
+            password_stdin,
+            json,
+        )),
+        CliCommand::User { action } => match action {
+            UserAction::List => on_runtime(accounts::user_list(json)),
+            UserAction::Create {
+                username,
+                email,
+                password,
+                password_stdin,
+                superuser,
+            } => on_runtime(accounts::user_create(
+                username,
+                email,
+                password,
+                password_stdin,
+                superuser,
+                json,
+            )),
+            UserAction::Delete { username, yes } => {
+                on_runtime(accounts::user_delete(username, yes, json))
+            }
         },
         CliCommand::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "dorm", &mut std::io::stdout());

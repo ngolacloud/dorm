@@ -64,3 +64,15 @@ tokio-postgres = { workspace = true }
 axum = "0.7"
 # Only to render the ledger's `applied_unix` as a readable UTC timestamp.
 chrono = { workspace = true, features = ["alloc"] }
+# Account administration (ADR 0009). `argon2` hashes a password into a
+# self-describing PHC string (`$argon2id$…`) — the roadmap's "never writes
+# incompatible hashes": the algorithm, version and parameters travel inside the
+# stored value, so any Argon2 verifier reads it back. `rpassword` reads a password
+# from the terminal without echoing it; the non-interactive flags/env/stdin paths
+# bypass it entirely.
+argon2 = "0.5"
+# `argon2` re-exports `password_hash`; naming it here with `getrandom` turns on
+# `OsRng` (the crate graph unifies to one `password-hash`), so the salt is drawn
+# from the OS CSPRNG.
+password-hash = { version = "0.5", features = ["getrandom"] }
+rpassword = "7"
