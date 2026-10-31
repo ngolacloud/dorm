@@ -33,6 +33,7 @@ use dorm_core::row::Row;
 use dorm_core::value::Value;
 use serde_json::json;
 
+mod accounts;
 mod scaffold;
 mod studio;
 
@@ -54,6 +55,19 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Answer "yes" to the confirmation on a destructive command, without
+    /// prompting. For scripts and `--yes`-style automation; the destructive
+    /// command still runs on the write path (a read-only session refuses it).
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
+
+    /// Run without ever prompting. Equivalent to `--yes` for the confirmation on
+    /// a destructive command: it proceeds without asking. A piped/scripted run
+    /// (no terminal) never blocks on a prompt regardless; this makes the intent
+    /// explicit and proceeds rather than refusing.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -74,6 +88,18 @@ enum CliCommand {
         /// Where to write the generated Rust.
         #[arg(long, default_value = "src/models.rs")]
         out: String,
+    },
+    /// Pretty-print `dorm.schema` into DORM's canonical form, in place. Native —
+    /// no project build, no database. Lossless: comments, every field and
+    /// block-level attribute and the `datasource` block are all preserved; only
+    /// layout changes (indentation, blank lines, aligned columns). Idempotent.
+    Format {
+        /// The schema file to read and rewrite.
+        #[arg(long, default_value = "dorm.schema")]
+        schema: String,
+        /// Do not write: exit 0 if the file is already formatted, 3 if not.
+        #[arg(long)]
+        check: bool,
     },
     /// Check your models for mistakes a query or migration would otherwise trip
     /// over — by building and running the project. (`cargo run --bin validate`.)
@@ -122,10 +148,79 @@ enum CliCommand {
         #[command(subcommand)]
         action: ApiAction,
     },
+    /// Create an administrator account (`is_superuser`), Django-style. Native —
+    /// writes a hashed password into the `orm_accounts` table (created on demand),
+    /// never the plaintext. Prompts without echo; `--password`/`--password-stdin`
+    /// make it scriptable. See ADR 0009.
+    Createsuperuser {
+        /// The login name. Prompted for if omitted.
+        #[arg(long)]
+        username: Option<String>,
+        /// An optional email address. Left unset (NULL) if omitted.
+        #[arg(long)]
+        email: Option<String>,
+        /// The password. Visible to `ps` and shell history — prefer
+        /// `--password-stdin` or the interactive prompt for anything real.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the password from one line of stdin (no confirmation prompt).
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// Change a user's password. Native; prompts without echo (confirmed twice),
+    /// or takes `--password`/`--password-stdin`. See ADR 0009.
+    Changepassword {
+        /// The username whose password to change.
+        username: String,
+        /// The new password. See the note on `createsuperuser --password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the new password from one line of stdin.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// Administer accounts in the `orm_accounts` table. See ADR 0009.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
     /// Print a shell completion script to stdout (bash, zsh, fish, …).
     Completions {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// List the accounts (read-only; never prints a hash). Honours `--json`.
+    List,
+    /// Create an account — a plain user unless `--superuser`.
+    Create {
+        /// The login name. Prompted for if omitted.
+        #[arg(long)]
+        username: Option<String>,
+        /// An optional email address.
+        #[arg(long)]
+        email: Option<String>,
+        /// The password. See the note on `createsuperuser --password`.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the password from one line of stdin.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+        /// Grant administrator rights (`is_superuser`).
+        #[arg(long)]
+        superuser: bool,
+    },
+    /// Delete an account by username. Confirms in a terminal; needs `--yes`
+    /// otherwise.
+    Delete {
+        /// The username to delete.
+        username: String,
+        /// Delete without the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -177,10 +272,38 @@ enum MigrateAction {
         #[arg(default_value = "migration")]
         name: String,
     },
+    /// Author the next migration from your models **and apply it**, in one step —
+    /// `prisma migrate dev`. The development loop: `make` the migration, then
+    /// `deploy` it. Equivalent to `dorm migrate make <name>` followed by `dorm
+    /// migrate deploy`. (Cargo lane: `makemigration` then `migrate`.)
+    Dev {
+        /// A short name for the migration, e.g. `add_body`.
+        #[arg(default_value = "migration")]
+        name: String,
+    },
     /// Apply the recorded migration chain in `migrations/` (or the initial
     /// schema when there is none yet). The default when `migrate` is given no
     /// subcommand. Like `prisma migrate deploy`. (`cargo run --bin migrate`.)
     Deploy,
+    /// Mark a migration version as applied in the ledger **without running its
+    /// SQL** — recovery after you fixed the schema by hand (`prisma migrate
+    /// resolve --applied`). Native: it inserts one row into
+    /// `orm_schema_migrations`.
+    ///
+    /// It never marks a version applied unless you name that version here, and it
+    /// refuses a version the ledger already records. The migration's name is read
+    /// from `migrations/` for the given version, or pass `--name` when the
+    /// version is not on disk (e.g. the fallback initial migration).
+    Resolve {
+        /// The exact migration version to record as applied. Required — there is
+        /// no default and no "latest": the operator must name the version.
+        version: i64,
+        /// The name to store for the version. Optional: when omitted it is read
+        /// from the migration file in `migrations/`. Required when the version is
+        /// not recorded on disk.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Show which migration versions the database has recorded as applied.
     Status,
     /// Show the additive changes `push` would apply, without touching the
@@ -280,6 +403,9 @@ fn main() -> ExitCode {
         std::env::set_var(db::DSN_ENV, dsn);
     }
     let json = cli.json;
+    // `--yes`/`--non-interactive` both mean "do not prompt me; proceed". They
+    // reach only the destructive commands, which pass this to `confirm`.
+    let assume_yes = cli.yes || cli.non_interactive;
 
     let result: CliResult = match cli.command {
         CliCommand::Init { name } => scaffold::init(name.as_deref()).map(|()| 0),
@@ -287,17 +413,22 @@ fn main() -> ExitCode {
             what: NewKind::Model { name },
         } => scaffold::new_model(&name).map(|()| 0),
         CliCommand::Generate { schema, out } => scaffold::generate(&schema, &out).map(|()| 0),
+        CliCommand::Format { schema, check } => scaffold::format(&schema, check),
         CliCommand::Validate => cargo_run("validate", json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
             MigrateAction::Make { name } => cargo_run_args("makemigration", &[&name], false),
+            MigrateAction::Dev { name } => migrate_dev(&name),
             MigrateAction::Deploy => cargo_run("migrate", false),
+            MigrateAction::Resolve { version, name } => {
+                on_runtime(migrate_resolve(version, name, json))
+            }
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
         },
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
-        CliCommand::Db { action } => on_runtime(run_db(action, json)),
+        CliCommand::Db { action } => on_runtime(run_db(action, json, assume_yes)),
         CliCommand::Studio {
             action,
             port,
@@ -311,6 +442,48 @@ fn main() -> ExitCode {
                 scaffold::api_generate(&schema, &out).map(|()| 0)
             }
             ApiAction::Serve => cargo_run("api", false),
+        },
+        CliCommand::Createsuperuser {
+            username,
+            email,
+            password,
+            password_stdin,
+        } => on_runtime(accounts::createsuperuser(
+            username,
+            email,
+            password,
+            password_stdin,
+            json,
+        )),
+        CliCommand::Changepassword {
+            username,
+            password,
+            password_stdin,
+        } => on_runtime(accounts::changepassword(
+            username,
+            password,
+            password_stdin,
+            json,
+        )),
+        CliCommand::User { action } => match action {
+            UserAction::List => on_runtime(accounts::user_list(json)),
+            UserAction::Create {
+                username,
+                email,
+                password,
+                password_stdin,
+                superuser,
+            } => on_runtime(accounts::user_create(
+                username,
+                email,
+                password,
+                password_stdin,
+                superuser,
+                json,
+            )),
+            UserAction::Delete { username, yes } => {
+                on_runtime(accounts::user_delete(username, yes, json))
+            }
         },
         CliCommand::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "dorm", &mut std::io::stdout());
@@ -364,6 +537,19 @@ fn cargo_run_args(bin: &str, args: &[&str], json: bool) -> CliResult {
         )
     })?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// `dorm migrate dev [name]`: author the next migration from the models and
+/// apply it, in one step — `prisma migrate dev`. Two cargo-lane runs, in order:
+/// `makemigration <name>` writes the migration file (or reports "no changes"),
+/// then `migrate` applies the chain. If `makemigration` fails we stop and
+/// surface its exit code, so a broken `make` never silently proceeds to deploy.
+fn migrate_dev(name: &str) -> CliResult {
+    let made = cargo_run_args("makemigration", &[name], false)?;
+    if made != 0 {
+        return Ok(made);
+    }
+    cargo_run("migrate", false)
 }
 
 /// Hide the password in a DSN before echoing it. libpq spells the secret
@@ -563,6 +749,120 @@ async fn migrate_status(json: bool) -> CliResult {
     Ok(0)
 }
 
+/// The migrations ledger, matching `dorm_migrations::migrator` (kept out of its
+/// public surface). `migrate status` reads it; `migrate resolve` writes one row.
+const LEDGER: &str = "orm_schema_migrations";
+
+/// `dorm migrate resolve <version> [--name <name>]`: mark a migration version as
+/// applied in the ledger **without running its SQL** — Prisma's `migrate resolve
+/// --applied`, for after a manual schema fix.
+///
+/// The operator must name the exact `version`; there is no "latest" and no
+/// default, so a version is never marked applied by accident. An already-recorded
+/// version is refused (idempotence would hide a mistake here). The name is read
+/// from the on-disk history in `migrations/` for that version — a pure files
+/// operation, no compiled models — or taken from `--name` when the version is not
+/// on disk (the fallback initial migration, say). The version travels as a bound
+/// parameter; nothing is ever spliced into the SQL.
+async fn migrate_resolve(version: i64, name: Option<String>, json: bool) -> CliResult {
+    // Resolve the name honestly before touching the database: prefer the explicit
+    // `--name`, else read it from the migration file for this version. A version
+    // with neither is an error — we will not invent a name.
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let history = dorm_migrations::History::open("migrations");
+            let recorded = history.load().map_err(|e| {
+                format!("reading the migrations/ history to find v{version}'s name: {e}")
+            })?;
+            match recorded.into_iter().find(|m| m.version == version) {
+                Some(m) => m.name,
+                None => {
+                    return Err(format!(
+                        "no migration v{version} in migrations/, so its name is unknown; \
+                         pass --name <name> to record it"
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+
+    db::guard_write("migrate resolve")?;
+    let is_postgres = db::backend_of(&db::dsn()?) == db::Backend::Postgres;
+
+    // Ensure the ledger exists with exactly the migrator's shape, so a resolve on
+    // a database that has never been migrated still has somewhere to write.
+    db::run_ddl(&format!(
+        "CREATE TABLE IF NOT EXISTS {LEDGER} \
+         (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_unix BIGINT NOT NULL)"
+    ))
+    .await?;
+
+    // `$1` on PostgreSQL, `?1` on SQLite — the one placeholder difference the two
+    // dialects force; the bound value is identical and never spliced.
+    let one = if is_postgres { "$1" } else { "?1" };
+    let already = db::fetch(
+        &format!("SELECT name FROM {LEDGER} WHERE version = {one}"),
+        &[Value::I64(version)],
+    )
+    .await?;
+    if let Some(row) = already.first() {
+        let existing: String = row.try_get::<String>(0)?;
+        return Err(format!(
+            "migration v{version} is already recorded as applied ({existing}); \
+             resolve will not touch it"
+        )
+        .into());
+    }
+
+    let insert = if is_postgres {
+        format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES ($1, $2, $3)")
+    } else {
+        format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES (?1, ?2, ?3)")
+    };
+    let applied_unix = now_unix();
+    db::run(
+        &insert,
+        &[
+            Value::I64(version),
+            Value::Text(name.clone()),
+            Value::I64(applied_unix),
+        ],
+    )
+    .await?;
+
+    if json {
+        println!(
+            "{}",
+            json!({
+                "resolved": {
+                    "version": version,
+                    "name": name,
+                    "applied_unix": applied_unix,
+                    "applied_at": applied_at(applied_unix),
+                }
+            })
+        );
+    } else {
+        println!(
+            "resolved: marked v{version} ({name}) applied at {} — its SQL was not run.",
+            applied_at(applied_unix)
+        );
+    }
+    Ok(0)
+}
+
+/// Seconds since the Unix epoch, for the ledger's `applied_unix` stamp — the same
+/// wall-clock metadata the migrator records, not a value a query reasons about.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Render the ledger's Unix seconds as a readable UTC stamp, falling back to the
 /// raw number if it is somehow out of range.
 fn applied_at(unix: i64) -> String {
@@ -572,7 +872,7 @@ fn applied_at(unix: i64) -> String {
     }
 }
 
-async fn run_db(action: DbAction, json: bool) -> CliResult {
+async fn run_db(action: DbAction, json: bool, assume_yes: bool) -> CliResult {
     match action {
         DbAction::Tables => db_tables(json).await,
         DbAction::Show { table } => db_show(&table, json).await,
@@ -583,10 +883,74 @@ async fn run_db(action: DbAction, json: bool) -> CliResult {
             filter,
         } => db_rows(&table, limit, filter.as_deref(), json).await,
         DbAction::Pull { out } => db_pull(&out).await,
-        DbAction::Execute { sql, params, write } => db_execute(&sql, &params, write, json).await,
+        DbAction::Execute { sql, params, write } => {
+            db_execute(&sql, &params, write, json, assume_yes).await
+        }
         DbAction::Shell => db_shell(),
-        DbAction::Seed { file } => db_seed(&file, json).await,
+        DbAction::Seed { file } => db_seed(&file, json, assume_yes).await,
     }
+}
+
+/// Whether the confirmation can be settled without an interactive prompt — true
+/// when `--yes`/`--non-interactive` was passed, or stdin is not a terminal (a
+/// piped or scripted run we must never block waiting for an answer). When this is
+/// true, [`confirm`] does not prompt; it proceeds iff the user asked to (`--yes`),
+/// so a scripted run never hangs.
+///
+/// Kept pure (no I/O) so its logic is unit-tested directly.
+fn settled_without_prompt(assume_yes: bool, stdin_is_tty: bool) -> bool {
+    assume_yes || !stdin_is_tty
+}
+
+/// The confirmation decision, factored out of all I/O so it can be tested.
+/// `read_line` is called only when an interactive prompt is warranted (a terminal
+/// and no `--yes`), so a non-tty run never reads and never blocks.
+///
+/// * `--yes`/`--non-interactive` → proceed (`true`), no read.
+/// * no terminal, no `--yes` → do not proceed (`false`): a destructive action
+///   nobody consented to is refused rather than run silently — and without
+///   blocking, since `read_line` is not called.
+/// * a terminal, no `--yes` → read the answer; `y`/`yes` (any case) proceeds.
+fn confirm_decision(
+    assume_yes: bool,
+    stdin_is_tty: bool,
+    read_line: impl FnOnce() -> std::io::Result<String>,
+) -> std::io::Result<bool> {
+    if settled_without_prompt(assume_yes, stdin_is_tty) {
+        return Ok(assume_yes);
+    }
+    let answer = read_line()?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Ask the user to confirm a destructive action, returning whether to proceed.
+///
+/// On a terminal it prints `{question} [y/N] ` to stderr (so `--json` on stdout
+/// stays clean) and reads one line. With `--yes`/`--non-interactive` it proceeds
+/// without asking; with neither and no terminal (piped/scripted) it refuses
+/// without blocking — the honest "never run a destructive statement nobody could
+/// confirm" default. See [`confirm_decision`] for the full truth table.
+fn confirm(question: &str, assume_yes: bool) -> std::io::Result<bool> {
+    use std::io::{IsTerminal, Write};
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    confirm_decision(assume_yes, stdin_is_tty, || {
+        let mut err = std::io::stderr();
+        write!(err, "{question} [y/N] ")?;
+        err.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line)
+    })
+}
+
+/// The database a destructive command will touch, redacted, for the confirmation
+/// message. Falls back to a neutral phrase when no DSN is configured (the command
+/// itself will then fail with the real "no database configured" error).
+fn confirm_target() -> String {
+    db::dsn().map_or_else(|_| "the database".to_string(), |d| redact(&d))
 }
 
 /// `dorm db shell`: open the native PostgreSQL client on the configured database.
@@ -605,9 +969,22 @@ fn db_shell() -> CliResult {
 /// file is applied as one batch (so it may contain multiple statements, a
 /// function body, a transaction). Writes — it is a seed — so it runs on the write
 /// path; a read-only session still refuses it.
-async fn db_seed(file: &str, json: bool) -> CliResult {
+async fn db_seed(file: &str, json: bool, assume_yes: bool) -> CliResult {
     let sql = std::fs::read_to_string(file)
         .map_err(|e| format!("reading {file}: {e} (create it, or pass --file)"))?;
+    // A seed file is arbitrary SQL applied as one batch — genuinely destructive
+    // (it can DROP/TRUNCATE/overwrite). Confirm before the write path. `--yes`
+    // proceeds; a non-interactive run with neither flag refuses without blocking.
+    if !confirm(
+        &format!(
+            "This will run the seed file `{file}` (arbitrary writes) against {target}. Continue?",
+            target = confirm_target()
+        ),
+        assume_yes,
+    )? {
+        eprintln!("aborted; nothing was run (pass --yes to proceed non-interactively).");
+        return Ok(1);
+    }
     db::guard_write("seed")?;
     db::run_ddl(&sql).await?;
     if json {
@@ -623,7 +1000,13 @@ async fn db_seed(file: &str, json: bool) -> CliResult {
 /// which calls `guard_write` first — so a read-only session refuses them — and
 /// print the affected-row count. Every `--param` is a bound `$n`; the SQL text is
 /// never parsed, and no value is ever formatted into it.
-async fn db_execute(sql: &str, params: &[String], write: bool, json: bool) -> CliResult {
+async fn db_execute(
+    sql: &str,
+    params: &[String],
+    write: bool,
+    json: bool,
+    assume_yes: bool,
+) -> CliResult {
     // Every user value binds as a text parameter. This is the whole point of the
     // valve: the statement is opaque and the values travel as `$1`, `$2`, …,
     // never spliced into the SQL. A text parameter is used directly where it meets
@@ -632,6 +1015,23 @@ async fn db_execute(sql: &str, params: &[String], write: bool, json: bool) -> Cl
     let bound: Vec<Value> = params.iter().map(|p| Value::Text(p.clone())).collect();
 
     if write {
+        // Guard the clearly irreversible statements — DROP, TRUNCATE, and an
+        // unqualified DELETE (no WHERE) — behind a confirmation. `--yes` proceeds;
+        // a non-interactive run with neither flag refuses without blocking. A
+        // targeted DELETE/UPDATE/INSERT is not prompted: the gate is for the
+        // bulk-irreversible slip, not every write.
+        if let Some(kind) = destructive_kind(sql) {
+            if !confirm(
+                &format!(
+                    "This will run a destructive statement ({kind}) against {target}. Continue?",
+                    target = confirm_target()
+                ),
+                assume_yes,
+            )? {
+                eprintln!("aborted; nothing was run (pass --yes to proceed non-interactively).");
+                return Ok(1);
+            }
+        }
         // The write path. `sql_execute` runs `guard_write` first, so a read-only
         // session refuses this with `Error::ReadOnly`, exactly like a compiled
         // write — the escape hatch does not escape the read-only rule.
@@ -745,6 +1145,33 @@ fn looks_like_read(sql: &str) -> bool {
         leading_keyword(sql).as_str(),
         "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN"
     )
+}
+
+/// Classify a write statement as irreversible-at-a-stroke, for the destructive
+/// confirmation — `Some("DROP")`, `Some("TRUNCATE")`, or `Some("DELETE without
+/// WHERE")` for a `DELETE` with no `WHERE` clause; `None` for a targeted write
+/// (an `INSERT`, `UPDATE`, or a `DELETE … WHERE …`) that is not prompted.
+///
+/// Lexical by the same honesty as [`looks_like_read`]: it reads the leading
+/// keyword, and for `DELETE` scans for a `WHERE` token. It can miss a destructive
+/// write hidden behind another keyword (`WITH … AS (DELETE …)`), and a `WHERE` in
+/// a string literal would make an unqualified `DELETE` look qualified — it errs
+/// toward *not* over-prompting a targeted write, never toward silently skipping a
+/// bare `DROP`/`TRUNCATE`. It is a fat-finger guard, not a safety boundary.
+fn destructive_kind(sql: &str) -> Option<&'static str> {
+    match leading_keyword(sql).as_str() {
+        "DROP" => Some("DROP"),
+        "TRUNCATE" => Some("TRUNCATE"),
+        "DELETE" if !has_where_token(sql) => Some("DELETE without WHERE"),
+        _ => None,
+    }
+}
+
+/// Whether the statement has a bare `WHERE` keyword token (case-insensitive),
+/// split on non-alphanumeric boundaries so `nowhere`/`somewhere` do not match.
+fn has_where_token(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("where"))
 }
 
 /// Render one PostgreSQL cell as a string, over the closed set of column types the
@@ -1175,4 +1602,77 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
 /// a real table or column, so the doubling of `"` is belt-and-braces.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settled_without_prompt_truth_table() {
+        // `--yes` (or `--non-interactive`, which maps to the same flag) → settled.
+        assert!(settled_without_prompt(true, true));
+        assert!(settled_without_prompt(true, false));
+        // No flag but a terminal → must prompt (not settled).
+        assert!(!settled_without_prompt(false, true));
+        // No flag and no terminal (piped/scripted) → settled; never block on a tty.
+        assert!(settled_without_prompt(false, false));
+    }
+
+    #[test]
+    fn confirm_decision_yes_flag_proceeds_without_reading() {
+        // `--yes`: proceed, and the reader must never be consulted.
+        let r =
+            confirm_decision(true, true, || panic!("must not prompt when --yes is set")).unwrap();
+        assert!(r);
+    }
+
+    #[test]
+    fn confirm_decision_non_interactive_proceeds() {
+        // `--non-interactive` reaches here as `assume_yes = true`; proceeds, no read.
+        let r = confirm_decision(true, false, || {
+            panic!("must not prompt when non-interactive")
+        })
+        .unwrap();
+        assert!(r);
+    }
+
+    #[test]
+    fn confirm_decision_non_tty_without_yes_refuses_without_blocking() {
+        // A mocked non-tty with no `--yes`: do not proceed, and never read stdin
+        // (so a scripted run cannot block). This is the "refuse" default.
+        let r =
+            confirm_decision(false, false, || panic!("must not read stdin on a non-tty")).unwrap();
+        assert!(!r);
+    }
+
+    #[test]
+    fn confirm_decision_tty_reads_the_answer() {
+        // A terminal with no `--yes`: the answer decides, case/whitespace-insensitive.
+        assert!(confirm_decision(false, true, || Ok("y\n".into())).unwrap());
+        assert!(confirm_decision(false, true, || Ok("  YES ".into())).unwrap());
+        assert!(!confirm_decision(false, true, || Ok("n\n".into())).unwrap());
+        assert!(!confirm_decision(false, true, || Ok("\n".into())).unwrap()); // default No
+        assert!(!confirm_decision(false, true, || Ok(String::new())).unwrap()); // EOF → No
+    }
+
+    #[test]
+    fn destructive_kind_flags_the_irreversible_only() {
+        assert_eq!(destructive_kind("DROP TABLE users"), Some("DROP"));
+        assert_eq!(destructive_kind("  truncate posts"), Some("TRUNCATE"));
+        assert_eq!(
+            destructive_kind("DELETE FROM users"),
+            Some("DELETE without WHERE")
+        );
+        // A targeted write is not prompted.
+        assert_eq!(destructive_kind("DELETE FROM users WHERE id = $1"), None);
+        assert_eq!(destructive_kind("delete from users where id=1"), None);
+        assert_eq!(destructive_kind("UPDATE users SET name = $1"), None);
+        assert_eq!(destructive_kind("INSERT INTO users VALUES ($1)"), None);
+        // `WHERE` as a substring of an identifier must not count as a clause.
+        assert_eq!(
+            destructive_kind("DELETE FROM nowhere_logs"),
+            Some("DELETE without WHERE")
+        );
+    }
 }
