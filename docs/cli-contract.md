@@ -47,7 +47,7 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
 | `dorm migrate resolve` | Reconcile ledger after manual recovery. | — | **planned** | Must never mark applied without evidence. |
 | `dorm db shell` | Open the native DB client (`psql`) on the configured database. | 0/1 | **done** | Native; hands you to `psql` with the DSN, then everything is `psql`. (Was `dorm dbshell` — now a `db` subcommand.) |
-| `dorm createsuperuser` / `changepassword` / `user …` | Application-account admin. | — | **planned** | Via an accounts adapter; never writes incompatible hashes — see roadmap §accounts. |
+| `dorm createsuperuser` / `changepassword` / `dorm user list\|create\|delete` | Application-account admin. | 0/1 | **done** | Native; the `orm_accounts` table is created on demand. Argon2id passwords stored as self-describing PHC strings (`$argon2id$…`) — never plaintext, never an incompatible hash. No-echo prompt, or `--password`/`--password-stdin` for scripts; every value bound (ADR 0005), writes honour the read-only guard; `user list` honours `--json` and never prints a hash. See [ADR 0009](adr/0009-accounts-admin.md). The pluggable per-application **accounts adapter** (roadmap §accounts) is the remaining work. |
 
 ## JSON shapes (stable)
 
