@@ -24,7 +24,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -71,7 +71,8 @@ pub async fn serve(port: u16, writable: bool) -> Result<(), String> {
                 .post(insert_row)
                 .patch(update_row)
                 .delete(delete_row),
-        );
+        )
+        .route("/api/tables/:model/export.csv", get(export_csv));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -193,12 +194,52 @@ async fn get_rows(
         .unwrap_or(0)
         .max(0);
 
-    // The filters are shared by the page and the count, so the total matches
-    // the view. Every value is a bound parameter; the field is checked against
-    // the model before it is used.
+    // Filters are shared by the page and the count, so the total matches the
+    // view. Every value is a bound parameter; each field is checked against the
+    // model before it is used.
+    let filters = list_filters(meta, &model, &q)?;
+
+    // Count with the same filters, ordering suppressed.
+    let mut cplan = Plan::new(meta);
+    cplan.filters = filters.clone();
+    cplan.unordered = true;
+    let csql = compiler::compile_count_on(&cplan, db::dialect())?;
+    let total: i64 = match db::sql(&csql.text, &csql.params).await?.first() {
+        Some(r) => r.try_get::<i64>(0)?,
+        None => 0,
+    };
+
+    // The page.
+    let mut plan = Plan::new(meta);
+    plan.filters = filters;
+    plan.order = order_terms(&fields, &q);
+    plan.limit = Some(limit);
+    plan.offset = Some(offset);
+    let rows = fetch_value_rows(&plan).await?;
+    let data: Vec<JsonValue> = rows.iter().map(|r| value_row_to_json(r, meta)).collect();
+
+    Ok(Json(json!({
+        "columns": fields,
+        "rows": data,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+/// The most rows a CSV export streams, so a huge table cannot pull unbounded.
+const CSV_MAX: i64 = 100_000;
+
+/// The request's exact filter and global search as `Q`s — shared by the paged
+/// read, its count, and the CSV export, so all three select the same rows.
+fn list_filters(
+    meta: &'static ModelMeta,
+    model: &str,
+    q: &HashMap<String, String>,
+) -> Result<Vec<Q>, StudioError> {
     let mut filters: Vec<Q> = Vec::new();
     if let (Some(col), Some(val)) = (q.get("filterCol"), q.get("filterVal")) {
-        let f = field_of(meta, col, &model)?;
+        let f = field_of(meta, col, model)?;
         filters.push(Q::new(
             col.clone(),
             coerce(f.ty, &JsonValue::String(val.clone()))?,
@@ -219,40 +260,101 @@ async fn get_rows(
             filters.push(search);
         }
     }
+    Ok(filters)
+}
 
-    // Count with the same filters, ordering suppressed.
-    let mut cplan = Plan::new(meta);
-    cplan.filters = filters.clone();
-    cplan.unordered = true;
-    let csql = compiler::compile_count_on(&cplan, db::dialect())?;
-    let total: i64 = match db::sql(&csql.text, &csql.params).await?.first() {
-        Some(r) => r.try_get::<i64>(0)?,
-        None => 0,
-    };
-
-    // The page.
-    let mut plan = Plan::new(meta);
-    plan.filters = filters;
-    if let Some(col) = q.get("orderBy").filter(|c| fields.contains(&c.as_str())) {
-        let desc = q.get("dir").map(String::as_str) == Some("desc");
-        plan.order = vec![OrderBy::parse(&format!(
-            "{}{}",
-            if desc { "-" } else { "" },
-            col
-        ))];
+/// The request's sort as an `OrderBy`, if `orderBy` names a field.
+fn order_terms(fields: &[&str], q: &HashMap<String, String>) -> Vec<OrderBy> {
+    match q.get("orderBy").filter(|c| fields.contains(&c.as_str())) {
+        Some(col) => {
+            let desc = q.get("dir").map(String::as_str) == Some("desc");
+            vec![OrderBy::parse(&format!(
+                "{}{}",
+                if desc { "-" } else { "" },
+                col
+            ))]
+        }
+        None => Vec::new(),
     }
-    plan.limit = Some(limit);
-    plan.offset = Some(offset);
-    let rows = fetch_value_rows(&plan).await?;
-    let data: Vec<JsonValue> = rows.iter().map(|r| value_row_to_json(r, meta)).collect();
+}
 
-    Ok(Json(json!({
-        "columns": fields,
-        "rows": data,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })))
+/// `GET /api/tables/<model>/export.csv` — the current view as a CSV download,
+/// with the same filter, search and sort as the grid, capped at [`CSV_MAX`] rows.
+async fn export_csv(
+    Path(model): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, StudioError> {
+    let meta = model_of(&model)?;
+    let fields: Vec<&str> = meta.fields.iter().map(|f| f.name).collect();
+    let mut plan = Plan::new(meta);
+    plan.filters = list_filters(meta, &model, &q)?;
+    plan.order = order_terms(&fields, &q);
+    plan.limit = Some(CSV_MAX);
+    let rows = fetch_value_rows(&plan).await?;
+
+    let mut out = String::new();
+    out.push_str(&csv_line(
+        &fields.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    ));
+    for row in &rows {
+        let cells: Vec<String> = meta
+            .fields
+            .iter()
+            .map(|f| {
+                row.get(f.name)
+                    .or_else(|| row.get(f.column))
+                    .map(value_to_cell)
+                    .unwrap_or_default()
+            })
+            .collect();
+        out.push_str(&csv_line(&cells));
+    }
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{model}.csv\""),
+            ),
+        ],
+        out,
+    )
+        .into_response())
+}
+
+/// An ORM [`Value`] as a CSV cell: a `NULL` is an empty field, scalars their
+/// text, and the rest (decimal, timestamp, uuid, json) their string form.
+fn value_to_cell(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::I32(n) => n.to_string(),
+        Value::I64(n) => n.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Timestamp(t) => t.to_rfc3339(),
+        Value::Uuid(u) => u.to_string(),
+        Value::Json(j) => j.to_string(),
+    }
+}
+
+/// One CSV record (RFC 4180): a field with a comma, quote or newline is wrapped
+/// in quotes with its own quotes doubled; the line ends `\r\n`.
+fn csv_line(cells: &[String]) -> String {
+    let escaped: Vec<String> = cells
+        .iter()
+        .map(|c| {
+            if c.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    let mut line = escaped.join(",");
+    line.push_str("\r\n");
+    line
 }
 
 /// `POST /api/tables/<model>/rows` — insert one row from `{ "values": {field: …} }`

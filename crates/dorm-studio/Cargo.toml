@@ -1,6 +1,8 @@
 [package]
 name = "dorm-studio"
-version = "0.1.0"
+# 0.1.1: CSV export and foreign-key relation editing (patch so `dorm-studio =
+# "0.1"` in generated projects keeps resolving).
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

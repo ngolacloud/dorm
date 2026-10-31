@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -68,7 +68,8 @@ pub async fn serve(port: u16, writable: bool) -> crate::CliResult {
                 .post(insert_row)
                 .patch(update_row)
                 .delete(delete_row),
-        );
+        )
+        .route("/api/tables/:table/export.csv", get(export_csv));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -238,52 +239,7 @@ async fn get_rows(
         .unwrap_or(0)
         .max(0);
 
-    // A WHERE shared by the page query and its count, so the total matches the
-    // filtered view. Values are the only bound parameters; a column is quoted
-    // only after being checked against the table's own columns.
-    let mut conds: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
-    // An exact-match column filter (the filter box / a foreign-key jump).
-    if let (Some(col), Some(val)) = (q.get("filterCol"), q.get("filterVal")) {
-        if !names.contains(&col.as_str()) {
-            return Err(StudioError::bad(format!("no column `{col}` on `{table}`")));
-        }
-        params.push(val.clone());
-        conds.push(format!("{}::text = ${}", quote_ident(col), params.len()));
-    }
-    // A global search: a case-insensitive substring match against every column,
-    // the Studio's "search any field". The term is escaped so its own `%`/`_`
-    // are literal, then bound once and reused across the columns' `ILIKE`s.
-    if let Some(term) = q.get("search").filter(|s| !s.is_empty()) {
-        let esc = term
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        params.push(format!("%{esc}%"));
-        let n = params.len();
-        let ors: Vec<String> = names
-            .iter()
-            .map(|c| format!("{}::text ILIKE ${n} ESCAPE '\\'", quote_ident(c)))
-            .collect();
-        conds.push(format!("({})", ors.join(" OR ")));
-    }
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conds.join(" AND "))
-    };
-
-    let order_clause = match q.get("orderBy").filter(|c| names.contains(&c.as_str())) {
-        Some(col) => {
-            let dir = if q.get("dir").map(String::as_str) == Some("desc") {
-                "DESC"
-            } else {
-                "ASC"
-            };
-            format!(" ORDER BY {} {}", quote_ident(col), dir)
-        }
-        None => String::new(),
-    };
+    let (where_clause, order_clause, params) = where_order(&table, &names, &q)?;
 
     let select = names
         .iter()
@@ -321,6 +277,126 @@ async fn get_rows(
         "limit": limit,
         "offset": offset,
     })))
+}
+
+/// The most rows a CSV export streams, so a huge table cannot pull unbounded.
+const CSV_MAX: i64 = 100_000;
+
+/// Build the `WHERE` and `ORDER BY` a listing shares — the exact filter, the
+/// global search, and the sort — with every value a bound parameter and every
+/// column checked against the table first. Shared by the paged read and the CSV
+/// export so the two see exactly the same rows.
+fn where_order(
+    table: &str,
+    names: &[&str],
+    q: &HashMap<String, String>,
+) -> Result<(String, String, Vec<String>), StudioError> {
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if let (Some(col), Some(val)) = (q.get("filterCol"), q.get("filterVal")) {
+        if !names.contains(&col.as_str()) {
+            return Err(StudioError::bad(format!("no column `{col}` on `{table}`")));
+        }
+        params.push(val.clone());
+        conds.push(format!("{}::text = ${}", quote_ident(col), params.len()));
+    }
+    if let Some(term) = q.get("search").filter(|s| !s.is_empty()) {
+        let esc = term
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        params.push(format!("%{esc}%"));
+        let n = params.len();
+        let ors: Vec<String> = names
+            .iter()
+            .map(|c| format!("{}::text ILIKE ${n} ESCAPE '\\'", quote_ident(c)))
+            .collect();
+        conds.push(format!("({})", ors.join(" OR ")));
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let order_clause = match q.get("orderBy").filter(|c| names.contains(&c.as_str())) {
+        Some(col) => {
+            let dir = if q.get("dir").map(String::as_str) == Some("desc") {
+                "DESC"
+            } else {
+                "ASC"
+            };
+            format!(" ORDER BY {} {}", quote_ident(col), dir)
+        }
+        None => String::new(),
+    };
+    Ok((where_clause, order_clause, params))
+}
+
+/// `GET /api/tables/:table/export.csv` — the current view as a CSV download, with
+/// the same filter, search and sort as the grid, capped at [`CSV_MAX`] rows.
+async fn export_csv(
+    Path(table): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, StudioError> {
+    let cols = require_table(&table).await?;
+    let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+    let (where_clause, order_clause, params) = where_order(&table, &names, &q)?;
+    let select = names
+        .iter()
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {select} FROM {}{}{} LIMIT {}",
+        quote_ident(&table),
+        where_clause,
+        order_clause,
+        CSV_MAX
+    );
+    let bound: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+    let rows = db::query(&sql, &bound).await?;
+
+    let mut out = String::new();
+    out.push_str(&csv_line(
+        &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    ));
+    for row in &rows {
+        let cells: Vec<String> = (0..names.len())
+            .map(|i| row.get::<_, Option<String>>(i).unwrap_or_default())
+            .collect();
+        out.push_str(&csv_line(&cells));
+    }
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{table}.csv\""),
+            ),
+        ],
+        out,
+    )
+        .into_response())
+}
+
+/// One CSV record (RFC 4180): a field with a comma, quote or newline is wrapped
+/// in quotes with its own quotes doubled; the line ends `\r\n`. A SQL `NULL`
+/// arrives as an empty field.
+fn csv_line(cells: &[String]) -> String {
+    let escaped: Vec<String> = cells
+        .iter()
+        .map(|c| {
+            if c.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    let mut line = escaped.join(",");
+    line.push_str("\r\n");
+    line
 }
 
 /// `POST /api/tables/:table/rows` — insert one row from `{ "values": {col: …} }`
