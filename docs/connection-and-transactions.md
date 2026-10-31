@@ -129,7 +129,29 @@ The session is *also* opened `READ ONLY` at the server (the real guard); the fla
 exists so the refusal names the operation instead of surfacing a raw PostgreSQL
 error.
 
+## Interactive transactions (the shell)
+
+`atomic` brackets a single future. The [shell](cli-contract.md#commands) (`dorm
+shell`, `--write`) also exposes transactions **interactively**, held open across
+commands:
+
+```text
+dorm*> :begin
+dorm*> insert Author name=Ada
+dorm*> insert Author name=Grace
+dorm*> Author                 # the session sees its own uncommitted rows
+dorm*> :commit                # …persisted atomically  (or :rollback to discard)
+```
+
+`:begin` opens a transaction on a dedicated connection; every following command
+runs on it, so a read sees the uncommitted work and a failed statement aborts
+the transaction. `:commit` persists everything at once; `:rollback` — or leaving
+the shell with a transaction open — discards it. Nothing a session began but did
+not commit is ever left written (ADR 0006).
+
 ## Next
 
 - [Migrations](migrations.md) — create the schema this connection runs against.
 - [Making queries](queries.md) — the full query API.
+- [DORM Studio](studio.md) — browse and edit over the same connection, read-only
+  unless `--write`.

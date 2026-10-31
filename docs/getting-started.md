@@ -112,7 +112,7 @@ FROM "posts" WHERE "posts"."title" ILIKE $1 ORDER BY "posts"."published_at" DESC
 
 The value `"rust"` is **not** in the SQL — it is parameter `$1`.
 
-> Everything up to here is exactly what [`cargo run -p dorm-example`](../crates/dorm-example)
+> Everything up to here is exactly what [`cargo run -p dorm-example`](https://github.com/ngolacloud/dorm/tree/main/crates/dorm-example)
 > prints. Run it to see steps 3 and 4 live.
 
 ## 5. Point DORM at a database and run it

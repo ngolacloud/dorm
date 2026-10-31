@@ -1,0 +1,27 @@
+[book]
+title = "DORM — the Delonix ORM"
+authors = ["NgolaCloud"]
+description = "A Django-shaped, compile-time-typed ORM for PostgreSQL — a Prisma-style schema, a migration generator, a CLI, and Studio."
+language = "en"
+# The docs live flat in `docs/`, cross-linked by relative path; the book is
+# built from here rather than a separate `src/` so those links keep working both
+# in the repository and on the published site.
+src = "."
+
+[build]
+# Outside `src` (which is `.`) so the output is never scanned as content.
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/ngolacloud/dorm"
+edit-url-template = "https://github.com/ngolacloud/dorm/edit/main/docs/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.playground]
+runnable = false
