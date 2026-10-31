@@ -18,6 +18,7 @@
 
 # Reference
 
+- [API reference (docs.rs)](api-reference.md)
 - [Roadmap](roadmap.md)
 - [Architecture decisions](adr/0001-declarative-schema.md)
   - [0001 — Declarative schema](adr/0001-declarative-schema.md)
