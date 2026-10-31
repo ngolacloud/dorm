@@ -177,10 +177,38 @@ enum MigrateAction {
         #[arg(default_value = "migration")]
         name: String,
     },
+    /// Author the next migration from your models **and apply it**, in one step —
+    /// `prisma migrate dev`. The development loop: `make` the migration, then
+    /// `deploy` it. Equivalent to `dorm migrate make <name>` followed by `dorm
+    /// migrate deploy`. (Cargo lane: `makemigration` then `migrate`.)
+    Dev {
+        /// A short name for the migration, e.g. `add_body`.
+        #[arg(default_value = "migration")]
+        name: String,
+    },
     /// Apply the recorded migration chain in `migrations/` (or the initial
     /// schema when there is none yet). The default when `migrate` is given no
     /// subcommand. Like `prisma migrate deploy`. (`cargo run --bin migrate`.)
     Deploy,
+    /// Mark a migration version as applied in the ledger **without running its
+    /// SQL** — recovery after you fixed the schema by hand (`prisma migrate
+    /// resolve --applied`). Native: it inserts one row into
+    /// `orm_schema_migrations`.
+    ///
+    /// It never marks a version applied unless you name that version here, and it
+    /// refuses a version the ledger already records. The migration's name is read
+    /// from `migrations/` for the given version, or pass `--name` when the
+    /// version is not on disk (e.g. the fallback initial migration).
+    Resolve {
+        /// The exact migration version to record as applied. Required — there is
+        /// no default and no "latest": the operator must name the version.
+        version: i64,
+        /// The name to store for the version. Optional: when omitted it is read
+        /// from the migration file in `migrations/`. Required when the version is
+        /// not recorded on disk.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Show which migration versions the database has recorded as applied.
     Status,
     /// Show the additive changes `push` would apply, without touching the
@@ -291,7 +319,11 @@ fn main() -> ExitCode {
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
             MigrateAction::Make { name } => cargo_run_args("makemigration", &[&name], false),
+            MigrateAction::Dev { name } => migrate_dev(&name),
             MigrateAction::Deploy => cargo_run("migrate", false),
+            MigrateAction::Resolve { version, name } => {
+                on_runtime(migrate_resolve(version, name, json))
+            }
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
         },
@@ -364,6 +396,19 @@ fn cargo_run_args(bin: &str, args: &[&str], json: bool) -> CliResult {
         )
     })?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// `dorm migrate dev [name]`: author the next migration from the models and
+/// apply it, in one step — `prisma migrate dev`. Two cargo-lane runs, in order:
+/// `makemigration <name>` writes the migration file (or reports "no changes"),
+/// then `migrate` applies the chain. If `makemigration` fails we stop and
+/// surface its exit code, so a broken `make` never silently proceeds to deploy.
+fn migrate_dev(name: &str) -> CliResult {
+    let made = cargo_run_args("makemigration", &[name], false)?;
+    if made != 0 {
+        return Ok(made);
+    }
+    cargo_run("migrate", false)
 }
 
 /// Hide the password in a DSN before echoing it. libpq spells the secret
@@ -561,6 +606,120 @@ async fn migrate_status(json: bool) -> CliResult {
         println!("  v{version:<4} {name:<24} {}", applied_at(applied_unix));
     }
     Ok(0)
+}
+
+/// The migrations ledger, matching `dorm_migrations::migrator` (kept out of its
+/// public surface). `migrate status` reads it; `migrate resolve` writes one row.
+const LEDGER: &str = "orm_schema_migrations";
+
+/// `dorm migrate resolve <version> [--name <name>]`: mark a migration version as
+/// applied in the ledger **without running its SQL** — Prisma's `migrate resolve
+/// --applied`, for after a manual schema fix.
+///
+/// The operator must name the exact `version`; there is no "latest" and no
+/// default, so a version is never marked applied by accident. An already-recorded
+/// version is refused (idempotence would hide a mistake here). The name is read
+/// from the on-disk history in `migrations/` for that version — a pure files
+/// operation, no compiled models — or taken from `--name` when the version is not
+/// on disk (the fallback initial migration, say). The version travels as a bound
+/// parameter; nothing is ever spliced into the SQL.
+async fn migrate_resolve(version: i64, name: Option<String>, json: bool) -> CliResult {
+    // Resolve the name honestly before touching the database: prefer the explicit
+    // `--name`, else read it from the migration file for this version. A version
+    // with neither is an error — we will not invent a name.
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let history = dorm_migrations::History::open("migrations");
+            let recorded = history.load().map_err(|e| {
+                format!("reading the migrations/ history to find v{version}'s name: {e}")
+            })?;
+            match recorded.into_iter().find(|m| m.version == version) {
+                Some(m) => m.name,
+                None => {
+                    return Err(format!(
+                        "no migration v{version} in migrations/, so its name is unknown; \
+                         pass --name <name> to record it"
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+
+    db::guard_write("migrate resolve")?;
+    let is_postgres = db::backend_of(&db::dsn()?) == db::Backend::Postgres;
+
+    // Ensure the ledger exists with exactly the migrator's shape, so a resolve on
+    // a database that has never been migrated still has somewhere to write.
+    db::run_ddl(&format!(
+        "CREATE TABLE IF NOT EXISTS {LEDGER} \
+         (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_unix BIGINT NOT NULL)"
+    ))
+    .await?;
+
+    // `$1` on PostgreSQL, `?1` on SQLite — the one placeholder difference the two
+    // dialects force; the bound value is identical and never spliced.
+    let one = if is_postgres { "$1" } else { "?1" };
+    let already = db::fetch(
+        &format!("SELECT name FROM {LEDGER} WHERE version = {one}"),
+        &[Value::I64(version)],
+    )
+    .await?;
+    if let Some(row) = already.first() {
+        let existing: String = row.try_get::<String>(0)?;
+        return Err(format!(
+            "migration v{version} is already recorded as applied ({existing}); \
+             resolve will not touch it"
+        )
+        .into());
+    }
+
+    let insert = if is_postgres {
+        format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES ($1, $2, $3)")
+    } else {
+        format!("INSERT INTO {LEDGER} (version, name, applied_unix) VALUES (?1, ?2, ?3)")
+    };
+    let applied_unix = now_unix();
+    db::run(
+        &insert,
+        &[
+            Value::I64(version),
+            Value::Text(name.clone()),
+            Value::I64(applied_unix),
+        ],
+    )
+    .await?;
+
+    if json {
+        println!(
+            "{}",
+            json!({
+                "resolved": {
+                    "version": version,
+                    "name": name,
+                    "applied_unix": applied_unix,
+                    "applied_at": applied_at(applied_unix),
+                }
+            })
+        );
+    } else {
+        println!(
+            "resolved: marked v{version} ({name}) applied at {} — its SQL was not run.",
+            applied_at(applied_unix)
+        );
+    }
+    Ok(0)
+}
+
+/// Seconds since the Unix epoch, for the ledger's `applied_unix` stamp — the same
+/// wall-clock metadata the migrator records, not a value a query reasons about.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Render the ledger's Unix seconds as a readable UTC stamp, falling back to the

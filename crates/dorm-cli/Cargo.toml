@@ -35,7 +35,7 @@ path = "src/main.rs"
 # workspace build with every feature on stays coherent: when `dorm-core/sqlite`
 # is linked, `Row` gains its `Sqlite` variant and the match in `db execute` that
 # handles it is compiled too.
-sqlite = ["dorm-core/sqlite"]
+sqlite = ["dorm-core/sqlite", "dorm-migrations/sqlite"]
 
 [dependencies]
 # Used for the live-database lanes: the DSN resolver, the pool, and `db::query`.
@@ -47,6 +47,11 @@ dorm-schema = { path = "../dorm-schema", version = "0.3.0" }
 # (introspection-backed, in this crate) serves `dorm_studio::INDEX_HTML`, the
 # same page a generated typed Studio serves.
 dorm-studio = { path = "../dorm-studio", version = "0.1.1" }
+# `migrate resolve` reads the migration's name from the on-disk history in
+# `migrations/` (a files operation needing no compiled models) via `History`.
+# Path plus version so an in-workspace build uses the local crate and crates.io
+# resolves the published one.
+dorm-migrations = { path = "../dorm-migrations", version = "0.7.1" }
 clap = { workspace = true }
 clap_complete = "4"
 serde_json = { workspace = true }
