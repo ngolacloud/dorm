@@ -1,0 +1,30 @@
+{
+  "name": "dorm-schema",
+  "displayName": "DORM Schema",
+  "description": "Syntax highlighting for DORM's dorm.schema files (Prisma-style schema for the Delonix ORM).",
+  "version": "0.1.0",
+  "publisher": "ngolacloud",
+  "license": "MIT OR Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/ngolacloud/dorm" },
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "keywords": ["dorm", "orm", "schema", "prisma", "postgresql"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "dorm",
+        "aliases": ["DORM Schema", "dorm"],
+        "filenames": ["dorm.schema"],
+        "extensions": [".dorm"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "dorm",
+        "scopeName": "source.dorm",
+        "path": "./syntaxes/dorm.tmLanguage.json"
+      }
+    ]
+  }
+}

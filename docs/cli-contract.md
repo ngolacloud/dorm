@@ -39,14 +39,14 @@ limits) · **planned** (contract agreed, not built — see
 | `dorm db tables\|show\|count\|rows` | Browse the live database, read-only. | 0/1 | **done** | Native; `--json`; `rows --where col=value` (bound param, column validated). |
 | `dorm completions <shell>` | Print a completion script. | 0 | **done** | |
 | `dorm generate` | Compile `dorm.schema` → `src/models.rs`. | 0/1 | **done** | Native; the declarative schema compiled to `#[derive(Model)]` — see [schema.md](schema.md), [ADR 0001](adr/0001-declarative-schema.md). |
-| `dorm format` | Pretty-print `dorm.schema`. | — | **planned** | Now that the schema exists, this is a formatter over it. |
+| `dorm format` | Pretty-print `dorm.schema`. | — | **planned** | Needs a lossless serializer: the parser's AST drops comments and model-level attributes, so a round-trip would lose them. A faithful formatter is its own piece of work, not shipped half-done. |
 | `dorm db pull [--out]` | Introspect a live PostgreSQL schema into `dorm.schema`. | 0/1 | **done** | Native; recovers tables, columns, types, serial/PK, nullability, foreign keys (with `@@map`). Approximate — not unique/index/length/check/ordering or relation `onDelete`; the file says so. Round-trips through `dorm generate`. |
 | `dorm api generate` / `dorm api serve` | Generate (`src/bin/api.rs`) and serve an Axum CRUD API + OpenAPI over the models. | 0/1 | **done** | Full CRUD: `GET`/`POST /<table>`, `GET`/`PATCH`/`DELETE /<table>/{id}`, `/openapi.json`, `/health`. Handlers go through the `QuerySet`; `DORM_API_ADDR` sets host:port. Generated code — see ADR 0001. |
-| `dorm db seed` | Run configured seeds. | — | **planned** | |
+| `dorm db seed [--file]` | Run a SQL seed file against the database (default `seeds.sql`). | 0/1 | **done** | Native; applies the file as one batch (multiple statements), on the write path — a read-only session refuses it. |
 | `dorm db execute "<SQL>" [-p VALUE]... [--write]` | Run explicit SQL with bound parameters. | 0/1 | **done** | Native; `--json`. The CLI surface over the ADR 0005 valve (`db::sql` / `db::sql_execute`). Read-only by default — a write needs `--write` and still passes the read-only guard. Every `-p` value is bound as `$n`, never spliced. Renders the closed set of types the ORM knows; project others as `::text`. |
 | `dorm migrate dev` | Author + apply a dev migration. | — | **planned** | Needs migration authoring beyond the initial. |
 | `dorm migrate resolve` | Reconcile ledger after manual recovery. | — | **planned** | Must never mark applied without evidence. |
-| `dorm dbshell` | Open the native DB client (`psql`, …). | — | **planned** | Per-backend. |
+| `dorm db shell` | Open the native DB client (`psql`) on the configured database. | 0/1 | **done** | Native; hands you to `psql` with the DSN, then everything is `psql`. (Was `dorm dbshell` — now a `db` subcommand.) |
 | `dorm createsuperuser` / `changepassword` / `user …` | Application-account admin. | — | **planned** | Via an accounts adapter; never writes incompatible hashes — see roadmap §accounts. |
 
 ## JSON shapes (stable)

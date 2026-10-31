@@ -18,6 +18,9 @@ preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/ngolacloud/dorm"
 edit-url-template = "https://github.com/ngolacloud/dorm/edit/main/docs/{path}"
 no-section-label = false
+# Teaches highlight.js the `dorm` language so ```dorm (dorm.schema) blocks are
+# coloured. See theme/dorm-hljs.js.
+additional-js = ["theme/dorm-hljs.js"]
 
 [output.html.fold]
 enable = true

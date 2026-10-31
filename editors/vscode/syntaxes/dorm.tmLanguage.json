@@ -1,0 +1,87 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "DORM Schema",
+  "scopeName": "source.dorm",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#block" },
+    { "include": "#attribute" },
+    { "include": "#type" },
+    { "include": "#function" },
+    { "include": "#constant" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-slash.dorm",
+      "match": "//.*$"
+    },
+    "block": {
+      "match": "\\b(datasource|generator|model|enum|type)\\b\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.block.dorm" },
+        "2": { "name": "entity.name.type.dorm" }
+      }
+    },
+    "attribute": {
+      "name": "entity.other.attribute-name.dorm",
+      "match": "@@?[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?"
+    },
+    "type": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.dorm",
+          "match": "\\b(Int|BigInt|String|Boolean|DateTime|Decimal|Float|Json|Uuid|Bytes)\\b"
+        },
+        {
+          "comment": "A capitalised name in type position is a model reference (relation).",
+          "name": "entity.name.type.model.dorm",
+          "match": "\\b([A-Z][A-Za-z0-9_]*)\\b(?=\\s*(\\[\\])?\\s*(@|$|//|\\?))"
+        }
+      ]
+    },
+    "function": {
+      "name": "support.function.dorm",
+      "match": "\\b(env|now|autoincrement|uuid|cuid|dbgenerated|auto)\\b(?=\\s*\\()"
+    },
+    "constant": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.dorm",
+          "match": "\\b(true|false|null)\\b"
+        },
+        {
+          "comment": "Relation / referential-action enum values.",
+          "name": "constant.language.action.dorm",
+          "match": "\\b(Cascade|Restrict|SetNull|SetDefault|NoAction)\\b"
+        },
+        {
+          "comment": "Named arguments like onDelete:",
+          "name": "variable.parameter.dorm",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b(?=\\s*:)"
+        }
+      ]
+    },
+    "string": {
+      "name": "string.quoted.double.dorm",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.dorm", "match": "\\\\." }
+      ]
+    },
+    "number": {
+      "name": "constant.numeric.dorm",
+      "match": "\\b\\d+(\\.\\d+)?\\b"
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "keyword.operator.optional.dorm", "match": "\\?" },
+        { "name": "punctuation.definition.list.dorm", "match": "\\[\\]" },
+        { "name": "keyword.operator.assignment.dorm", "match": "=" }
+      ]
+    }
+  }
+}

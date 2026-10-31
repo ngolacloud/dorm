@@ -7,7 +7,7 @@ to Rust `#[derive(Model)]` structs by `dorm generate` (see
 
 ## A complete example
 
-```prisma
+```dorm
 datasource db {
   provider = "postgresql"
   url      = env("DELONIX_ORM_DSN")

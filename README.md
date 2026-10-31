@@ -67,30 +67,42 @@ let newest = Author::objects()
 
 ## Install
 
-DORM is not yet published to a registry. Depend on it by path (or a git
-dependency once it has a remote):
+The crates are on [crates.io](https://crates.io). Install the CLI:
+
+```sh
+cargo install dorm-cli        # the `dorm` binary
+dorm init blog                # scaffold a project
+```
+
+Or add the library to a Cargo project:
 
 ```toml
 [dependencies]
-dorm-core = { path = "../DORM/crates/dorm-core" }
-dorm-derive = { path = "../DORM/crates/dorm-derive" }
-dorm-migrations = { path = "../DORM/crates/dorm-migrations" }
+dorm-core = "0.6"
+dorm-derive = "0.3"
+dorm-migrations = "0.7"       # add when you generate or apply schema
 ```
 
-A crate that only **defines models** needs `dorm-core` and `dorm-derive`. Add
-`dorm-migrations` when you want to generate or apply schema.
+A crate that only **defines models** needs `dorm-core` and `dorm-derive`. See the
+[Installation guide](https://ngolacloud.github.io/dorm/installation.html) for the
+full story.
 
-## Documentation
+## The guides
+
+The full book is at **<https://ngolacloud.github.io/dorm/>**. The main pages:
 
 | Guide | Covers |
 |---|---|
-| [Getting started](docs/getting-started.md) | Install, define a model, generate the schema, run a query — from zero |
-| [Models](docs/models.md) | Every field type and `#[model]`/`#[field]` attribute |
-| [Making queries](docs/queries.md) | `QuerySet` in full: filtering, lookups, ordering, writes, aggregates, relations |
-| [Migrations](docs/migrations.md) | Generating DDL, the versioned migrator, and the migration ledger |
-| [Connection & transactions](docs/connection-and-transactions.md) | The DSN, the pool, read-only mode, `atomic`, and the one-runtime rule |
-| [CLI contract](docs/cli-contract.md) | The `dorm` command surface mapped onto Prisma, with honest per-command status |
-| [Roadmap](docs/roadmap.md) | The phased plan: migrations, multi-SGBD tiers, SQLite, the admin shell, accounts |
+| [Installation](https://ngolacloud.github.io/dorm/installation.html) | Install the CLI and the library crates; requirements and the DSN |
+| [Start a new project](https://ngolacloud.github.io/dorm/quickstart.html) | Scaffold with `dorm init`: schema → generate → push → query → Studio |
+| [Use DORM in an existing project](https://ngolacloud.github.io/dorm/existing-project.html) | Add DORM as a crate to a Cargo project you already have |
+| [The schema](https://ngolacloud.github.io/dorm/schema.html) · [Models](https://ngolacloud.github.io/dorm/models.html) · [Making queries](https://ngolacloud.github.io/dorm/queries.html) | The `dorm.schema` syntax, the generated models, and the whole `QuerySet` API |
+| [Migrations](https://ngolacloud.github.io/dorm/migrations.html) · [Connection & transactions](https://ngolacloud.github.io/dorm/connection-and-transactions.html) | Versioning the schema; the pool, read-only mode and `atomic` |
+| [Managing your database](https://ngolacloud.github.io/dorm/managing-the-database.html) · [DORM Studio](https://ngolacloud.github.io/dorm/studio.html) | Inspect, migrate and browse; the web UI |
+| [CLI reference](https://ngolacloud.github.io/dorm/cli-contract.html) | Every `dorm` command and its status |
+
+Editor and shell integration (VS Code highlighting, `bat`, completions) is in
+[`editors/`](editors).
 
 ## Try it without a database
 
