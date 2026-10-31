@@ -582,6 +582,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dorm-core",
+ "dorm-migrations",
  "dorm-schema",
  "dorm-studio",
  "serde_json",
