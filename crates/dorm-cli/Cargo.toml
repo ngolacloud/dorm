@@ -6,7 +6,7 @@ name = "dorm-cli"
 # 0.12.0: adds `dorm studio` (native + typed, over `dorm-studio`).
 # 0.12.1: Studio CSV export and foreign-key relation editing.
 # 0.12.2: `dorm db shell` (psql) and `dorm db seed`.
-version = "0.12.2"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -42,7 +42,7 @@ sqlite = ["dorm-core/sqlite", "dorm-migrations/sqlite"]
 # A path alongside the version so an in-workspace build uses the local crate and
 # crates.io resolves the published one.
 dorm-core = { path = "../dorm-core", version = "0.6.0" }
-dorm-schema = { path = "../dorm-schema", version = "0.3.0" }
+dorm-schema = { path = "../dorm-schema", version = "0.3.1" }
 # The Studio's single-page app lives here and is shared: the native `dorm studio`
 # (introspection-backed, in this crate) serves `dorm_studio::INDEX_HTML`, the
 # same page a generated typed Studio serves.
