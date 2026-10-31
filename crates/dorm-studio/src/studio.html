@@ -146,6 +146,7 @@
         <input id="filterVal" placeholder="value" size="12" />
         <button id="applyFilter">Filter</button>
       </div>
+      <button id="exportCsv" title="Download the current view as CSV">⬇ CSV</button>
       <button id="refresh">Refresh</button>
       <button id="newRow" class="primary" style="display:none">+ New row</button>
     </div>
@@ -347,6 +348,9 @@ function beginEdit(td, row, col) {
   const current = row[col];
   state.editingCell = { td, row, col, html: td.innerHTML, cls: td.className };
   td.className = "editing";
+  // A foreign key edits by picking the referenced row from a dropdown, like
+  // Prisma Studio's relation editor, rather than typing a raw key.
+  if (m.references) { beginRelationEdit(td, m, current); return; }
   const input = document.createElement("input");
   input.value = current === null ? "" : current;
   input.placeholder = m.nullable ? "(empty = NULL)" : "";
@@ -356,6 +360,42 @@ function beginEdit(td, row, col) {
     else if (e.key === "Escape") cancelEdit();
   };
   input.onblur = () => commitEdit(input.value);
+}
+
+// Edit a foreign key by choosing a referenced row from a <select> populated with
+// the referenced table (value = its key, label = key + a readable column).
+async function beginRelationEdit(td, m, current) {
+  const ref = m.references;
+  const select = document.createElement("select");
+  select.innerHTML = '<option>loading…</option>';
+  td.innerHTML = ""; td.appendChild(select); select.focus();
+  let rows;
+  try {
+    const url = `/api/tables/${encodeURIComponent(ref.table)}/rows?limit=500&orderBy=${encodeURIComponent(ref.column)}`;
+    rows = (await api("GET", url)).rows;
+  } catch (e) { toast(e.message); cancelEdit(); return; }
+  if (!state.editingCell) return; // cancelled while loading
+  const refTable = state.schema.tables.find((t) => t.name === ref.table);
+  const labelField = refTable ? pickLabelField(refTable, ref.column) : null;
+  const NULL = " null";
+  select.innerHTML = "";
+  if (m.nullable) { const o = new Option("(null)", NULL); select.add(o); }
+  for (const rr of rows) {
+    const key = rr[ref.column];
+    const label = labelField && rr[labelField] != null ? `${key} — ${rr[labelField]}` : String(key);
+    select.add(new Option(label, String(key)));
+  }
+  select.value = current === null ? NULL : String(current);
+  const finish = () => commitEdit(select.value === NULL ? null : select.value);
+  select.onchange = finish;
+  select.onkeydown = (e) => { if (e.key === "Escape") cancelEdit(); else if (e.key === "Enter") finish(); };
+}
+
+// A readable column to label a referenced row by — the first non-key text column.
+function pickLabelField(t, keyCol) {
+  const c = t.columns.find((c) => !c.pk && c.name !== keyCol &&
+    (c.type === "text" || (c.type || "").includes("char")));
+  return c ? c.name : null;
 }
 function cancelEdit() {
   const e = state.editingCell; if (!e) return;
@@ -447,9 +487,22 @@ async function saveNewRow(tr) {
 
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+// Download the current view (same filter, search and sort) as CSV. The endpoint
+// replies with an attachment, so pointing the browser at it saves the file
+// without leaving the page.
+function exportCsv() {
+  if (!state.table) return;
+  const p = new URLSearchParams();
+  if (state.orderBy) { p.set("orderBy", state.orderBy); p.set("dir", state.dir); }
+  if (state.filterCol && state.filterVal !== "") { p.set("filterCol", state.filterCol); p.set("filterVal", state.filterVal); }
+  if (state.search) p.set("search", state.search);
+  window.location.href = `/api/tables/${encodeURIComponent(state.table)}/export.csv?` + p;
+}
+
 $("refresh").onclick = loadRows;
 $("newRow").onclick = startNewRow;
 $("bulkDelete").onclick = bulkDelete;
+$("exportCsv").onclick = exportCsv;
 let searchTimer;
 $("search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
