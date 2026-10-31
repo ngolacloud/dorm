@@ -54,6 +54,19 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Answer "yes" to the confirmation on a destructive command, without
+    /// prompting. For scripts and `--yes`-style automation; the destructive
+    /// command still runs on the write path (a read-only session refuses it).
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
+
+    /// Run without ever prompting. Equivalent to `--yes` for the confirmation on
+    /// a destructive command: it proceeds without asking. A piped/scripted run
+    /// (no terminal) never blocks on a prompt regardless; this makes the intent
+    /// explicit and proceeds rather than refusing.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -308,6 +321,9 @@ fn main() -> ExitCode {
         std::env::set_var(db::DSN_ENV, dsn);
     }
     let json = cli.json;
+    // `--yes`/`--non-interactive` both mean "do not prompt me; proceed". They
+    // reach only the destructive commands, which pass this to `confirm`.
+    let assume_yes = cli.yes || cli.non_interactive;
 
     let result: CliResult = match cli.command {
         CliCommand::Init { name } => scaffold::init(name.as_deref()).map(|()| 0),
@@ -329,7 +345,7 @@ fn main() -> ExitCode {
         },
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
-        CliCommand::Db { action } => on_runtime(run_db(action, json)),
+        CliCommand::Db { action } => on_runtime(run_db(action, json, assume_yes)),
         CliCommand::Studio {
             action,
             port,
@@ -731,7 +747,7 @@ fn applied_at(unix: i64) -> String {
     }
 }
 
-async fn run_db(action: DbAction, json: bool) -> CliResult {
+async fn run_db(action: DbAction, json: bool, assume_yes: bool) -> CliResult {
     match action {
         DbAction::Tables => db_tables(json).await,
         DbAction::Show { table } => db_show(&table, json).await,
@@ -742,10 +758,74 @@ async fn run_db(action: DbAction, json: bool) -> CliResult {
             filter,
         } => db_rows(&table, limit, filter.as_deref(), json).await,
         DbAction::Pull { out } => db_pull(&out).await,
-        DbAction::Execute { sql, params, write } => db_execute(&sql, &params, write, json).await,
+        DbAction::Execute { sql, params, write } => {
+            db_execute(&sql, &params, write, json, assume_yes).await
+        }
         DbAction::Shell => db_shell(),
-        DbAction::Seed { file } => db_seed(&file, json).await,
+        DbAction::Seed { file } => db_seed(&file, json, assume_yes).await,
     }
+}
+
+/// Whether the confirmation can be settled without an interactive prompt — true
+/// when `--yes`/`--non-interactive` was passed, or stdin is not a terminal (a
+/// piped or scripted run we must never block waiting for an answer). When this is
+/// true, [`confirm`] does not prompt; it proceeds iff the user asked to (`--yes`),
+/// so a scripted run never hangs.
+///
+/// Kept pure (no I/O) so its logic is unit-tested directly.
+fn settled_without_prompt(assume_yes: bool, stdin_is_tty: bool) -> bool {
+    assume_yes || !stdin_is_tty
+}
+
+/// The confirmation decision, factored out of all I/O so it can be tested.
+/// `read_line` is called only when an interactive prompt is warranted (a terminal
+/// and no `--yes`), so a non-tty run never reads and never blocks.
+///
+/// * `--yes`/`--non-interactive` → proceed (`true`), no read.
+/// * no terminal, no `--yes` → do not proceed (`false`): a destructive action
+///   nobody consented to is refused rather than run silently — and without
+///   blocking, since `read_line` is not called.
+/// * a terminal, no `--yes` → read the answer; `y`/`yes` (any case) proceeds.
+fn confirm_decision(
+    assume_yes: bool,
+    stdin_is_tty: bool,
+    read_line: impl FnOnce() -> std::io::Result<String>,
+) -> std::io::Result<bool> {
+    if settled_without_prompt(assume_yes, stdin_is_tty) {
+        return Ok(assume_yes);
+    }
+    let answer = read_line()?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Ask the user to confirm a destructive action, returning whether to proceed.
+///
+/// On a terminal it prints `{question} [y/N] ` to stderr (so `--json` on stdout
+/// stays clean) and reads one line. With `--yes`/`--non-interactive` it proceeds
+/// without asking; with neither and no terminal (piped/scripted) it refuses
+/// without blocking — the honest "never run a destructive statement nobody could
+/// confirm" default. See [`confirm_decision`] for the full truth table.
+fn confirm(question: &str, assume_yes: bool) -> std::io::Result<bool> {
+    use std::io::{IsTerminal, Write};
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    confirm_decision(assume_yes, stdin_is_tty, || {
+        let mut err = std::io::stderr();
+        write!(err, "{question} [y/N] ")?;
+        err.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line)
+    })
+}
+
+/// The database a destructive command will touch, redacted, for the confirmation
+/// message. Falls back to a neutral phrase when no DSN is configured (the command
+/// itself will then fail with the real "no database configured" error).
+fn confirm_target() -> String {
+    db::dsn().map_or_else(|_| "the database".to_string(), |d| redact(&d))
 }
 
 /// `dorm db shell`: open the native PostgreSQL client on the configured database.
@@ -764,9 +844,22 @@ fn db_shell() -> CliResult {
 /// file is applied as one batch (so it may contain multiple statements, a
 /// function body, a transaction). Writes — it is a seed — so it runs on the write
 /// path; a read-only session still refuses it.
-async fn db_seed(file: &str, json: bool) -> CliResult {
+async fn db_seed(file: &str, json: bool, assume_yes: bool) -> CliResult {
     let sql = std::fs::read_to_string(file)
         .map_err(|e| format!("reading {file}: {e} (create it, or pass --file)"))?;
+    // A seed file is arbitrary SQL applied as one batch — genuinely destructive
+    // (it can DROP/TRUNCATE/overwrite). Confirm before the write path. `--yes`
+    // proceeds; a non-interactive run with neither flag refuses without blocking.
+    if !confirm(
+        &format!(
+            "This will run the seed file `{file}` (arbitrary writes) against {target}. Continue?",
+            target = confirm_target()
+        ),
+        assume_yes,
+    )? {
+        eprintln!("aborted; nothing was run (pass --yes to proceed non-interactively).");
+        return Ok(1);
+    }
     db::guard_write("seed")?;
     db::run_ddl(&sql).await?;
     if json {
@@ -782,7 +875,13 @@ async fn db_seed(file: &str, json: bool) -> CliResult {
 /// which calls `guard_write` first — so a read-only session refuses them — and
 /// print the affected-row count. Every `--param` is a bound `$n`; the SQL text is
 /// never parsed, and no value is ever formatted into it.
-async fn db_execute(sql: &str, params: &[String], write: bool, json: bool) -> CliResult {
+async fn db_execute(
+    sql: &str,
+    params: &[String],
+    write: bool,
+    json: bool,
+    assume_yes: bool,
+) -> CliResult {
     // Every user value binds as a text parameter. This is the whole point of the
     // valve: the statement is opaque and the values travel as `$1`, `$2`, …,
     // never spliced into the SQL. A text parameter is used directly where it meets
@@ -791,6 +890,23 @@ async fn db_execute(sql: &str, params: &[String], write: bool, json: bool) -> Cl
     let bound: Vec<Value> = params.iter().map(|p| Value::Text(p.clone())).collect();
 
     if write {
+        // Guard the clearly irreversible statements — DROP, TRUNCATE, and an
+        // unqualified DELETE (no WHERE) — behind a confirmation. `--yes` proceeds;
+        // a non-interactive run with neither flag refuses without blocking. A
+        // targeted DELETE/UPDATE/INSERT is not prompted: the gate is for the
+        // bulk-irreversible slip, not every write.
+        if let Some(kind) = destructive_kind(sql) {
+            if !confirm(
+                &format!(
+                    "This will run a destructive statement ({kind}) against {target}. Continue?",
+                    target = confirm_target()
+                ),
+                assume_yes,
+            )? {
+                eprintln!("aborted; nothing was run (pass --yes to proceed non-interactively).");
+                return Ok(1);
+            }
+        }
         // The write path. `sql_execute` runs `guard_write` first, so a read-only
         // session refuses this with `Error::ReadOnly`, exactly like a compiled
         // write — the escape hatch does not escape the read-only rule.
@@ -904,6 +1020,33 @@ fn looks_like_read(sql: &str) -> bool {
         leading_keyword(sql).as_str(),
         "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN"
     )
+}
+
+/// Classify a write statement as irreversible-at-a-stroke, for the destructive
+/// confirmation — `Some("DROP")`, `Some("TRUNCATE")`, or `Some("DELETE without
+/// WHERE")` for a `DELETE` with no `WHERE` clause; `None` for a targeted write
+/// (an `INSERT`, `UPDATE`, or a `DELETE … WHERE …`) that is not prompted.
+///
+/// Lexical by the same honesty as [`looks_like_read`]: it reads the leading
+/// keyword, and for `DELETE` scans for a `WHERE` token. It can miss a destructive
+/// write hidden behind another keyword (`WITH … AS (DELETE …)`), and a `WHERE` in
+/// a string literal would make an unqualified `DELETE` look qualified — it errs
+/// toward *not* over-prompting a targeted write, never toward silently skipping a
+/// bare `DROP`/`TRUNCATE`. It is a fat-finger guard, not a safety boundary.
+fn destructive_kind(sql: &str) -> Option<&'static str> {
+    match leading_keyword(sql).as_str() {
+        "DROP" => Some("DROP"),
+        "TRUNCATE" => Some("TRUNCATE"),
+        "DELETE" if !has_where_token(sql) => Some("DELETE without WHERE"),
+        _ => None,
+    }
+}
+
+/// Whether the statement has a bare `WHERE` keyword token (case-insensitive),
+/// split on non-alphanumeric boundaries so `nowhere`/`somewhere` do not match.
+fn has_where_token(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("where"))
 }
 
 /// Render one PostgreSQL cell as a string, over the closed set of column types the
@@ -1334,4 +1477,77 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
 /// a real table or column, so the doubling of `"` is belt-and-braces.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settled_without_prompt_truth_table() {
+        // `--yes` (or `--non-interactive`, which maps to the same flag) → settled.
+        assert!(settled_without_prompt(true, true));
+        assert!(settled_without_prompt(true, false));
+        // No flag but a terminal → must prompt (not settled).
+        assert!(!settled_without_prompt(false, true));
+        // No flag and no terminal (piped/scripted) → settled; never block on a tty.
+        assert!(settled_without_prompt(false, false));
+    }
+
+    #[test]
+    fn confirm_decision_yes_flag_proceeds_without_reading() {
+        // `--yes`: proceed, and the reader must never be consulted.
+        let r =
+            confirm_decision(true, true, || panic!("must not prompt when --yes is set")).unwrap();
+        assert!(r);
+    }
+
+    #[test]
+    fn confirm_decision_non_interactive_proceeds() {
+        // `--non-interactive` reaches here as `assume_yes = true`; proceeds, no read.
+        let r = confirm_decision(true, false, || {
+            panic!("must not prompt when non-interactive")
+        })
+        .unwrap();
+        assert!(r);
+    }
+
+    #[test]
+    fn confirm_decision_non_tty_without_yes_refuses_without_blocking() {
+        // A mocked non-tty with no `--yes`: do not proceed, and never read stdin
+        // (so a scripted run cannot block). This is the "refuse" default.
+        let r =
+            confirm_decision(false, false, || panic!("must not read stdin on a non-tty")).unwrap();
+        assert!(!r);
+    }
+
+    #[test]
+    fn confirm_decision_tty_reads_the_answer() {
+        // A terminal with no `--yes`: the answer decides, case/whitespace-insensitive.
+        assert!(confirm_decision(false, true, || Ok("y\n".into())).unwrap());
+        assert!(confirm_decision(false, true, || Ok("  YES ".into())).unwrap());
+        assert!(!confirm_decision(false, true, || Ok("n\n".into())).unwrap());
+        assert!(!confirm_decision(false, true, || Ok("\n".into())).unwrap()); // default No
+        assert!(!confirm_decision(false, true, || Ok(String::new())).unwrap()); // EOF → No
+    }
+
+    #[test]
+    fn destructive_kind_flags_the_irreversible_only() {
+        assert_eq!(destructive_kind("DROP TABLE users"), Some("DROP"));
+        assert_eq!(destructive_kind("  truncate posts"), Some("TRUNCATE"));
+        assert_eq!(
+            destructive_kind("DELETE FROM users"),
+            Some("DELETE without WHERE")
+        );
+        // A targeted write is not prompted.
+        assert_eq!(destructive_kind("DELETE FROM users WHERE id = $1"), None);
+        assert_eq!(destructive_kind("delete from users where id=1"), None);
+        assert_eq!(destructive_kind("UPDATE users SET name = $1"), None);
+        assert_eq!(destructive_kind("INSERT INTO users VALUES ($1)"), None);
+        // `WHERE` as a substring of an identifier must not count as a clause.
+        assert_eq!(
+            destructive_kind("DELETE FROM nowhere_logs"),
+            Some("DELETE without WHERE")
+        );
+    }
 }
