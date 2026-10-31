@@ -75,6 +75,18 @@ enum CliCommand {
         #[arg(long, default_value = "src/models.rs")]
         out: String,
     },
+    /// Pretty-print `dorm.schema` into DORM's canonical form, in place. Native —
+    /// no project build, no database. Lossless: comments, every field and
+    /// block-level attribute and the `datasource` block are all preserved; only
+    /// layout changes (indentation, blank lines, aligned columns). Idempotent.
+    Format {
+        /// The schema file to read and rewrite.
+        #[arg(long, default_value = "dorm.schema")]
+        schema: String,
+        /// Do not write: exit 0 if the file is already formatted, 3 if not.
+        #[arg(long)]
+        check: bool,
+    },
     /// Check your models for mistakes a query or migration would otherwise trip
     /// over — by building and running the project. (`cargo run --bin validate`.)
     Validate,
@@ -287,6 +299,7 @@ fn main() -> ExitCode {
             what: NewKind::Model { name },
         } => scaffold::new_model(&name).map(|()| 0),
         CliCommand::Generate { schema, out } => scaffold::generate(&schema, &out).map(|()| 0),
+        CliCommand::Format { schema, check } => scaffold::format(&schema, check),
         CliCommand::Validate => cargo_run("validate", json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
