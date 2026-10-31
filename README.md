@@ -28,6 +28,18 @@ let newest = Author::objects()
     .await?;
 ```
 
+## Documentation
+
+- **Guide** (this book): <https://ngolacloud.github.io/dorm/> — schema, models,
+  queries, migrations, transactions, the CLI and Studio.
+- **API reference**: generated per release on [docs.rs](https://docs.rs) —
+  [`dorm-core`](https://docs.rs/dorm-core/latest/dorm_core/),
+  [`dorm-derive`](https://docs.rs/dorm-derive/latest/dorm_derive/),
+  [`dorm-migrations`](https://docs.rs/dorm-migrations/latest/dorm_migrations/),
+  [`dorm-schema`](https://docs.rs/dorm-schema/latest/dorm_schema/),
+  [`dorm-cli`](https://docs.rs/dorm-cli/latest/dorm_cli/),
+  [`dorm-studio`](https://docs.rs/dorm-studio/latest/dorm_studio/).
+
 ## Why DORM
 
 - **Two front ends, one compiler.** The typed API (`author::name.eq("ada")`) and
@@ -118,10 +130,11 @@ Open-sourced per ADR 0073 and **dual-licensed** under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-at your option — the Rust ecosystem convention. The library crates
-(`dorm-core`, `dorm-derive`, `dorm-migrations`) are published to
-[crates.io](https://crates.io/crates/dorm-core); `dorm-models`, `dorm-example`
-and `dorm-shell` are example/internal and stay unpublished.
+at your option — the Rust ecosystem convention. The crates `dorm-core`,
+`dorm-derive`, `dorm-migrations`, `dorm-schema`, `dorm-cli` and `dorm-studio` are
+published to [crates.io](https://crates.io/crates/dorm-core) (and documented on
+[docs.rs](https://docs.rs/dorm-core)); `dorm-models`, `dorm-example` and
+`dorm-shell` are example/internal and stay unpublished.
 
 Unless you explicitly state otherwise, any contribution you intentionally submit
 for inclusion shall be dual-licensed as above, without any additional terms.
