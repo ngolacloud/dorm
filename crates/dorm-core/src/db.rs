@@ -1777,16 +1777,32 @@ mod sqlite {
 /// **`utf8mb4`**.
 #[cfg(feature = "mysql")]
 mod mysql {
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
     use mysql_async::prelude::Queryable;
 
-    use super::{dsn, Error, Result};
+    use super::{dsn, savepoint_name, Error, Result, Tx};
     use crate::compiler::positionalize;
     use crate::row::{value_to_mysql, Row};
     use crate::value::Value;
 
     static MYSQL_POOL: OnceLock<mysql_async::Pool> = OnceLock::new();
+
+    /// The connection a MySQL transaction runs on, plus its savepoint depth —
+    /// the mirror of PostgreSQL's `TxState`, with a `mysql_async::Conn` in place of
+    /// the pooled `Object`.
+    struct MySqlTxState {
+        conn: Option<mysql_async::Conn>,
+        depth: usize,
+    }
+
+    type Shared = Arc<tokio::sync::Mutex<MySqlTxState>>;
+
+    tokio::task_local! {
+        /// The transaction in scope, if any. Set by [`atomic`] for the closure's
+        /// duration, so a nested `fetch`/`run` finds it and runs on its connection.
+        static MYSQL_TX: Shared;
+    }
 
     /// The pool, built once from the DSN with the per-connection `init` fixups.
     fn pool() -> Result<&'static mysql_async::Pool> {
@@ -1836,6 +1852,12 @@ mod mysql {
 
     pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            let rows: Vec<mysql_async::Row> = conn.exec(text, params).await.map_err(db_err)?;
+            return Ok(rows.into_iter().map(Row::MySql).collect());
+        }
         let mut conn = conn().await?;
         let rows: Vec<mysql_async::Row> = conn.exec(text, params).await.map_err(db_err)?;
         Ok(rows.into_iter().map(Row::MySql).collect())
@@ -1843,14 +1865,153 @@ mod mysql {
 
     pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
         let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            conn.exec_drop(text, params).await.map_err(db_err)?;
+            return Ok(conn.affected_rows());
+        }
         let mut conn = conn().await?;
         conn.exec_drop(text, params).await.map_err(db_err)?;
         Ok(conn.affected_rows())
     }
 
+    /// Run an `INSERT` and report `(rows affected, last_insert_id)` — the verb the
+    /// no-`RETURNING` path uses to find the generated keys. `last_insert_id` is
+    /// per-connection, so this must run inside the transaction that then reloads
+    /// the rows. Wired by the create path in ADR 0018 Inc. 2b.
+    #[allow(dead_code)]
+    pub(super) async fn insert(sql: &str, params: &[Value]) -> Result<(u64, u64)> {
+        let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            conn.exec_drop(text, params).await.map_err(db_err)?;
+            return Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)));
+        }
+        let mut conn = conn().await?;
+        conn.exec_drop(text, params).await.map_err(db_err)?;
+        Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)))
+    }
+
     pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+        // DDL auto-commits in MySQL, so it is never run on a transaction's
+        // connection; a standalone checkout is correct and avoids surprising a
+        // transaction with an implicit commit.
         let mut conn = conn().await?;
         conn.query_drop(ddl).await.map_err(db_err)
+    }
+
+    /// Run `f` inside a transaction (ADR 0018), the MySQL mirror of `atomic_pg`:
+    /// an owned `Conn` in a task-local, `BEGIN`/`SAVEPOINT` issued directly. InnoDB
+    /// supports savepoints, so nesting is a savepoint exactly as on PostgreSQL.
+    pub(super) async fn atomic<F, Fut, T>(f: F) -> Result<T>
+    where
+        F: FnOnce(Tx) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match MYSQL_TX.try_with(|t| t.clone()) {
+            // Already inside one: a savepoint.
+            Ok(shared) => {
+                let depth = {
+                    let mut state = shared.lock().await;
+                    state.depth += 1;
+                    let depth = state.depth;
+                    let conn = state.conn.as_mut().ok_or_else(tx_gone)?;
+                    conn.query_drop(format!("SAVEPOINT {}", savepoint_name(depth)))
+                        .await
+                        .map_err(db_err)?;
+                    depth
+                };
+                let name = savepoint_name(depth);
+                let guard = PanicGuard {
+                    shared: shared.clone(),
+                    armed: true,
+                };
+                let outcome = f(Tx { depth }).await;
+                let mut guard = guard;
+                guard.armed = false;
+
+                let mut state = shared.lock().await;
+                state.depth -= 1;
+                let conn = state.conn.as_mut().ok_or_else(tx_gone)?;
+                match outcome {
+                    Ok(v) => {
+                        conn.query_drop(format!("RELEASE SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        Ok(v)
+                    }
+                    Err(e) => {
+                        conn.query_drop(format!("ROLLBACK TO SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        conn.query_drop(format!("RELEASE SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        Err(e)
+                    }
+                }
+            }
+            // The outermost transaction.
+            Err(_) => {
+                let mut conn = conn().await?;
+                conn.query_drop("BEGIN").await.map_err(db_err)?;
+                let shared: Shared = Arc::new(tokio::sync::Mutex::new(MySqlTxState {
+                    conn: Some(conn),
+                    depth: 1,
+                }));
+                let guard = PanicGuard {
+                    shared: shared.clone(),
+                    armed: true,
+                };
+                let outcome = MYSQL_TX.scope(shared.clone(), f(Tx { depth: 1 })).await;
+                let mut guard = guard;
+                guard.armed = false;
+
+                let mut state = shared.lock().await;
+                let mut conn = state.conn.take().ok_or_else(tx_gone)?;
+                let result = match outcome {
+                    Ok(v) => conn.query_drop("COMMIT").await.map(|()| v).map_err(db_err),
+                    Err(e) => {
+                        // The rollback's own failure must not hide the error that
+                        // caused it; that is the one the caller needs to read.
+                        let _ = conn.query_drop("ROLLBACK").await;
+                        Err(e)
+                    }
+                };
+                // Dropping the `Conn` returns it to the pool now that no transaction
+                // is open.
+                drop(conn);
+                result
+            }
+        }
+    }
+
+    /// Closes the connection if dropped while still holding it — which only happens
+    /// on a panic, and is what makes MySQL roll the transaction back (a connection
+    /// closing mid-transaction is rolled back by the server), the same guarantee
+    /// `PanicGuard` gives the PostgreSQL path.
+    struct PanicGuard {
+        shared: Shared,
+        armed: bool,
+    }
+
+    impl Drop for PanicGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Ok(mut state) = self.shared.try_lock() {
+                // Take the connection out so it is closed rather than returned to
+                // the pool with an open transaction; the server rolls it back.
+                let _ = state.conn.take();
+            }
+        }
+    }
+
+    fn tx_gone() -> Error {
+        Error::Db("the MySQL transaction's connection is gone; it was rolled back".into())
     }
 
     fn db_err(e: mysql_async::Error) -> Error {
@@ -1930,11 +2091,10 @@ where
         Backend::Sqlite => sqlite::atomic(f).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
-        // MySQL transactions land in the next increment (ADR 0018 Inc. 2); the
-        // raw statement path above already works on MySQL.
-        Backend::MySql => Err(Error::Db(
-            "MySQL transactions are not implemented yet (ADR 0018 Inc. 2)".into(),
-        )),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => mysql::atomic(f).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 

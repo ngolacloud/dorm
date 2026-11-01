@@ -22,15 +22,24 @@ fn dsn() -> Option<String> {
         .filter(|s| s.starts_with("mysql:"))
 }
 
+/// The one `#[tokio::test]`: the `mysql_async` pool is a process global whose
+/// connections belong to the runtime that built it, so every phase must share one
+/// runtime — two `#[tokio::test]` functions would each build their own and the
+/// second would find the pool's runtime shut down. (The PostgreSQL live suite
+/// shares a runtime for the same reason.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a throwaway MySQL; set DORM_COMPAT_MYSQL_DSN"]
-async fn every_value_type_round_trips_and_positional_params_bind() {
+async fn mysql_live() {
     let Some(dsn) = dsn() else {
         eprintln!("skipped: set DORM_COMPAT_MYSQL_DSN to a mysql:// DSN");
         return;
     };
     std::env::set_var(db::DSN_ENV, &dsn);
+    value_round_trip_and_positional_params().await;
+    transactions_commit_rollback_and_savepoint().await;
+}
 
+async fn value_round_trip_and_positional_params() {
     db::run_ddl("DROP TABLE IF EXISTS probe").await.unwrap();
     db::run_ddl(
         "CREATE TABLE probe (\
@@ -111,4 +120,61 @@ async fn every_value_type_round_trips_and_positional_params_bind() {
         1,
         "?1 is the first param"
     );
+}
+
+/// Count the rows of `t` — a tiny read used by the transaction test.
+async fn count_t() -> i64 {
+    db::fetch("SELECT count(*) FROM t", &[]).await.unwrap()[0]
+        .try_get::<i64>(0)
+        .unwrap()
+}
+
+async fn transactions_commit_rollback_and_savepoint() {
+    db::run_ddl("DROP TABLE IF EXISTS t").await.unwrap();
+    db::run_ddl("CREATE TABLE t (n INT NOT NULL)")
+        .await
+        .unwrap();
+
+    // A committed transaction persists.
+    db::atomic(|_tx| async {
+        db::run("INSERT INTO t (n) VALUES (?1)", &[Value::I64(1)]).await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(count_t().await, 1, "the committed insert stayed");
+
+    // A transaction that returns Err rolls back.
+    let rolled = db::atomic(|_tx| async {
+        db::run("INSERT INTO t (n) VALUES (?1)", &[Value::I64(2)]).await?;
+        Err::<(), _>(dorm_core::Error::Db("boom".into()))
+    })
+    .await;
+    assert!(rolled.is_err());
+    assert_eq!(count_t().await, 1, "the rolled-back insert left nothing");
+
+    // A nested atomic is a savepoint: the inner failure undoes only its own work,
+    // and the outer transaction still commits.
+    db::atomic(|_tx| async {
+        db::run("INSERT INTO t (n) VALUES (?1)", &[Value::I64(3)]).await?;
+        let inner = db::atomic(|_tx| async {
+            db::run("INSERT INTO t (n) VALUES (?1)", &[Value::I64(4)]).await?;
+            Err::<(), _>(dorm_core::Error::Db("inner".into()))
+        })
+        .await;
+        assert!(inner.is_err(), "the inner savepoint failed");
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // 1 and 3 committed; 2 (rolled back) and 4 (savepoint) did not.
+    assert_eq!(count_t().await, 2, "only the outer inserts survived");
+    let ns: Vec<i64> = db::fetch("SELECT n FROM t ORDER BY n", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.try_get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ns, vec![1, 3]);
 }
