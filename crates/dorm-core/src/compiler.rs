@@ -150,6 +150,10 @@ pub enum Dialect {
     Sqlite,
 }
 
+// Everything a dialect decides differently lives here, as methods on `Dialect` —
+// not as `match`es scattered through the compiler. Adding a SQL backend (ADR
+// 0011) is adding an arm to each of these, in one place, which is what keeps the
+// fan-out to MySQL/MSSQL/Cockroach/Oracle tractable.
 impl Dialect {
     /// The case-insensitive pattern operator: PostgreSQL's `ILIKE`, or `LIKE` on
     /// SQLite (whose `LIKE` is already case-insensitive for ASCII).
@@ -157,6 +161,29 @@ impl Dialect {
         match self {
             Dialect::Postgres => "ILIKE",
             Dialect::Sqlite => "LIKE",
+        }
+    }
+
+    /// The character that introduces a bound-parameter placeholder: `$` on
+    /// PostgreSQL (`$1`), `?` on SQLite (`?1`). Numbered on both, which is what
+    /// lets [`shift_placeholders`] renumber a subquery's parameters.
+    fn placeholder_marker(self) -> char {
+        match self {
+            Dialect::Postgres => '$',
+            Dialect::Sqlite => '?',
+        }
+    }
+
+    /// A bound-parameter placeholder for binding position `n` (1-based).
+    fn placeholder(self, n: usize) -> String {
+        format!("{}{n}", self.placeholder_marker())
+    }
+
+    /// The SQL expression for "now", used to refresh `auto_now` columns on write.
+    fn now(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "now()",
+            Dialect::Sqlite => "CURRENT_TIMESTAMP",
         }
     }
 }
@@ -179,10 +206,7 @@ impl Binder {
     /// SQLite.
     fn bind(&mut self, v: Value) -> String {
         self.params.push(v);
-        match self.dialect {
-            Dialect::Postgres => format!("${}", self.params.len()),
-            Dialect::Sqlite => format!("?{}", self.params.len()),
-        }
+        self.dialect.placeholder(self.params.len())
     }
 }
 
@@ -921,10 +945,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         ));
     }
     // `auto_now` columns are refreshed on every write without the caller asking.
-    let now = match dialect {
-        Dialect::Postgres => "now()",
-        Dialect::Sqlite => "CURRENT_TIMESTAMP",
-    };
+    let now = dialect.now();
     for f in plan.model.fields {
         if f.auto_now && !assignments.iter().any(|a| a.field == f.name) {
             sets.push(format!("{} = {now}", quote(f.column)?));
@@ -999,10 +1020,7 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     if by == 0 {
         return sql.to_string();
     }
-    let marker = match dialect {
-        Dialect::Postgres => '$',
-        Dialect::Sqlite => '?',
-    };
+    let marker = dialect.placeholder_marker();
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {

@@ -34,3 +34,4 @@
   - [0008 — Observability](adr/0008-observability.md)
   - [0009 — Accounts admin](adr/0009-accounts-admin.md)
   - [0010 — Database handle & read-replica routing](adr/0010-database-handle-and-read-replica-routing.md)
+  - [0011 — Multi-backend & production roadmap](adr/0011-multi-backend-and-production-roadmap.md)
