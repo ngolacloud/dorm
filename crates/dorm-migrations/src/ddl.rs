@@ -279,6 +279,8 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::I32 | FieldType::I64 | FieldType::Bool => "INTEGER",
             FieldType::Text | FieldType::Timestamp | FieldType::Uuid | FieldType::Json => "TEXT",
             FieldType::Decimal => "NUMERIC",
+            FieldType::F64 => "REAL",
+            FieldType::Bytes => "BLOB",
         }
         .to_string(),
     }

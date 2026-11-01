@@ -138,12 +138,14 @@ fn type_tag(ty: FieldType) -> &'static str {
     match ty {
         FieldType::I32 => "i32",
         FieldType::I64 => "i64",
+        FieldType::F64 => "f64",
         FieldType::Text => "text",
         FieldType::Bool => "bool",
         FieldType::Decimal => "decimal",
         FieldType::Timestamp => "timestamp",
         FieldType::Uuid => "uuid",
         FieldType::Json => "json",
+        FieldType::Bytes => "bytes",
     }
 }
 

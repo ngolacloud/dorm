@@ -79,11 +79,13 @@ fn to_sqlite(v: &Value) -> rusqlite::types::Value {
         Value::Bool(b) => S::Integer(i64::from(*b)),
         Value::I32(n) => S::Integer(i64::from(*n)),
         Value::I64(n) => S::Integer(*n),
+        Value::F64(x) => S::Real(*x),
         Value::Text(s) => S::Text(s.clone()),
         Value::Decimal(d) => S::Text(d.to_string()),
         Value::Timestamp(t) => S::Text(t.to_rfc3339()),
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Json(j) => S::Text(j.to_string()),
+        Value::Bytes(b) => S::Blob(b.clone()),
     }
 }
 
@@ -106,9 +108,19 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
         rusqlite::types::Value::Text(s) => Some(s.clone()),
         _ => None,
     };
+    let as_f64 = |r: &rusqlite::types::Value| match r {
+        rusqlite::types::Value::Real(x) => Some(*x),
+        rusqlite::types::Value::Integer(n) => Some(*n as f64),
+        _ => None,
+    };
+    let as_blob = |r: &rusqlite::types::Value| match r {
+        rusqlite::types::Value::Blob(b) => Some(b.clone()),
+        _ => None,
+    };
     Ok(match ty {
         FieldType::I32 => Value::I32(as_i64(&raw).ok_or(mismatch("integer"))? as i32),
         FieldType::I64 => Value::I64(as_i64(&raw).ok_or(mismatch("integer"))?),
+        FieldType::F64 => Value::F64(as_f64(&raw).ok_or(mismatch("float"))?),
         FieldType::Bool => Value::Bool(as_i64(&raw).ok_or(mismatch("integer"))? != 0),
         FieldType::Text => Value::Text(as_text(&raw).ok_or(mismatch("text"))?),
         FieldType::Decimal => Value::Decimal(
@@ -130,6 +142,7 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
             serde_json::from_str(&as_text(&raw).ok_or(mismatch("json text"))?)
                 .map_err(|_| mismatch("json"))?,
         ),
+        FieldType::Bytes => Value::Bytes(as_blob(&raw).ok_or(mismatch("blob"))?),
     })
 }
 

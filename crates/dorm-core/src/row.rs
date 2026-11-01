@@ -148,6 +148,8 @@ impl_decode!(serde_json::Value, |c| serde_json::from_str(&sqlite_text(
     c
 )?)
 .map_err(|_| Error::Db("not json".into())));
+impl_decode!(f64, sqlite_real);
+impl_decode!(Vec<u8>, sqlite_blob);
 
 /// A SQLite integer cell, or a type error.
 #[cfg(feature = "sqlite")]
@@ -164,6 +166,26 @@ fn sqlite_text(cell: &rusqlite::types::Value) -> Result<String> {
     match cell {
         rusqlite::types::Value::Text(s) => Ok(s.clone()),
         _ => Err(Error::Db("expected text".into())),
+    }
+}
+
+/// A SQLite real cell, or a type error. An integer is accepted and widened — a
+/// whole number stored in a `REAL` column comes back as `Integer` from SQLite.
+#[cfg(feature = "sqlite")]
+fn sqlite_real(cell: &rusqlite::types::Value) -> Result<f64> {
+    match cell {
+        rusqlite::types::Value::Real(x) => Ok(*x),
+        rusqlite::types::Value::Integer(n) => Ok(*n as f64),
+        _ => Err(Error::Db("expected a real".into())),
+    }
+}
+
+/// A SQLite blob cell, or a type error.
+#[cfg(feature = "sqlite")]
+fn sqlite_blob(cell: &rusqlite::types::Value) -> Result<Vec<u8>> {
+    match cell {
+        rusqlite::types::Value::Blob(b) => Ok(b.clone()),
+        _ => Err(Error::Db("expected a blob".into())),
     }
 }
 
@@ -201,11 +223,13 @@ pub(crate) fn value_to_sqlite(v: &crate::value::Value) -> rusqlite::types::Value
         Value::Bool(b) => S::Integer(i64::from(*b)),
         Value::I32(n) => S::Integer(i64::from(*n)),
         Value::I64(n) => S::Integer(*n),
+        Value::F64(x) => S::Real(*x),
         Value::Text(s) => S::Text(s.clone()),
         Value::Decimal(d) => S::Text(d.to_string()),
         Value::Timestamp(t) => S::Text(t.to_rfc3339()),
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Json(j) => S::Text(j.to_string()),
+        Value::Bytes(b) => S::Blob(b.clone()),
     }
 }
 
@@ -230,6 +254,7 @@ pub(crate) fn cell_to_value(
     Ok(match ty {
         FieldType::I32 => Value::I32(sqlite_int(cell).map_err(|_| mismatch("integer"))? as i32),
         FieldType::I64 => Value::I64(sqlite_int(cell).map_err(|_| mismatch("bigint"))?),
+        FieldType::F64 => Value::F64(sqlite_real(cell).map_err(|_| mismatch("float"))?),
         FieldType::Bool => Value::Bool(sqlite_int(cell).map_err(|_| mismatch("boolean"))? != 0),
         FieldType::Text => Value::Text(sqlite_text(cell).map_err(|_| mismatch("text"))?),
         FieldType::Decimal => {
@@ -255,5 +280,6 @@ pub(crate) fn cell_to_value(
             serde_json::from_str(&sqlite_text(cell).map_err(|_| mismatch("json text"))?)
                 .map_err(|_| mismatch("json"))?,
         ),
+        FieldType::Bytes => Value::Bytes(sqlite_blob(cell).map_err(|_| mismatch("bytes"))?),
     })
 }

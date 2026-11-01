@@ -1261,11 +1261,13 @@ fn render_pg_cell(full: &Row, idx: usize) -> Result<String, Box<dyn std::error::
         Type::BOOL => FieldType::Bool,
         Type::INT4 => FieldType::I32,
         Type::INT8 => FieldType::I64,
+        Type::FLOAT8 => FieldType::F64,
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => FieldType::Text,
         Type::NUMERIC => FieldType::Decimal,
         Type::TIMESTAMP | Type::TIMESTAMPTZ => FieldType::Timestamp,
         Type::UUID => FieldType::Uuid,
         Type::JSON | Type::JSONB => FieldType::Json,
+        Type::BYTEA => FieldType::Bytes,
         _ => {
             // Outside the ORM's set. Text is the escape a SELECT can always take,
             // and the error names how: `col::text`.
