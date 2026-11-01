@@ -35,12 +35,27 @@ pub struct ColumnSpec {
     pub ty: FieldType,
 }
 
+/// Whether a compiled statement only reads, or writes.
+///
+/// The executor routes by this: a [`Read`](StatementKind::Read) may run on a
+/// read replica when one is configured, while a [`Write`](StatementKind::Write)
+/// — including an `INSERT … RETURNING`, which returns rows yet still writes —
+/// always runs on the primary. It is the compiler, not a guess from the SQL
+/// text, that classifies this: the one place that knows for certain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Read,
+    Write,
+}
+
 /// Compiled SQL, its parameters in binding order, and how to read the result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sql {
     pub text: String,
     pub params: Vec<Value>,
     pub columns: Vec<ColumnSpec>,
+    /// Read or write, for replica routing. See [`StatementKind`].
+    pub kind: StatementKind,
 }
 
 /// What a `QuerySet` accumulates, and all the compiler needs.
@@ -712,6 +727,7 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -738,6 +754,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
                 name: "count".into(),
                 ty: FieldType::I64,
             }],
+            kind: StatementKind::Read,
         });
     }
 
@@ -759,6 +776,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "count".into(),
             ty: FieldType::I64,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -781,6 +799,7 @@ pub fn compile_exists_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "exists".into(),
             ty: FieldType::Bool,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -823,6 +842,7 @@ pub fn compile_aggregate_on(plan: &Plan, aggs: &[Aggregate], dialect: Dialect) -
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -934,6 +954,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         text,
         params,
         columns: vec![],
+        kind: StatementKind::Write,
     })
 }
 
@@ -964,6 +985,7 @@ pub fn compile_delete_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
         ),
         params: inner.params,
         columns: vec![],
+        kind: StatementKind::Write,
     })
 }
 
@@ -1083,6 +1105,7 @@ pub fn compile_insert_on(
                 ty: f.ty,
             })
             .collect(),
+        kind: StatementKind::Write,
     })
 }
 

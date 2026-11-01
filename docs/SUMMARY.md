@@ -33,3 +33,4 @@
   - [0007 — Prepared-statement cache & benchmarks](adr/0007-prepared-statement-cache-and-benchmarks.md)
   - [0008 — Observability](adr/0008-observability.md)
   - [0009 — Accounts admin](adr/0009-accounts-admin.md)
+  - [0010 — Database handle & read-replica routing](adr/0010-database-handle-and-read-replica-routing.md)

@@ -155,8 +155,16 @@ pub async fn refresh_instance<T: Model>(obj: &mut T) -> Result<()> {
 }
 
 /// Run compiled SQL that returns rows, against whichever backend the DSN names.
+///
+/// Routed by what the compiler classified the statement as: a
+/// [`Read`](compiler::StatementKind::Read) may go to a read replica
+/// ([`db::fetch_read`]), while a [`Write`](compiler::StatementKind::Write) that
+/// returns rows — an `INSERT … RETURNING` — stays on the primary ([`db::fetch`]).
 pub async fn run_query(sql: &compiler::Sql) -> Result<Vec<Row>> {
-    db::fetch(&sql.text, &sql.params).await
+    match sql.kind {
+        compiler::StatementKind::Read => db::fetch_read(&sql.text, &sql.params).await,
+        compiler::StatementKind::Write => db::fetch(&sql.text, &sql.params).await,
+    }
 }
 
 /// Run compiled SQL for its row count, against whichever backend the DSN names.

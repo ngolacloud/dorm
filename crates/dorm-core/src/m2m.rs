@@ -128,7 +128,7 @@ impl ManyToMany {
 
     /// Whether `a` and `b` are linked.
     pub async fn exists(&self, a: Value, b: Value) -> Result<bool> {
-        let rows = db::fetch(
+        let rows = db::fetch_read(
             &format!(
                 "SELECT 1 FROM {} WHERE {} = {} AND {} = {} LIMIT 1",
                 self.table,
@@ -145,7 +145,7 @@ impl ManyToMany {
 
     /// How many things `a` is linked to.
     pub async fn count(&self, a: Value) -> Result<i64> {
-        let rows = db::fetch(
+        let rows = db::fetch_read(
             &format!(
                 "SELECT count(*) FROM {} WHERE {} = {}",
                 self.table,
@@ -165,7 +165,7 @@ impl ManyToMany {
     /// hand these to `B::objects().filter_str("pk__in", …)` to load the rows, or
     /// use the reverse-relation filter in the module docs.
     pub async fn keys<K: Decode>(&self, a: Value) -> Result<Vec<K>> {
-        db::fetch(
+        db::fetch_read(
             &format!(
                 "SELECT {} FROM {} WHERE {} = {}",
                 self.b_column,

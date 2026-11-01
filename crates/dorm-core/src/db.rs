@@ -45,6 +45,11 @@ use crate::value::Value;
 pub const DSN_ENV: &str = "DELONIX_ORM_DSN";
 /// Accepted fallback, checked only when [`DSN_ENV`] is absent.
 pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
+/// An optional read-replica DSN. When set, the process-default [`Database`]
+/// routes the reads DORM compiles (`StatementKind::Read`) to it, while writes —
+/// and anything inside a transaction — stay on [`DSN_ENV`]'s primary. Absent,
+/// there is no replica and every statement runs on the primary, unchanged.
+pub const REPLICA_DSN_ENV: &str = "DELONIX_ORM_REPLICA_DSN";
 /// Ceiling on pooled connections.
 pub const POOL_MAX_ENV: &str = "DELONIX_ORM_POOL_MAX";
 /// How long a caller waits for a connection before giving up.
@@ -81,7 +86,36 @@ const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
 /// those are never here (see [`observe`]).
 const SQL_LOG_MAX: usize = 300;
 
-static POOL: OnceLock<Pool> = OnceLock::new();
+/// The process-default database, built lazily from the environment the first
+/// time it is needed.
+///
+/// It is a *default*, not the only source. A caller can build a [`Database`]
+/// explicitly and run against it with [`with_session`]; the module never
+/// *requires* this global — which is what lets one process serve many databases
+/// (a tenant's, a primary/replica pair) instead of the single process-wide pool
+/// it used to be locked to.
+static DEFAULT_DB: OnceLock<Database> = OnceLock::new();
+
+tokio::task_local! {
+    /// The [`Database`] in scope for this task, if any. Set by [`with_session`]
+    /// and consulted by every statement before it falls back to [`DEFAULT_DB`].
+    /// This is what carries a per-session database — a tenant's, or a
+    /// primary/replica pair — down to the `db::*` calls without threading a
+    /// handle through every `QuerySet` method (the same task-local shape the
+    /// transaction routing and the read-only scope already use).
+    static SESSION: Arc<Database>;
+}
+
+/// Which connection a statement wants: the primary, or a read replica when the
+/// active [`Database`] has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Writes, DDL, raw statements, and everything inside a transaction.
+    Primary,
+    /// A read DORM compiled (`compiler::StatementKind::Read`); served by the
+    /// replica when the active database has one, otherwise by the primary.
+    ReadReplica,
+}
 
 /// The process-wide read-only default, for the one-process-one-session case (the
 /// CLI/shell's `--read-only`). A *session* can override it per task — see
@@ -305,13 +339,17 @@ where
     READ_ONLY_SCOPE.scope(yes, fut).await
 }
 
-/// Whether the current context is read-only: the task-local session scope if one
-/// is active ([`with_read_only`]), otherwise the process-wide [`set_read_only`]
-/// default.
+/// Whether the current context is read-only, most specific wins: the per-task
+/// scope ([`with_read_only`], B-12) overrides the session's [`Database`] default
+/// ([`with_session`]), which overrides the process-wide [`set_read_only`] flag.
 pub fn is_read_only() -> bool {
-    READ_ONLY_SCOPE
-        .try_with(|&yes| yes)
-        .unwrap_or_else(|_| READ_ONLY.load(Ordering::SeqCst))
+    if let Ok(yes) = READ_ONLY_SCOPE.try_with(|&yes| yes) {
+        return yes;
+    }
+    if let Ok(yes) = SESSION.try_with(|db| db.read_only) {
+        return yes;
+    }
+    READ_ONLY.load(Ordering::SeqCst)
 }
 
 /// Refuse a write in a read-only session.
@@ -322,29 +360,91 @@ pub fn guard_write(op: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Build the pool, once.
+/// A database: a primary connection pool, an optional read replica, and the
+/// read-only default for sessions that run against it.
 ///
-/// # The pool belongs to one runtime
+/// This is the handle that replaced the single process-wide pool. A process can
+/// hold as many as it needs — one per tenant, a primary/replica pair — and reach
+/// one for a unit of work with [`with_session`], instead of every `db::*` call
+/// implicitly meaning the one global pool. The [`DEFAULT_DB`] built from the
+/// environment is just the most common case of this, kept so the embedded
+/// single-database path needs no session at all.
+///
+/// # The pools belong to one runtime
 ///
 /// `tokio-postgres` drives each connection from a background task, so a pooled
-/// connection is owned by the runtime that created it. This pool is a process
-/// global, which means **the process must keep one runtime alive for as long as
-/// it uses the ORM**. Drop that runtime and every connection in the pool dies
-/// with it; the next borrow comes back `connection closed`.
-///
-/// It matters for the shell: the synchronous REPL has to build its runtime once
-/// and `block_on` against that same one for the whole session. A runtime per
-/// statement would work for exactly one statement. This is not a hypothetical —
-/// it is what the integration tests did first, and five of them failed on it.
-pub fn pool() -> Result<&'static Pool> {
-    if let Some(p) = POOL.get() {
-        return Ok(p);
+/// connection is owned by the runtime that created it. **The process must keep
+/// one runtime alive for as long as it uses these pools.** Drop that runtime and
+/// every connection dies with it; the next borrow comes back `connection
+/// closed`. It matters for the shell: the synchronous REPL builds its runtime
+/// once and `block_on`s against that same one for the whole session. A runtime
+/// per statement would work for exactly one statement — it is what the
+/// integration tests did first, and five of them failed on it.
+pub struct Database {
+    primary: Pool,
+    /// Present when a replica DSN was configured; reads route here.
+    replica: Option<Pool>,
+    /// The primary DSN, kept so backend/dialect detection can consult the active
+    /// database rather than only the process environment.
+    dsn: String,
+    /// The read-only default for sessions on this database. A task can still
+    /// override it per request with [`with_read_only`] (B-12).
+    read_only: bool,
+}
+
+impl Database {
+    /// Connect a database from explicit DSNs: a required primary and an optional
+    /// read replica. `read_only` becomes the default for sessions that run
+    /// against it (overridable per task by [`with_read_only`]).
+    ///
+    /// This is the handle a server builds per tenant, or once with a
+    /// primary/replica pair; it needs no process environment set, which is what
+    /// frees the module from requiring the global pool.
+    pub fn connect(primary_dsn: &str, replica_dsn: Option<&str>, read_only: bool) -> Result<Self> {
+        let primary = build_pool(primary_dsn)?;
+        let replica = match replica_dsn {
+            Some(r) if !r.trim().is_empty() => Some(build_pool(r)?),
+            _ => None,
+        };
+        Ok(Database {
+            primary,
+            replica,
+            dsn: primary_dsn.to_string(),
+            read_only,
+        })
     }
-    let raw = dsn()?;
+
+    /// Build the process-default database from the environment: [`DSN_ENV`] for
+    /// the primary and [`REPLICA_DSN_ENV`] for the optional replica.
+    fn from_env() -> Result<Self> {
+        let primary = dsn()?;
+        let replica = std::env::var(REPLICA_DSN_ENV)
+            .ok()
+            .filter(|r| !r.trim().is_empty());
+        Database::connect(&primary, replica.as_deref(), false)
+    }
+
+    /// The pool a route resolves to. A [`Route::ReadReplica`] picks the replica
+    /// only when one exists **and** no transaction is open: a transaction already
+    /// holds its own connection and must not be split across primary and replica,
+    /// and it is the one place a read must see its own uncommitted writes.
+    fn pool_for(&self, route: Route) -> &Pool {
+        match route {
+            Route::ReadReplica if !in_transaction() => {
+                self.replica.as_ref().unwrap_or(&self.primary)
+            }
+            _ => &self.primary,
+        }
+    }
+}
+
+/// Build one connection pool for a DSN. This is the former body of `pool()`,
+/// lifted so a [`Database`] can build a primary and a replica the same way.
+fn build_pool(raw: &str) -> Result<Pool> {
     // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
     // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
     // the parse; verification is done by the connector, not the driver.
-    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(&raw);
+    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(raw);
     let mut config: Config = cleaned
         .parse()
         .map_err(|e| Error::Config(format!("the DSN is not usable: {e}")))?;
@@ -363,7 +463,7 @@ pub fn pool() -> Result<&'static Pool> {
     let requirement = ssl_requirement(mode.as_deref())?;
 
     let manager = build_manager(config, requirement, root.as_deref())?;
-    let pool = Pool::builder(manager)
+    Pool::builder(manager)
         // Required because the timeouts below are set: deadpool needs a runtime
         // to arm them against, and without this it refuses to build with
         // "Timeouts require a runtime" rather than silently ignoring them.
@@ -375,9 +475,38 @@ pub fn pool() -> Result<&'static Pool> {
         ) as u64)))
         .create_timeout(Some(Duration::from_millis(POOL_ACQUIRE_TIMEOUT_DEFAULT_MS)))
         .build()
-        .map_err(|e| Error::Pool(e.to_string()))?;
+        .map_err(|e| Error::Pool(e.to_string()))
+}
 
-    Ok(POOL.get_or_init(|| pool))
+/// The process-default database, built from the environment on first use.
+fn default_db() -> Result<&'static Database> {
+    if let Some(d) = DEFAULT_DB.get() {
+        return Ok(d);
+    }
+    let built = Database::from_env()?;
+    Ok(DEFAULT_DB.get_or_init(|| built))
+}
+
+/// Run `fut` with `db` as the database in scope for the task, so every `db::*`
+/// statement it makes — queries, writes, transactions — runs against `db`
+/// instead of the process default. Concurrent sessions on different databases do
+/// not see each other's: a spawned task starts outside the scope and falls back
+/// to the default, exactly as the read-only scope and the transaction scope do.
+pub async fn with_session<F, T>(db: Arc<Database>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION.scope(db, fut).await
+}
+
+/// The primary pool of the process-default database.
+///
+/// Kept for callers that want the process pool directly — the pool-stats gauge,
+/// chiefly. It is deliberately the *default*: a statement does not go through
+/// here, it goes through [`acquire`], which honours the session in scope. This
+/// returns the global so the embedded single-database path is unchanged.
+pub fn pool() -> Result<&'static Pool> {
+    Ok(&default_db()?.primary)
 }
 
 // --------------------------------------------------------------------- TLS
@@ -687,8 +816,19 @@ tokio::task_local! {
     static CURRENT_TX: Shared;
 }
 
-async fn acquire() -> Result<Object> {
-    pool()?
+/// Acquire a connection for `route` from the database in scope — the session's
+/// if [`with_session`] set one, otherwise the process default. Holding the
+/// session `Arc` across the `.await` keeps its pools alive for the borrow.
+async fn acquire(route: Route) -> Result<Object> {
+    if let Ok(db) = SESSION.try_with(|d| d.clone()) {
+        return db
+            .pool_for(route)
+            .get()
+            .await
+            .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")));
+    }
+    default_db()?
+        .pool_for(route)
         .get()
         .await
         .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
@@ -710,12 +850,28 @@ async fn acquire() -> Result<Object> {
 /// given query — pays Parse once and is Bind/Execute-only thereafter. The win
 /// grows with repetition, which is the ORM's whole access pattern.
 pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    query_routed(sql, params, Route::Primary).await
+}
+
+/// Run a read on a read replica when the active [`Database`] has one — otherwise
+/// identical to [`query`]. This is the entry the typed read funnel uses for a
+/// `StatementKind::Read`; a transaction in scope keeps it on the primary (a
+/// transaction must read its own writes), as [`Database::pool_for`] enforces.
+pub async fn query_read(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    query_routed(sql, params, Route::ReadReplica).await
+}
+
+async fn query_routed(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    route: Route,
+) -> Result<Vec<PgRow>> {
     // Observed end to end (ADR 0008): the clock spans Parse-or-cache-hit plus
     // Bind/Execute, which is the latency the caller actually pays. `in_tx` is
     // read up front so the event records the routing even on the error path.
     let in_tx = in_transaction();
     let start = Instant::now();
-    let result = query_inner(sql, params).await;
+    let result = query_inner(sql, params, route).await;
     observe(
         "query",
         sql,
@@ -726,7 +882,11 @@ pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRo
     result
 }
 
-async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+async fn query_inner(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    route: Route,
+) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
@@ -738,7 +898,7 @@ async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Pg
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.query(&stmt, params).await.map_err(from_pg);
     }
-    let conn = acquire().await?;
+    let conn = acquire(route).await?;
     if no_prepare() {
         return conn.query(sql, params).await.map_err(from_pg);
     }
@@ -778,7 +938,8 @@ async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64>
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.execute(&stmt, params).await.map_err(from_pg);
     }
-    let conn = acquire().await?;
+    // Writes always run on the primary.
+    let conn = acquire(Route::Primary).await?;
     if no_prepare() {
         return conn.execute(sql, params).await.map_err(from_pg);
     }
@@ -823,9 +984,20 @@ pub fn backend_of(dsn: &str) -> Backend {
     }
 }
 
+/// The DSN of the database in scope — the session's ([`with_session`]) if one is
+/// set, otherwise the process environment's. Backend and dialect detection use
+/// this so a session on an explicit [`Database`] is classified by *its* DSN, and
+/// a process that runs purely through sessions needs no environment DSN at all.
+fn active_dsn() -> Result<String> {
+    if let Ok(d) = SESSION.try_with(|db| db.dsn.clone()) {
+        return Ok(d);
+    }
+    dsn()
+}
+
 /// The configured backend, or an error if no DSN is set.
 fn backend() -> Result<Backend> {
-    Ok(backend_of(&dsn()?))
+    Ok(backend_of(&active_dsn()?))
 }
 
 /// The SQL dialect the configured backend speaks.
@@ -835,7 +1007,7 @@ fn backend() -> Result<Backend> {
 /// query's SQL still works — the missing DSN surfaces later, when the query is
 /// actually run.
 pub fn dialect() -> Dialect {
-    match dsn() {
+    match active_dsn() {
         Ok(d) if backend_of(&d) == Backend::Sqlite => Dialect::Sqlite,
         _ => Dialect::Postgres,
     }
@@ -853,6 +1025,29 @@ pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
             let borrowed: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
             Ok(query(sql, &borrowed)
+                .await?
+                .into_iter()
+                .map(Row::Pg)
+                .collect())
+        }
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => sqlite::fetch(sql, params).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+    }
+}
+
+/// Run a read that may be served by a read replica, handing back
+/// backend-agnostic [`Row`]s. This is [`fetch`] for a `StatementKind::Read`: on
+/// PostgreSQL it routes through [`query_read`], so the active [`Database`]'s
+/// replica serves it when there is one (and no transaction is open). SQLite has
+/// no replica, so it is identical to [`fetch`] there.
+pub async fn fetch_read(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    match backend()? {
+        Backend::Postgres => {
+            let borrowed: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+            Ok(query_read(sql, &borrowed)
                 .await?
                 .into_iter()
                 .map(Row::Pg)
@@ -911,7 +1106,7 @@ pub async fn sql_execute(sql: &str, params: &[Value]) -> Result<u64> {
 /// backend. Used to stand a schema up before the typed path queries it.
 pub async fn run_ddl(ddl: &str) -> Result<()> {
     match backend()? {
-        Backend::Postgres => simple(&acquire().await?, ddl).await,
+        Backend::Postgres => simple(&acquire(Route::Primary).await?, ddl).await,
         #[cfg(feature = "sqlite")]
         Backend::Sqlite => sqlite::run_ddl(ddl).await,
         #[cfg(not(feature = "sqlite"))]
@@ -1404,7 +1599,7 @@ where
 
         // The outermost transaction.
         Err(_) => {
-            let conn = acquire().await?;
+            let conn = acquire(Route::Primary).await?;
             let start = if is_read_only() {
                 "BEGIN READ ONLY"
             } else {
@@ -1499,7 +1694,7 @@ enum TxHandle {
 pub async fn begin_interactive() -> Result<InteractiveTransaction> {
     match backend()? {
         Backend::Postgres => {
-            let conn = acquire().await?;
+            let conn = acquire(Route::Primary).await?;
             let start = if is_read_only() {
                 "BEGIN READ ONLY"
             } else {
