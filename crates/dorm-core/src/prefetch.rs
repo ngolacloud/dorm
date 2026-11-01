@@ -16,7 +16,8 @@
 //! # async fn f() -> dorm_core::Result<()> {
 //! # use dorm_core::prefetch::prefetch;
 //! # use dorm_core::model::Model;
-//! # #[derive(Clone)] struct Tenant; # #[derive(Clone)] struct Application;
+//! # #[derive(Clone)] struct Tenant;
+//! # #[derive(Clone)] struct Application;
 //! # impl Model for Tenant { fn meta() -> &'static dorm_core::meta::ModelMeta { unimplemented!() } fn from_row(_: &dorm_core::row::Row, _: usize) -> dorm_core::Result<Self> { unimplemented!() } fn pk(&self) -> dorm_core::value::Value { unimplemented!() } fn column_values(&self) -> Vec<(String, dorm_core::value::Value)> { unimplemented!() } }
 //! # impl Model for Application { fn meta() -> &'static dorm_core::meta::ModelMeta { unimplemented!() } fn from_row(_: &dorm_core::row::Row, _: usize) -> dorm_core::Result<Self> { unimplemented!() } fn pk(&self) -> dorm_core::value::Value { unimplemented!() } fn column_values(&self) -> Vec<(String, dorm_core::value::Value)> { unimplemented!() } }
 //! # let tenants: Vec<Tenant> = vec![];

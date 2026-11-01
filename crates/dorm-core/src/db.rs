@@ -1280,6 +1280,65 @@ mod sqlite {
 
     static CONN: OnceLock<Arc<Mutex<rusqlite::Connection>>> = OnceLock::new();
 
+    /// The reader pool for a file-backed database (ADR 0017). Read-only
+    /// connections a standalone read checks out, so reads run concurrently with
+    /// the writer under WAL instead of serialising on the one connection. `None`
+    /// for `:memory:`, which has no file to share and keeps the single connection.
+    static READERS: OnceLock<Option<ReaderPool>> = OnceLock::new();
+
+    /// A pool of read-only connections to one file database, bounded by a
+    /// semaphore so at most N readers are live at once. Idle connections are kept
+    /// and reused rather than reopened per read.
+    struct ReaderPool {
+        path: String,
+        idle: Mutex<Vec<rusqlite::Connection>>,
+        permits: tokio::sync::Semaphore,
+    }
+
+    /// The reader pool for the configured DSN, or `None` for `:memory:`. Built
+    /// once; its size follows the same `DELONIX_ORM_POOL_MAX` as PostgreSQL's.
+    fn readers() -> Option<&'static ReaderPool> {
+        READERS
+            .get_or_init(|| {
+                dsn_path(&dsn().ok()?).map(|path| ReaderPool {
+                    path,
+                    idle: Mutex::new(Vec::new()),
+                    permits: tokio::sync::Semaphore::new(super::env_usize(super::POOL_MAX_ENV, 4)),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Run a standalone read on a pooled reader connection. Holds a permit for the
+    /// query so the pool never exceeds its size, checks out an idle connection (or
+    /// opens one), and returns it afterwards — even if the query failed.
+    async fn read_pooled(
+        pool: &'static ReaderPool,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Row>> {
+        let _permit = pool
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| Error::Db("the SQLite reader pool is closed".into()))?;
+        let conn = match pool.idle.lock().map_err(|_| poisoned())?.pop() {
+            Some(c) => c,
+            None => open_reader(&pool.path)?,
+        };
+        let sql = sql.to_string();
+        let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+        // The connection moves into the blocking closure and back out, so a failed
+        // query still returns it to the pool rather than leaking it.
+        let (result, conn) = blocking(move || {
+            let rows = query_on(&conn, &sql, params);
+            Ok((rows, conn))
+        })
+        .await?;
+        pool.idle.lock().map_err(|_| poisoned())?.push(conn);
+        result
+    }
+
     /// Serialises logical access to the single connection. An outer `atomic`
     /// holds it for its whole scope; a standalone statement holds it for one call.
     /// This — not the per-call connection `Mutex` — is what keeps a transaction
@@ -1331,23 +1390,71 @@ mod sqlite {
         Ok(CONN.get_or_init(|| Arc::new(Mutex::new(c))).clone())
     }
 
-    /// Open a connection for the DSN. `sqlite::memory:`, `sqlite:` and `:memory:`
-    /// are in-memory; anything else is the file path after the scheme.
-    fn open(dsn: &str) -> Result<rusqlite::Connection> {
+    /// The file path a SQLite DSN names, or `None` for an in-memory database.
+    /// `sqlite::memory:`, `sqlite:` and `:memory:` are in-memory; anything else is
+    /// the path after the scheme.
+    fn dsn_path(dsn: &str) -> Option<String> {
         let rest = dsn
             .trim()
             .strip_prefix("sqlite:")
             .or_else(|| dsn.trim().strip_prefix("file:"))
             .unwrap_or_else(|| dsn.trim());
-        let conn = if rest.is_empty() || rest == ":memory:" {
-            rusqlite::Connection::open_in_memory()
+        if rest.is_empty() || rest == ":memory:" {
+            None
         } else {
-            rusqlite::Connection::open(rest)
-        };
-        conn.map_err(|e| Error::Db(e.to_string()))
+            Some(rest.to_string())
+        }
+    }
+
+    /// Open the writer connection for the DSN. A file database is put in **WAL**
+    /// journal mode (ADR 0017): a writer and the pooled readers then run
+    /// concurrently — readers see the last committed snapshot while the writer
+    /// writes, instead of every statement serialising on one connection. An
+    /// in-memory database cannot use WAL (it has no file to journal), so it keeps
+    /// the single-connection behaviour.
+    fn open(dsn: &str) -> Result<rusqlite::Connection> {
+        match dsn_path(dsn) {
+            None => rusqlite::Connection::open_in_memory().map_err(|e| Error::Db(e.to_string())),
+            Some(path) => {
+                let conn =
+                    rusqlite::Connection::open(&path).map_err(|e| Error::Db(e.to_string()))?;
+                // WAL is a persistent property of the database file, so setting it
+                // on the writer is enough — a reader that opens the same file later
+                // is already in WAL mode. `busy_timeout` lets a brief lock
+                // contention wait rather than failing with `SQLITE_BUSY`.
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .map_err(|e| Error::Db(e.to_string()))?;
+                conn.busy_timeout(std::time::Duration::from_millis(5_000))
+                    .map_err(|e| Error::Db(e.to_string()))?;
+                Ok(conn)
+            }
+        }
+    }
+
+    /// Open a read-only connection to a file database for the reader pool. WAL is
+    /// already set by the writer, so a reader only needs its own `busy_timeout`.
+    fn open_reader(path: &str) -> Result<rusqlite::Connection> {
+        use rusqlite::OpenFlags;
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| Error::Db(e.to_string()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(5_000))
+            .map_err(|e| Error::Db(e.to_string()))?;
+        Ok(conn)
     }
 
     pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        // A standalone read on a file database goes to the reader pool — concurrent
+        // with the writer under WAL. Inside a transaction, or on `:memory:`, it
+        // stays on the one connection the transaction or the database holds, so it
+        // still reads its own uncommitted writes.
+        if !in_tx() {
+            if let Some(pool) = readers() {
+                return read_pooled(pool, sql, params).await;
+            }
+        }
         let _lock = lock_if_standalone().await;
         fetch_on_conn(sql, params).await
     }
@@ -1368,28 +1475,40 @@ mod sqlite {
         .await
     }
 
-    /// Run a row-returning statement on the connection, assuming the caller holds
-    /// the connection lock (standalone statement) or is inside a transaction.
+    /// Run a row-returning statement on one connection — the shape the reader pool
+    /// and the shared-connection path both need. Synchronous: the callers wrap it
+    /// in [`blocking`].
+    fn query_on(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: Vec<rusqlite::types::Value>,
+    ) -> Result<Vec<Row>> {
+        let mut stmt = conn.prepare(sql).map_err(db_err)?;
+        let ncols = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let mut cells = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                cells.push(r.get::<usize, rusqlite::types::Value>(i).map_err(db_err)?);
+            }
+            out.push(Row::Sqlite(SqliteRow::new(cells)));
+        }
+        Ok(out)
+    }
+
+    /// Run a row-returning statement on the **shared** connection, assuming the
+    /// caller holds the connection lock (standalone statement) or is inside a
+    /// transaction.
     async fn fetch_on_conn(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         let conn = conn()?;
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
         blocking(move || {
             let guard = conn.lock().map_err(|_| poisoned())?;
-            let mut stmt = guard.prepare(&sql).map_err(db_err)?;
-            let ncols = stmt.column_count();
-            let mut rows = stmt
-                .query(rusqlite::params_from_iter(params))
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(r) = rows.next().map_err(db_err)? {
-                let mut cells = Vec::with_capacity(ncols);
-                for i in 0..ncols {
-                    cells.push(r.get::<usize, rusqlite::types::Value>(i).map_err(db_err)?);
-                }
-                out.push(Row::Sqlite(SqliteRow::new(cells)));
-            }
-            Ok(out)
+            query_on(&guard, &sql, params)
         })
         .await
     }

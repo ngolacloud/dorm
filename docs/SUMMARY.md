@@ -40,3 +40,4 @@
   - [0014 — Reversible migrations](adr/0014-reversible-migrations.md)
   - [0015 — Connection resilience](adr/0015-connection-resilience.md)
   - [0016 — Wider Value: float & bytes](adr/0016-wider-value-float-and-bytes.md)
+  - [0017 — SQLite reader pool (WAL)](adr/0017-sqlite-reader-pool-wal.md)
