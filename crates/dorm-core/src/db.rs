@@ -1047,6 +1047,8 @@ async fn simple(conn: &Object, sql: &str) -> Result<()> {
 pub enum Backend {
     Postgres,
     Sqlite,
+    /// MySQL / MariaDB (ADR 0018), opt-in behind the `mysql` feature.
+    MySql,
 }
 
 /// Which backend the configured DSN selects.
@@ -1060,6 +1062,8 @@ pub fn backend_of(dsn: &str) -> Backend {
     let lower = d.to_ascii_lowercase();
     if lower.starts_with("sqlite:") || lower.starts_with("file:") || d == ":memory:" {
         Backend::Sqlite
+    } else if lower.starts_with("mysql:") || lower.starts_with("mariadb:") {
+        Backend::MySql
     } else {
         Backend::Postgres
     }
@@ -1088,8 +1092,9 @@ fn backend() -> Result<Backend> {
 /// query's SQL still works — the missing DSN surfaces later, when the query is
 /// actually run.
 pub fn dialect() -> Dialect {
-    match active_dsn() {
-        Ok(d) if backend_of(&d) == Backend::Sqlite => Dialect::Sqlite,
+    match active_dsn().map(|d| backend_of(&d)) {
+        Ok(Backend::Sqlite) => Dialect::Sqlite,
+        Ok(Backend::MySql) => Dialect::MySql,
         _ => Dialect::Postgres,
     }
 }
@@ -1166,6 +1171,26 @@ impl Driver for SqliteDriver {
     }
 }
 
+/// The MySQL driver: its own `mysql_async` pool (ADR 0018). Like SQLite it does
+/// not use the `Database` handle, so `route` is ignored (no replica yet).
+#[cfg(feature = "mysql")]
+struct MySqlDriver;
+
+#[cfg(feature = "mysql")]
+impl Driver for MySqlDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], _route: Route) -> Result<Vec<Row>> {
+        mysql::fetch(sql, params).await
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        mysql::run(sql, params).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        mysql::run_ddl(ddl).await
+    }
+}
+
 /// Run a row-returning statement on the active backend's [`Driver`], taking ORM
 /// values and handing back backend-agnostic [`Row`]s. Keeps the
 /// transaction-in-scope routing (PostgreSQL via `CURRENT_TX`; SQLite via its own
@@ -1189,6 +1214,10 @@ async fn fetch_routed(sql: &str, params: &[Value], route: Route) -> Result<Vec<R
         Backend::Sqlite => SqliteDriver.fetch(sql, params, route).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.fetch(sql, params, route).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 
@@ -1200,6 +1229,10 @@ pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
         Backend::Sqlite => SqliteDriver.run(sql, params).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.run(sql, params).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 
@@ -1239,6 +1272,10 @@ pub async fn run_ddl(ddl: &str) -> Result<()> {
         Backend::Sqlite => SqliteDriver.run_ddl(ddl).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.run_ddl(ddl).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 
@@ -1248,6 +1285,16 @@ fn sqlite_disabled() -> Error {
     Error::Config(
         "the DSN selects SQLite, but this build has no SQLite backend; \
          rebuild dorm-core with features = [\"sqlite\"]"
+            .into(),
+    )
+}
+
+/// The error a MySQL DSN gets in a build that left the `mysql` feature off.
+#[cfg(not(feature = "mysql"))]
+fn mysql_disabled() -> Error {
+    Error::Config(
+        "the DSN selects MySQL, but this build has no MySQL backend; \
+         rebuild dorm-core with features = [\"mysql\"]"
             .into(),
     )
 }
@@ -1718,6 +1765,99 @@ mod sqlite {
     }
 }
 
+/// The MySQL backend: its own `mysql_async` pool (ADR 0018), a sibling of the
+/// `sqlite` module. Like SQLite it reads the DSN from the process environment and
+/// does not use the `Database` handle — session/replica wait for the Database↔
+/// Driver refactor. The non-scalar types travel as text/native values via
+/// [`value_to_mysql`]/the `mysql_*` decoders in [`crate::row`].
+///
+/// Each new connection runs the `init` statements: **`ANSI_QUOTES`** so the
+/// compiler's double-quoted identifiers are identifiers, not string literals;
+/// **`time_zone='+00:00'`** so a `DATETIME` round-trips a `DateTime<Utc>`; and
+/// **`utf8mb4`**.
+#[cfg(feature = "mysql")]
+mod mysql {
+    use std::sync::OnceLock;
+
+    use mysql_async::prelude::Queryable;
+
+    use super::{dsn, Error, Result};
+    use crate::compiler::positionalize;
+    use crate::row::{value_to_mysql, Row};
+    use crate::value::Value;
+
+    static MYSQL_POOL: OnceLock<mysql_async::Pool> = OnceLock::new();
+
+    /// The pool, built once from the DSN with the per-connection `init` fixups.
+    fn pool() -> Result<&'static mysql_async::Pool> {
+        if let Some(p) = MYSQL_POOL.get() {
+            return Ok(p);
+        }
+        let url = dsn()?;
+        let opts = mysql_async::Opts::from_url(&url)
+            .map_err(|e| Error::Config(format!("the MySQL DSN is not usable: {e}")))?;
+        let builder = mysql_async::OptsBuilder::from_opts(opts).init(vec![
+            // Append, never overwrite, so the server's strict mode is kept.
+            "SET SESSION sql_mode=CONCAT(@@sql_mode, ',ANSI_QUOTES')".to_string(),
+            "SET time_zone='+00:00'".to_string(),
+            "SET NAMES utf8mb4".to_string(),
+        ]);
+        Ok(MYSQL_POOL.get_or_init(|| mysql_async::Pool::new(builder)))
+    }
+
+    /// Acquire a connection, retrying a transient failure with the same capped
+    /// backoff as the PostgreSQL path (ADR 0015).
+    async fn conn() -> Result<mysql_async::Conn> {
+        let max = super::env_u64(super::RETRY_MAX_ENV, super::RETRY_MAX_DEFAULT);
+        let base = super::env_u64(super::RETRY_BASE_MS_ENV, super::RETRY_BASE_MS_DEFAULT);
+        let mut attempt: u32 = 0;
+        loop {
+            match pool()?.get_conn().await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    if u64::from(attempt) >= max {
+                        return Err(Error::Pool(format!(
+                            "could not acquire a MySQL connection: {e}"
+                        )));
+                    }
+                    tokio::time::sleep(super::backoff_delay(base, attempt)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// The numbered `?n` the compiler emits, converted to the bare positional `?`
+    /// MySQL binds by order, with the parameters reordered to match (ADR 0018).
+    fn positional(sql: &str, params: &[Value]) -> (String, Vec<mysql_async::Value>) {
+        let (text, ordered) = positionalize(sql, params);
+        (text, ordered.iter().map(value_to_mysql).collect())
+    }
+
+    pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        let (text, params) = positional(sql, params);
+        let mut conn = conn().await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(text, params).await.map_err(db_err)?;
+        Ok(rows.into_iter().map(Row::MySql).collect())
+    }
+
+    pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+        let (text, params) = positional(sql, params);
+        let mut conn = conn().await?;
+        conn.exec_drop(text, params).await.map_err(db_err)?;
+        Ok(conn.affected_rows())
+    }
+
+    pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+        let mut conn = conn().await?;
+        conn.query_drop(ddl).await.map_err(db_err)
+    }
+
+    fn db_err(e: mysql_async::Error) -> Error {
+        Error::Db(e.to_string())
+    }
+}
+
 /// A handle on the transaction in scope.
 ///
 /// It carries no connection: the task-local does the routing. What it offers is
@@ -1790,6 +1930,11 @@ where
         Backend::Sqlite => sqlite::atomic(f).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        // MySQL transactions land in the next increment (ADR 0018 Inc. 2); the
+        // raw statement path above already works on MySQL.
+        Backend::MySql => Err(Error::Db(
+            "MySQL transactions are not implemented yet (ADR 0018 Inc. 2)".into(),
+        )),
     }
 }
 
@@ -1960,6 +2105,9 @@ pub async fn begin_interactive() -> Result<InteractiveTransaction> {
         ))),
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        Backend::MySql => Err(Error::Db(
+            "MySQL interactive transactions are not implemented yet (ADR 0018 Inc. 2)".into(),
+        )),
     }
 }
 

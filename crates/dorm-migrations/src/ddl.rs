@@ -17,6 +17,10 @@ use dorm_core::value::FieldType;
 pub enum Backend {
     Postgres,
     Sqlite,
+    /// MySQL / MariaDB (ADR 0018). The type map below is the first cut; the
+    /// `VARCHAR`-for-indexed-`TEXT` and table-level foreign-key refinements are
+    /// the DDL slice (ADR 0018 Inc. 3).
+    MySql,
 }
 
 impl Backend {
@@ -28,6 +32,7 @@ impl Backend {
         match dorm_core::db::backend_of(dsn) {
             dorm_core::db::Backend::Sqlite => Backend::Sqlite,
             dorm_core::db::Backend::Postgres => Backend::Postgres,
+            dorm_core::db::Backend::MySql => Backend::MySql,
         }
     }
 }
@@ -111,6 +116,7 @@ fn column_def(f: &FieldMeta, backend: Backend) -> Result<String> {
             return Ok(match backend {
                 Backend::Postgres => format!("{} BIGSERIAL PRIMARY KEY", f.column),
                 Backend::Sqlite => format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", f.column),
+                Backend::MySql => format!("{} BIGINT AUTO_INCREMENT PRIMARY KEY", f.column),
             });
         }
         let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f, backend)?);
@@ -169,7 +175,9 @@ pub fn add_column(meta: &ModelMeta, f: &FieldMeta) -> Result<String> {
 pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Result<String> {
     let guard = match backend {
         Backend::Postgres => "IF NOT EXISTS ",
-        Backend::Sqlite => "",
+        // MySQL has no `IF NOT EXISTS` on `ADD COLUMN`; the versioned ledger, not
+        // idempotent re-runs, is the source of truth there (ADR 0018).
+        Backend::Sqlite | Backend::MySql => "",
     };
     Ok(format!(
         "ALTER TABLE {} ADD COLUMN {}{} {}",
@@ -187,7 +195,7 @@ pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Resul
 pub fn drop_column(table: &str, column: &str, backend: Backend) -> String {
     let guard = match backend {
         Backend::Postgres => "IF EXISTS ",
-        Backend::Sqlite => "",
+        Backend::Sqlite | Backend::MySql => "",
     };
     format!("ALTER TABLE {table} DROP COLUMN {guard}{column}")
 }
@@ -228,6 +236,8 @@ pub fn index_on(table: &str, column: &str) -> String {
 /// to the plain form.
 pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> String {
     match backend {
+        // MySQL has no `CREATE INDEX CONCURRENTLY`.
+        Backend::MySql => index_on(table, column),
         Backend::Postgres => format!(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_{column}_idx ON {table} ({column})"
         ),
@@ -246,6 +256,7 @@ fn effective_default(f: &FieldMeta, backend: Backend) -> Option<String> {
             Some(match backend {
                 Backend::Postgres => "now()".to_string(),
                 Backend::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+                Backend::MySql => "CURRENT_TIMESTAMP(6)".to_string(),
             })
         } else {
             None
@@ -281,6 +292,26 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Decimal => "NUMERIC",
             FieldType::F64 => "REAL",
             FieldType::Bytes => "BLOB",
+        }
+        .to_string(),
+        Backend::MySql => match ty {
+            FieldType::I32 => "INT",
+            FieldType::I64 => "BIGINT",
+            FieldType::F64 => "DOUBLE",
+            // TINYINT(1) is MySQL's boolean; the driver maps 0/1 ↔ bool.
+            FieldType::Bool => "TINYINT(1)",
+            // `TEXT` here; a UNIQUE/indexed TEXT needs a `VARCHAR(n)` — the Inc. 3
+            // refinement that has the field's attributes to decide.
+            FieldType::Text => "TEXT",
+            // An unqualified DECIMAL is `(10,0)` on MySQL and would truncate cents;
+            // a wide precision keeps money exact, as ADR 0016 requires.
+            FieldType::Decimal => "DECIMAL(38,9)",
+            // DATETIME (not TIMESTAMP: no 2038 limit, no tz conversion); UTC comes
+            // from the connection's `time_zone='+00:00'`.
+            FieldType::Timestamp => "DATETIME(6)",
+            FieldType::Uuid => "CHAR(36)",
+            FieldType::Json => "JSON",
+            FieldType::Bytes => "LONGBLOB",
         }
         .to_string(),
     }

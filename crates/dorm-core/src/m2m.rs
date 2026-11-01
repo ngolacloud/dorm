@@ -241,13 +241,14 @@ impl BoundManyToMany {
 }
 
 /// A placeholder for bind parameter `n` in the configured backend's dialect:
-/// `$n` on PostgreSQL, `?n` on SQLite.
+/// `$n` on PostgreSQL, `?n` on SQLite and MySQL (MySQL's driver converts the
+/// numbered `?n` to a bare positional `?`).
 fn ph(n: usize) -> String {
     match db::dsn()
         .map(|d| db::backend_of(&d))
         .unwrap_or(Backend::Postgres)
     {
         Backend::Postgres => format!("${n}"),
-        Backend::Sqlite => format!("?{n}"),
+        Backend::Sqlite | Backend::MySql => format!("?{n}"),
     }
 }

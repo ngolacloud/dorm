@@ -34,6 +34,10 @@ pub enum Row {
     /// A SQLite row, its columns already read into owned values.
     #[cfg(feature = "sqlite")]
     Sqlite(SqliteRow),
+    /// A MySQL row (ADR 0018). `mysql_async::Row` owns its values, like SQLite's,
+    /// so it is held directly rather than materialised into a side type.
+    #[cfg(feature = "mysql")]
+    MySql(mysql_async::Row),
 }
 
 impl Row {
@@ -48,8 +52,17 @@ impl Row {
             Row::Pg(row) => T::from_pg(row, idx),
             #[cfg(feature = "sqlite")]
             Row::Sqlite(row) => T::from_sqlite(row.cell(idx)),
+            #[cfg(feature = "mysql")]
+            Row::MySql(row) => T::from_mysql(mysql_cell(row, idx)),
         }
     }
+}
+
+/// The MySQL cell at `idx`, or `NULL` if the row has no such column — a missing
+/// cell is a `NULL`, never a panic, as on SQLite.
+#[cfg(feature = "mysql")]
+pub(crate) fn mysql_cell(row: &mysql_async::Row, idx: usize) -> &mysql_async::Value {
+    row.as_ref(idx).unwrap_or(&mysql_async::Value::NULL)
 }
 
 /// The owned cells of one SQLite result row, in column order.
@@ -85,14 +98,18 @@ pub trait Decode: Sized {
     /// Decode from one already-read SQLite cell.
     #[cfg(feature = "sqlite")]
     fn from_sqlite(cell: &rusqlite::types::Value) -> Result<Self>;
+
+    /// Decode from one MySQL cell (ADR 0018).
+    #[cfg(feature = "mysql")]
+    fn from_mysql(cell: &mysql_async::Value) -> Result<Self>;
 }
 
-/// Impl [`Decode`] for a scalar and its `Option`. `$from_cell` turns a non-NULL
-/// SQLite cell into the value; a NULL is an error for the scalar and `None` for
-/// the `Option`, which is exactly PostgreSQL's `try_get::<_, T>` vs
-/// `try_get::<_, Option<T>>` split.
+/// Impl [`Decode`] for a scalar and its `Option`. `$from_sqlite`/`$from_mysql`
+/// turn a non-NULL cell of each backend into the value; a NULL is an error for
+/// the scalar and `None` for the `Option`, which is exactly PostgreSQL's
+/// `try_get::<_, T>` vs `try_get::<_, Option<T>>` split.
 macro_rules! impl_decode {
-    ($t:ty, $from_cell:expr) => {
+    ($t:ty, $from_sqlite:expr, $from_mysql:expr) => {
         impl Decode for $t {
             fn from_pg(row: &tokio_postgres::Row, idx: usize) -> Result<Self> {
                 row.try_get::<usize, $t>(idx)
@@ -105,7 +122,17 @@ macro_rules! impl_decode {
                     rusqlite::types::Value::Null => Err(Error::Db(
                         concat!("unexpected NULL reading a non-null ", stringify!($t)).into(),
                     )),
-                    other => ($from_cell)(other),
+                    other => ($from_sqlite)(other),
+                }
+            }
+
+            #[cfg(feature = "mysql")]
+            fn from_mysql(cell: &mysql_async::Value) -> Result<Self> {
+                match cell {
+                    mysql_async::Value::NULL => Err(Error::Db(
+                        concat!("unexpected NULL reading a non-null ", stringify!($t)).into(),
+                    )),
+                    other => ($from_mysql)(other),
                 }
             }
         }
@@ -120,36 +147,65 @@ macro_rules! impl_decode {
             fn from_sqlite(cell: &rusqlite::types::Value) -> Result<Self> {
                 match cell {
                     rusqlite::types::Value::Null => Ok(None),
-                    other => ($from_cell)(other).map(Some),
+                    other => ($from_sqlite)(other).map(Some),
+                }
+            }
+
+            #[cfg(feature = "mysql")]
+            fn from_mysql(cell: &mysql_async::Value) -> Result<Self> {
+                match cell {
+                    mysql_async::Value::NULL => Ok(None),
+                    other => ($from_mysql)(other).map(Some),
                 }
             }
         }
     };
 }
 
-// The `$from_cell` closures are compiled only under `sqlite`; with the feature
-// off they are dead tokens inside the cfg'd `from_sqlite` body and reference no
-// `rusqlite` item.
-impl_decode!(i32, |c| sqlite_int(c).map(|n| n as i32));
-impl_decode!(i64, sqlite_int);
-impl_decode!(bool, |c| sqlite_int(c).map(|n| n != 0));
-impl_decode!(String, sqlite_text);
-impl_decode!(rust_decimal::Decimal, |c| {
-    use std::str::FromStr as _;
-    rust_decimal::Decimal::from_str(&sqlite_text(c)?).map_err(|_| Error::Db("not a decimal".into()))
-});
-impl_decode!(chrono::DateTime<chrono::Utc>, |c| sqlite_timestamp(
-    &sqlite_text(c)?
-));
-impl_decode!(uuid::Uuid, |c| sqlite_text(c)?
-    .parse()
-    .map_err(|_| Error::Db("not a uuid".into())));
-impl_decode!(serde_json::Value, |c| serde_json::from_str(&sqlite_text(
-    c
-)?)
-.map_err(|_| Error::Db("not json".into())));
-impl_decode!(f64, sqlite_real);
-impl_decode!(Vec<u8>, sqlite_blob);
+// The closures are compiled only under their feature; with it off they are dead
+// tokens inside the cfg'd `from_sqlite`/`from_mysql` body. Non-scalar types
+// (Decimal, timestamp, uuid, json) travel as text on both SQLite and MySQL, so a
+// value written by one reads back identically.
+impl_decode!(i32, |c| sqlite_int(c).map(|n| n as i32), |c| mysql_int(c)
+    .map(|n| n as i32));
+impl_decode!(i64, sqlite_int, mysql_int);
+impl_decode!(bool, |c| sqlite_int(c).map(|n| n != 0), |c| mysql_int(c)
+    .map(|n| n != 0));
+impl_decode!(String, sqlite_text, mysql_text);
+impl_decode!(
+    rust_decimal::Decimal,
+    |c| {
+        use std::str::FromStr as _;
+        rust_decimal::Decimal::from_str(&sqlite_text(c)?)
+            .map_err(|_| Error::Db("not a decimal".into()))
+    },
+    |c| {
+        use std::str::FromStr as _;
+        rust_decimal::Decimal::from_str(&mysql_text(c)?)
+            .map_err(|_| Error::Db("not a decimal".into()))
+    }
+);
+impl_decode!(
+    chrono::DateTime<chrono::Utc>,
+    |c| sqlite_timestamp(&sqlite_text(c)?),
+    mysql_timestamp
+);
+impl_decode!(
+    uuid::Uuid,
+    |c| sqlite_text(c)?
+        .parse()
+        .map_err(|_| Error::Db("not a uuid".into())),
+    |c| mysql_text(c)?
+        .parse()
+        .map_err(|_| Error::Db("not a uuid".into()))
+);
+impl_decode!(
+    serde_json::Value,
+    |c| serde_json::from_str(&sqlite_text(c)?).map_err(|_| Error::Db("not json".into())),
+    |c| serde_json::from_str(&mysql_text(c)?).map_err(|_| Error::Db("not json".into()))
+);
+impl_decode!(f64, sqlite_real, mysql_double);
+impl_decode!(Vec<u8>, sqlite_blob, mysql_blob);
 
 /// A SQLite integer cell, or a type error.
 #[cfg(feature = "sqlite")]
@@ -197,7 +253,7 @@ fn sqlite_blob(cell: &rusqlite::types::Value) -> Result<Vec<u8>> {
 /// stamped by `CURRENT_TIMESTAMP`, whose format is the space-separated
 /// `YYYY-MM-DD HH:MM:SS` in UTC — not RFC 3339. Both are UTC, so both are
 /// accepted here rather than failing to decode a row the schema itself created.
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "mysql"))]
 fn sqlite_timestamp(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
@@ -281,5 +337,155 @@ pub(crate) fn cell_to_value(
                 .map_err(|_| mismatch("json"))?,
         ),
         FieldType::Bytes => Value::Bytes(sqlite_blob(cell).map_err(|_| mismatch("bytes"))?),
+    })
+}
+
+// ----------------------------------------------------------------- MySQL (ADR 0018)
+//
+// The non-scalar types travel as text/native values, mirroring SQLite: Decimal,
+// Uuid and Json as UTF-8 bytes; a Timestamp as MySQL's native `Date` value (an
+// RFC-3339 string would be rejected by a `DATETIME` column). The session is fixed
+// to UTC (`time_zone='+00:00'`), so a `DATETIME` round-trips a `DateTime<Utc>`.
+
+/// A MySQL integer cell, or a type error. `TINYINT(1)` (a boolean) also arrives here.
+#[cfg(feature = "mysql")]
+fn mysql_int(cell: &mysql_async::Value) -> Result<i64> {
+    match cell {
+        mysql_async::Value::Int(n) => Ok(*n),
+        mysql_async::Value::UInt(n) => Ok(*n as i64),
+        _ => Err(Error::Db("expected an integer".into())),
+    }
+}
+
+/// A MySQL floating cell, or a type error. An integer widens.
+#[cfg(feature = "mysql")]
+fn mysql_double(cell: &mysql_async::Value) -> Result<f64> {
+    match cell {
+        mysql_async::Value::Double(x) => Ok(*x),
+        mysql_async::Value::Float(x) => Ok(f64::from(*x)),
+        mysql_async::Value::Int(n) => Ok(*n as f64),
+        mysql_async::Value::UInt(n) => Ok(*n as f64),
+        _ => Err(Error::Db("expected a real".into())),
+    }
+}
+
+/// A MySQL text cell (returned as bytes), decoded as UTF-8.
+#[cfg(feature = "mysql")]
+fn mysql_text(cell: &mysql_async::Value) -> Result<String> {
+    match cell {
+        mysql_async::Value::Bytes(b) => {
+            String::from_utf8(b.clone()).map_err(|_| Error::Db("not valid UTF-8".into()))
+        }
+        _ => Err(Error::Db("expected text".into())),
+    }
+}
+
+/// A MySQL blob cell.
+#[cfg(feature = "mysql")]
+fn mysql_blob(cell: &mysql_async::Value) -> Result<Vec<u8>> {
+    match cell {
+        mysql_async::Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(Error::Db("expected a blob".into())),
+    }
+}
+
+/// A MySQL `DATETIME` cell as a UTC timestamp — the native `Date` value, or a
+/// text form (if the server sent it as a string), both read as UTC.
+#[cfg(feature = "mysql")]
+fn mysql_timestamp(cell: &mysql_async::Value) -> Result<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    match cell {
+        mysql_async::Value::Date(y, mo, d, h, mi, s, micro) => {
+            let naive = NaiveDate::from_ymd_opt(i32::from(*y), u32::from(*mo), u32::from(*d))
+                .and_then(|date| {
+                    date.and_hms_micro_opt(u32::from(*h), u32::from(*mi), u32::from(*s), *micro)
+                })
+                .ok_or_else(|| Error::Db("invalid datetime".into()))?;
+            Ok(Utc.from_utc_datetime(&naive))
+        }
+        mysql_async::Value::Bytes(_) => sqlite_timestamp(&mysql_text(cell)?),
+        _ => Err(Error::Db("expected a datetime".into())),
+    }
+}
+
+/// Bind one ORM [`Value`](crate::value::Value) as a MySQL parameter (ADR 0018).
+/// The counterpart of the `mysql_*` decoders, so a value round-trips the same way.
+#[cfg(feature = "mysql")]
+pub(crate) fn value_to_mysql(v: &crate::value::Value) -> mysql_async::Value {
+    use crate::value::Value;
+    use chrono::{Datelike, Timelike};
+    use mysql_async::Value as M;
+    match v {
+        Value::Null => M::NULL,
+        Value::Bool(b) => M::Int(i64::from(*b)),
+        Value::I32(n) => M::Int(i64::from(*n)),
+        Value::I64(n) => M::Int(*n),
+        Value::F64(x) => M::Double(*x),
+        Value::Text(s) => M::Bytes(s.clone().into_bytes()),
+        Value::Decimal(d) => M::Bytes(d.to_string().into_bytes()),
+        Value::Timestamp(t) => {
+            let t = t.naive_utc();
+            M::Date(
+                t.year() as u16,
+                t.month() as u8,
+                t.day() as u8,
+                t.hour() as u8,
+                t.minute() as u8,
+                t.second() as u8,
+                t.nanosecond() / 1_000,
+            )
+        }
+        Value::Uuid(u) => M::Bytes(u.to_string().into_bytes()),
+        Value::Json(j) => M::Bytes(j.to_string().into_bytes()),
+        Value::Bytes(b) => M::Bytes(b.clone()),
+    }
+}
+
+/// Decode one MySQL cell into the [`Value`](crate::value::Value) its declared
+/// [`FieldType`](crate::value::FieldType) expects — the dynamic (model-erased)
+/// path [`crate::value::read_column`] takes for a MySQL row.
+#[cfg(feature = "mysql")]
+pub(crate) fn mysql_cell_to_value(
+    cell: &mysql_async::Value,
+    ty: crate::value::FieldType,
+    column: &str,
+) -> Result<crate::value::Value> {
+    use crate::value::{FieldType, Value};
+    if matches!(cell, mysql_async::Value::NULL) {
+        return Ok(Value::Null);
+    }
+    let mismatch = |want: &'static str| Error::UnexpectedColumnType {
+        column: column.to_string(),
+        want,
+    };
+    Ok(match ty {
+        FieldType::I32 => Value::I32(mysql_int(cell).map_err(|_| mismatch("integer"))? as i32),
+        FieldType::I64 => Value::I64(mysql_int(cell).map_err(|_| mismatch("bigint"))?),
+        FieldType::F64 => Value::F64(mysql_double(cell).map_err(|_| mismatch("float"))?),
+        FieldType::Bool => Value::Bool(mysql_int(cell).map_err(|_| mismatch("boolean"))? != 0),
+        FieldType::Text => Value::Text(mysql_text(cell).map_err(|_| mismatch("text"))?),
+        FieldType::Decimal => {
+            use std::str::FromStr as _;
+            Value::Decimal(
+                rust_decimal::Decimal::from_str(
+                    &mysql_text(cell).map_err(|_| mismatch("decimal text"))?,
+                )
+                .map_err(|_| mismatch("decimal"))?,
+            )
+        }
+        FieldType::Timestamp => {
+            Value::Timestamp(mysql_timestamp(cell).map_err(|_| mismatch("timestamp"))?)
+        }
+        FieldType::Uuid => Value::Uuid(
+            mysql_text(cell)
+                .map_err(|_| mismatch("uuid text"))?
+                .parse()
+                .map_err(|_| mismatch("uuid"))?,
+        ),
+        FieldType::Json => Value::Json(
+            serde_json::from_str(&mysql_text(cell).map_err(|_| mismatch("json text"))?)
+                .map_err(|_| mismatch("json"))?,
+        ),
+        FieldType::Bytes => Value::Bytes(mysql_blob(cell).map_err(|_| mismatch("bytes"))?),
     })
 }

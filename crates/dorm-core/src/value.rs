@@ -356,6 +356,10 @@ pub fn read_column(
         crate::row::Row::Sqlite(row) => {
             return crate::row::cell_to_value(row.cell(idx), ty, column)
         }
+        #[cfg(feature = "mysql")]
+        crate::row::Row::MySql(row) => {
+            return crate::row::mysql_cell_to_value(crate::row::mysql_cell(row, idx), ty, column)
+        }
     };
     let fail = |want: &'static str| Error::UnexpectedColumnType {
         column: column.to_string(),

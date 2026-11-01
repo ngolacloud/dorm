@@ -189,11 +189,12 @@ impl History {
     }
 }
 
-/// `"postgres"` or `"sqlite"` for a backend.
+/// The directory tag for a backend's migration history.
 fn backend_str(backend: Backend) -> &'static str {
     match backend {
         Backend::Postgres => "postgres",
         Backend::Sqlite => "sqlite",
+        Backend::MySql => "mysql",
     }
 }
 
