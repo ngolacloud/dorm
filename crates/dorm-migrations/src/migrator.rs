@@ -147,24 +147,40 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
 pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     db::guard_write("sync")?;
     let plans = build_plans(models)?;
-    db::atomic(|_tx| async move {
+    let backend = ddl::Backend::of_dsn(&db::dsn()?);
+
+    // Indexes build `CONCURRENTLY` on PostgreSQL (B-22), which PostgreSQL forbids
+    // inside a transaction — so they are collected now and applied *after* the
+    // transactional changes, each on its own connection outside any transaction.
+    // They are idempotent (`IF NOT EXISTS`), so re-running `sync` is safe, and
+    // they are not among the reported changes (as before).
+    let index_stmts: Vec<String> = models
+        .iter()
+        .flat_map(|m| ddl::indexes_concurrent(m, backend))
+        .collect();
+
+    // Transactional part: create missing tables and add missing columns, under
+    // the advisory lock so two concurrent syncs serialise rather than racing on
+    // `ALTER TABLE`.
+    let changes = db::atomic(|_tx| async move {
         db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
         let (tables, columns) = introspect().await?;
         let changes = changes_for(&plans, &tables, &columns);
-        // Apply the changes; then the indexes (idempotent, so run for every table,
-        // and not counted among the reported changes).
         for stmt in &changes {
             db::execute(stmt, &[]).await?;
         }
-        for (_, _, indexes, _) in &plans {
-            for idx in indexes {
-                db::execute(idx, &[]).await?;
-            }
-        }
-        Ok(changes)
+        Ok::<Vec<String>, dorm_core::Error>(changes)
     })
-    .await
-    .map_err(Into::into)
+    .await?;
+
+    // Non-transactional part: the indexes. Outside the transaction so
+    // `CREATE INDEX CONCURRENTLY` is legal and does not block writes to a
+    // populated table.
+    for idx in &index_stmts {
+        db::execute(idx, &[]).await?;
+    }
+
+    Ok(changes)
 }
 
 /// The additive changes [`sync`] *would* apply, without touching the database —

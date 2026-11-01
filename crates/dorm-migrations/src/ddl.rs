@@ -209,6 +209,25 @@ pub fn index_on(table: &str, column: &str) -> String {
     format!("CREATE INDEX IF NOT EXISTS {table}_{column}_idx ON {table} ({column})")
 }
 
+/// Like [`index_on`] but non-blocking on PostgreSQL (B-22).
+///
+/// A plain `CREATE INDEX` takes a `SHARE` lock that stops writes to the table
+/// for the whole build; `CREATE INDEX CONCURRENTLY` takes only a
+/// `SHARE UPDATE EXCLUSIVE` lock, so writes keep flowing while the index builds.
+/// The trade-off is that `CONCURRENTLY` **cannot run inside a transaction**
+/// (PostgreSQL rejects it with `25001`), so the caller must apply it outside one
+/// — which is why [`crate::migrate`]/`sync` run indexes separately from the
+/// transactional table changes. SQLite has no `CONCURRENTLY`, so it falls back
+/// to the plain form.
+pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> String {
+    match backend {
+        Backend::Postgres => format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_{column}_idx ON {table} ({column})"
+        ),
+        Backend::Sqlite => index_on(table, column),
+    }
+}
+
 /// The column's SQL default, if any. An explicit `default = "..."` wins; failing
 /// that, an `auto_now_add`/`auto_now` column gets the backend's "now" as a
 /// database-level safety net (the ORM also stamps the value in Rust on write, so
@@ -273,6 +292,18 @@ pub fn indexes(meta: &ModelMeta) -> Vec<String> {
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on(meta.table, f.column))
+        .collect()
+}
+
+/// Like [`indexes`] but each index builds `CONCURRENTLY` on PostgreSQL (B-22), so
+/// the caller must run these outside a transaction. Used by `sync`, which applies
+/// indexes to a possibly-populated table where a blocking build would stop
+/// writes.
+pub fn indexes_concurrent(meta: &ModelMeta, backend: Backend) -> Vec<String> {
+    meta.fields
+        .iter()
+        .filter(|f| f.index)
+        .map(|f| index_on_concurrent(meta.table, f.column, backend))
         .collect()
 }
 
@@ -399,6 +430,20 @@ mod tests {
         assert_eq!(
             indexes(&M),
             vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
+        );
+    }
+
+    // B-22: the concurrent variant builds without blocking writes on PostgreSQL
+    // and falls back to the plain form on SQLite (which has no CONCURRENTLY).
+    #[test]
+    fn a_concurrent_index_is_non_blocking_on_postgres_and_plain_on_sqlite() {
+        assert_eq!(
+            index_on_concurrent("tenants", "slug", Backend::Postgres),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
+        );
+        assert_eq!(
+            index_on_concurrent("tenants", "slug", Backend::Sqlite),
+            "CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
         );
     }
 
