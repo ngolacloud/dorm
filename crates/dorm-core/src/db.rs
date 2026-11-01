@@ -76,9 +76,30 @@ pub const SSLROOTCERT_ENV: &str = "DELONIX_ORM_SSLROOTCERT";
 /// execution has no named handle to lose. It costs a Parse round trip per call —
 /// the price of running behind a transaction-mode pooler (DBA-03/H2).
 pub const NO_PREPARE_ENV: &str = "DELONIX_ORM_NO_PREPARE";
+/// How a connection is checked before a checkout hands it out (ADR 0015):
+/// `verified` (the default — a liveness round trip, so a connection a database
+/// restart or `pg_terminate_backend` killed is detected and replaced rather than
+/// handed to a doomed query), `fast` (no round trip, lowest latency), or `clean`
+/// (`DISCARD ALL` as well). The resilient default costs one empty round trip per
+/// checkout; `fast` is the opt-out for a latency-critical, stable deployment.
+pub const POOL_RECYCLING_ENV: &str = "DELONIX_ORM_POOL_RECYCLING";
+/// How many times [`acquire`] retries a transient connection failure — a database
+/// restarting, or a momentarily exhausted pool — before giving up. `0` disables
+/// retry. **Only the acquire is retried**, never a statement already in flight:
+/// a connection breaking mid-write could have committed, so retrying it might
+/// double-apply. An acquire has sent nothing, so retrying it is always safe.
+pub const RETRY_MAX_ENV: &str = "DELONIX_ORM_RETRY_MAX";
+/// The base backoff between acquire retries, in milliseconds; it doubles each
+/// attempt up to a 2 s cap. See [`RETRY_MAX_ENV`].
+pub const RETRY_BASE_MS_ENV: &str = "DELONIX_ORM_RETRY_BASE_MS";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
+const RETRY_MAX_DEFAULT: u64 = 3;
+const RETRY_BASE_MS_DEFAULT: u64 = 50;
+/// The ceiling on a single backoff wait, so exponential growth cannot stall a
+/// request for minutes.
+const RETRY_BACKOFF_CAP_MS: u64 = 2_000;
 
 /// How much SQL a log line carries before it is truncated. Long enough to read
 /// the shape of a statement, short enough that a 50-line generated query does
@@ -602,6 +623,30 @@ fn merge_statement_timeout(options: Option<&str>, ms: u64) -> Option<String> {
     })
 }
 
+/// The connection-recycling strategy from the environment (ADR 0015), defaulting
+/// to the resilient `Verified`. See [`POOL_RECYCLING_ENV`].
+fn recycling_method() -> RecyclingMethod {
+    match std::env::var(POOL_RECYCLING_ENV)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("fast") => RecyclingMethod::Fast,
+        Ok("clean") => RecyclingMethod::Clean,
+        // `verified` by name, and also the default for anything unset or
+        // unrecognised: resilience is the safe thing to assume.
+        _ => RecyclingMethod::Verified,
+    }
+}
+
+/// Exponential backoff for the n-th acquire retry (0-based), capped. Pure, so the
+/// schedule is unit-tested. Attempt 0 waits `base`, 1 waits `2×base`, and so on,
+/// never past [`RETRY_BACKOFF_CAP_MS`].
+fn backoff_delay(base_ms: u64, attempt: u32) -> Duration {
+    let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    let ms = base_ms.saturating_mul(factor).min(RETRY_BACKOFF_CAP_MS);
+    Duration::from_millis(ms)
+}
+
 /// Build the pool's `Manager`, choosing the TLS connector from the requirement
 /// and the compiled features. `deadpool`'s `Manager` is not generic over the TLS
 /// type — it erases it — so every arm returns the same `Manager` and the process
@@ -614,12 +659,14 @@ fn build_manager(
     requirement: SslRequirement,
     root: Option<&str>,
 ) -> Result<Manager> {
-    // `Fast` recycling: the pool hands back a connection without a round trip.
-    // It is safe here because a connection is only ever returned to the pool
-    // with no transaction open — `atomic` takes it out of the pool instead of
-    // returning a dirty one.
+    // How a connection is checked on checkout (ADR 0015). `Verified` (the default)
+    // does a liveness round trip, so a connection killed by a restart or
+    // `pg_terminate_backend` is detected and replaced rather than handed to a
+    // doomed query; `fast` opts out of the round trip. Either is safe: a
+    // connection is only ever returned to the pool with no transaction open
+    // (`atomic` takes it out instead of returning a dirty one).
     let mgr_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
+        recycling_method: recycling_method(),
     };
 
     if requirement == SslRequirement::Disable {
@@ -819,7 +866,41 @@ tokio::task_local! {
 /// Acquire a connection for `route` from the database in scope — the session's
 /// if [`with_session`] set one, otherwise the process default. Holding the
 /// session `Arc` across the `.await` keeps its pools alive for the borrow.
+/// Acquire a connection for `route`, retrying a transient failure with backoff
+/// (ADR 0015). A pool error means nothing was sent on any connection yet — the
+/// database is restarting, or the pool is momentarily exhausted — so retrying is
+/// always safe (unlike a statement in flight, which `acquire` never retries). The
+/// `Verified` recycling above already replaces a *dead* pooled connection
+/// transparently; this retry covers the window where a fresh connection cannot be
+/// made yet because the server is still coming back.
 async fn acquire(route: Route) -> Result<Object> {
+    let max = env_u64(RETRY_MAX_ENV, RETRY_MAX_DEFAULT);
+    let base = env_u64(RETRY_BASE_MS_ENV, RETRY_BASE_MS_DEFAULT);
+    let mut attempt: u32 = 0;
+    loop {
+        match acquire_once(route).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if u64::from(attempt) >= max {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    target: "dorm::db",
+                    attempt = attempt + 1,
+                    max,
+                    error = %e,
+                    "retrying connection acquisition after a transient failure"
+                );
+                tokio::time::sleep(backoff_delay(base, attempt)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One acquisition from the database in scope — the session's pool, or the
+/// process default's.
+async fn acquire_once(route: Route) -> Result<Object> {
     if let Ok(db) = SESSION.try_with(|d| d.clone()) {
         return db
             .pool_for(route)
@@ -2052,6 +2133,42 @@ mod tests {
             merge_statement_timeout(Some("-c search_path=app"), 0).as_deref(),
             Some("-c search_path=app")
         );
+    }
+
+    #[test]
+    fn backoff_doubles_each_attempt_and_is_capped() {
+        // Attempt 0 waits the base, then it doubles: 50, 100, 200, 400…
+        assert_eq!(backoff_delay(50, 0), Duration::from_millis(50));
+        assert_eq!(backoff_delay(50, 1), Duration::from_millis(100));
+        assert_eq!(backoff_delay(50, 2), Duration::from_millis(200));
+        assert_eq!(backoff_delay(50, 3), Duration::from_millis(400));
+        // The cap holds, and a huge attempt cannot overflow into a tiny wait.
+        assert_eq!(
+            backoff_delay(1000, 10),
+            Duration::from_millis(RETRY_BACKOFF_CAP_MS)
+        );
+        assert_eq!(
+            backoff_delay(1, 200),
+            Duration::from_millis(RETRY_BACKOFF_CAP_MS)
+        );
+    }
+
+    #[test]
+    fn recycling_defaults_to_verified_and_honours_the_override() {
+        let before = std::env::var(POOL_RECYCLING_ENV).ok();
+        std::env::remove_var(POOL_RECYCLING_ENV);
+        assert!(matches!(recycling_method(), RecyclingMethod::Verified));
+        std::env::set_var(POOL_RECYCLING_ENV, "fast");
+        assert!(matches!(recycling_method(), RecyclingMethod::Fast));
+        std::env::set_var(POOL_RECYCLING_ENV, " Clean ");
+        assert!(matches!(recycling_method(), RecyclingMethod::Clean));
+        // Anything unrecognised falls back to the resilient default.
+        std::env::set_var(POOL_RECYCLING_ENV, "banana");
+        assert!(matches!(recycling_method(), RecyclingMethod::Verified));
+        match before {
+            Some(v) => std::env::set_var(POOL_RECYCLING_ENV, v),
+            None => std::env::remove_var(POOL_RECYCLING_ENV),
+        }
     }
 
     #[test]

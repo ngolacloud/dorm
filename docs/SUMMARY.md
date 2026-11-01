@@ -38,3 +38,4 @@
   - [0012 — Native CQRS](adr/0012-native-cqrs.md)
   - [0013 — prefetch (reverse relation, no N+1)](adr/0013-prefetch-related.md)
   - [0014 — Reversible migrations](adr/0014-reversible-migrations.md)
+  - [0015 — Connection resilience](adr/0015-connection-resilience.md)
