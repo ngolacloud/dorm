@@ -82,7 +82,21 @@ const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
 const SQL_LOG_MAX: usize = 300;
 
 static POOL: OnceLock<Pool> = OnceLock::new();
+
+/// The process-wide read-only default, for the one-process-one-session case (the
+/// CLI/shell's `--read-only`). A *session* can override it per task — see
+/// [`READ_ONLY_SCOPE`] and [`with_read_only`].
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+tokio::task_local! {
+    /// A per-session read-only override (B-12 / SEC-03). A task running inside
+    /// [`with_read_only`] consults this instead of the process-wide [`READ_ONLY`]
+    /// flag, so one request can be read-only while another, concurrent request on
+    /// the same process writes — the isolation a global `AtomicBool` cannot give.
+    /// Outside any such scope the global default applies, so the CLI/shell is
+    /// unaffected.
+    static READ_ONLY_SCOPE: bool;
+}
 
 /// The slow-query threshold, read from the environment exactly once.
 ///
@@ -261,18 +275,43 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Mark this process as read-only. Every write refuses before it reaches SQL.
+/// Mark this **process** as read-only. Every write refuses before it reaches SQL.
 ///
 /// The session is *also* opened `READ ONLY` at the server, which is the real
 /// guard; this flag exists so the refusal names the operation instead of
 /// surfacing a PostgreSQL error about a read-only transaction.
+///
+/// This is the process-wide default, for the one-process-one-session case (the
+/// CLI/shell's `--read-only`). A server handling many sessions on one process
+/// wants [`with_read_only`] instead, which scopes the flag to one task so
+/// concurrent sessions do not leak into each other (B-12 / SEC-03).
 pub fn set_read_only(yes: bool) {
     READ_ONLY.store(yes, Ordering::SeqCst);
 }
 
-/// Whether this process is read-only.
+/// Run `fut` with the read-only state forced to `yes` for this task alone,
+/// overriding the process-wide [`set_read_only`] default.
+///
+/// This is the per-session form: two concurrent requests can each wrap their work
+/// in `with_read_only` with different values and neither sees the other's — the
+/// isolation the global flag cannot provide. It applies to the whole async
+/// subtree the future awaits (transactions included), but not to tasks spawned
+/// off it, which start their own task-local scope — a spawned task is a new
+/// session.
+pub async fn with_read_only<F, T>(yes: bool, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    READ_ONLY_SCOPE.scope(yes, fut).await
+}
+
+/// Whether the current context is read-only: the task-local session scope if one
+/// is active ([`with_read_only`]), otherwise the process-wide [`set_read_only`]
+/// default.
 pub fn is_read_only() -> bool {
-    READ_ONLY.load(Ordering::SeqCst)
+    READ_ONLY_SCOPE
+        .try_with(|&yes| yes)
+        .unwrap_or_else(|_| READ_ONLY.load(Ordering::SeqCst))
 }
 
 /// Refuse a write in a read-only session.

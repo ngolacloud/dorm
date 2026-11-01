@@ -766,3 +766,66 @@ e2e!(bulk_create_of_70000_rows_succeeds, "acme-bulk", |_t, _p| {
         .await
         .expect("cleanup");
 });
+
+// Regression for SEC-03/H15 and B-12: the read-only flag is per *session*, not
+// per process. Two concurrent sessions — one read-only, one writable — do not
+// leak into each other, which the old process-global `AtomicBool` could not
+// express. Not written with `e2e!` so the two sessions can run under one
+// `tokio::join!`.
+#[test]
+#[ignore = "needs a Postgres (DELONIX_ORM_TEST_DSN)"]
+fn two_sessions_have_independent_read_only_flags() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipped: DELONIX_ORM_TEST_DSN is not set");
+        return;
+    };
+    setup(&dsn);
+    let rt = runtime();
+    rt.block_on(async {
+        let (t, p) = seed("acme-session-iso").await;
+        Application::objects()
+            .filter(application::tenant.eq(t.pk()))
+            .delete()
+            .await
+            .expect("clear the tenant's applications");
+
+        // Run both sessions concurrently. Each wraps its write in its own
+        // `with_read_only` scope; neither touches the process-wide flag.
+        let read_only_session = db::with_read_only(true, async {
+            Application::objects()
+                .create(NewApplication {
+                    tenant: t.as_fk(),
+                    plan: p.as_fk(),
+                    name: "from-the-read-only-session".into(),
+                })
+                .await
+        });
+        let writable_session = db::with_read_only(false, async {
+            Application::objects()
+                .create(NewApplication {
+                    tenant: t.as_fk(),
+                    plan: p.as_fk(),
+                    name: "from-the-writable-session".into(),
+                })
+                .await
+        });
+        let (ro, rw) = tokio::join!(read_only_session, writable_session);
+
+        // The read-only session refuses — while the writable one, running at the
+        // same instant, succeeds. Under the old global flag one would have forced
+        // the other.
+        assert!(
+            matches!(ro, Err(Error::ReadOnly("create"))),
+            "the read-only session must refuse the write, got {ro:?}"
+        );
+        let app = rw.expect("the writable session writes while the other is read-only");
+
+        // No scope leaked into the process-wide default.
+        assert!(
+            !db::is_read_only(),
+            "the per-session scopes did not leak to the process default"
+        );
+
+        app.delete().await.expect("cleanup");
+    });
+}
