@@ -202,6 +202,13 @@ pub fn drop_index(table: &str, column: &str) -> String {
     format!("DROP INDEX IF EXISTS {}_{}_idx", table, column)
 }
 
+/// `ALTER TABLE <table> RENAME COLUMN <from> TO <to>` — the data-preserving
+/// alternative to drop-then-add when a column is renamed (B-24). Both PostgreSQL
+/// and SQLite (≥ 3.25) accept this exact form, so no dialect split is needed.
+pub fn rename_column(table: &str, from: &str, to: &str) -> String {
+    format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")
+}
+
 /// `CREATE INDEX IF NOT EXISTS <table>_<column>_idx ON <table> (<column>)` — the
 /// one place the index name is spelled, shared by [`indexes`] and the
 /// autodetector so a dropped index names exactly what a created one made.

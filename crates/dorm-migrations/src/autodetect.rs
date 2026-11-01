@@ -174,6 +174,37 @@ pub fn autodetect(
     models: &[&'static ModelMeta],
     backend: Backend,
 ) -> Result<Vec<String>> {
+    autodetect_with_renames(previous, models, backend, &[])
+}
+
+/// A column rename declared by the migration author (B-24).
+///
+/// Without it, a column that changed name reads as a drop of the old column plus
+/// an add of the new one — and the data in the old column is lost. Because a
+/// rename cannot be inferred safely (two unrelated drop+add pairs look the same),
+/// the author declares it, exactly as Django's `makemigrations` prompts for it;
+/// the autodetector then emits `ALTER TABLE … RENAME COLUMN`, which preserves the
+/// data, and treats the column as matched by its new name for the rest of the
+/// diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRename {
+    /// The table (not the model) the column belongs to.
+    pub table: String,
+    /// The column's name in the previous snapshot.
+    pub from: String,
+    /// The column's name in the current models.
+    pub to: String,
+}
+
+/// Like [`autodetect`], with a set of author-declared column renames applied
+/// before the diff — so a renamed column is a data-preserving `RENAME COLUMN`
+/// instead of a drop-then-add (B-24).
+pub fn autodetect_with_renames(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Vec<String>> {
     let current = Snapshot::from_models(models);
     let prev_tables: BTreeMap<&str, &Table> = previous
         .tables
@@ -186,14 +217,33 @@ pub fn autodetect(
     let mut b = Buckets::default();
 
     // Tables the models declare: new ones get a full CREATE; existing ones get a
-    // column-, index- and alteration-level diff.
+    // column-, index- and alteration-level diff — after any renames for that
+    // table are applied to the previous snapshot.
     for (cur_table, meta) in current.tables.iter().zip(models.iter()) {
         match prev_tables.get(cur_table.name.as_str()) {
             None => {
                 b.creates.push(ddl::create_table_on(meta, backend)?);
                 b.creates.extend(ddl::indexes(meta));
             }
-            Some(prev) => diff_table(prev, cur_table, meta, backend, &mut b)?,
+            Some(prev) => {
+                let table_renames: Vec<&ColumnRename> = renames
+                    .iter()
+                    .filter(|r| r.table == cur_table.name)
+                    .collect();
+                if table_renames.is_empty() {
+                    diff_table(prev, cur_table, meta, backend, &mut b)?;
+                } else {
+                    let renamed_prev = apply_renames(prev, cur_table, &table_renames)?;
+                    // The `RENAME COLUMN`s run first, so the rest of the diff
+                    // (alters, adds, drops, the SQLite rebuild) sees the column
+                    // under its new name and matches it instead of dropping it.
+                    for r in &table_renames {
+                        b.renames
+                            .push(ddl::rename_column(&cur_table.name, &r.from, &r.to));
+                    }
+                    diff_table(&renamed_prev, cur_table, meta, backend, &mut b)?;
+                }
+            }
         }
     }
 
@@ -207,10 +257,40 @@ pub fn autodetect(
     Ok(b.into_ordered())
 }
 
+/// Rewrite `prev`'s column names per the table's declared renames, returning a
+/// snapshot table the diff can compare under the new names. Each rename is
+/// validated: its source must exist in `prev` and its target in `cur`, or it is
+/// an [`Error::InvalidRename`] — a mistyped rename must fail loudly, never
+/// silently fall back to the data-losing drop+add.
+fn apply_renames(prev: &Table, cur: &Table, renames: &[&ColumnRename]) -> Result<Table> {
+    let mut out = prev.clone();
+    for r in renames {
+        if !prev.columns.iter().any(|c| c.name == r.from) {
+            return Err(Error::InvalidRename(format!(
+                "table `{}`: no column `{}` to rename from",
+                r.table, r.from
+            )));
+        }
+        if !cur.columns.iter().any(|c| c.name == r.to) {
+            return Err(Error::InvalidRename(format!(
+                "table `{}`: no column `{}` to rename to",
+                r.table, r.to
+            )));
+        }
+        for c in &mut out.columns {
+            if c.name == r.from {
+                c.name = r.to.clone();
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The statement buckets, kept apart so the whole migration can be emitted
 /// additive-before-destructive regardless of the order tables are visited in.
 #[derive(Default)]
 struct Buckets {
+    renames: Vec<String>,
     creates: Vec<String>,
     adds: Vec<String>,
     index_adds: Vec<String>,
@@ -223,7 +303,11 @@ struct Buckets {
 
 impl Buckets {
     fn into_ordered(self) -> Vec<String> {
-        let mut out = self.creates;
+        // Renames run first: the rest of the diff was computed against a snapshot
+        // already rewritten to the new names, so the database must carry them by
+        // the time an alter/add/drop/rebuild for that table runs.
+        let mut out = self.renames;
+        out.extend(self.creates);
         out.extend(self.adds);
         out.extend(self.index_adds);
         out.extend(self.pg_alters);
@@ -477,7 +561,20 @@ pub fn make_migration(
     name: &str,
     backend: Backend,
 ) -> Result<Option<(Migration, Snapshot)>> {
-    let statements = autodetect(previous, models, backend)?;
+    make_migration_with_renames(previous, models, version, name, backend, &[])
+}
+
+/// Like [`make_migration`], with author-declared column renames (B-24) so a
+/// renamed column is a `RENAME COLUMN`, not a data-losing drop+add.
+pub fn make_migration_with_renames(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    version: i64,
+    name: &str,
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Option<(Migration, Snapshot)>> {
+    let statements = autodetect_with_renames(previous, models, backend, renames)?;
     if statements.is_empty() {
         return Ok(None);
     }
@@ -892,5 +989,139 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialise");
         let back: Snapshot = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(snap, back, "the snapshot survives a JSON round trip");
+    }
+
+    // ---- B-24: column rename detection ----
+
+    // `notes` with `title` renamed to `headline` (same type).
+    const HEADLINE: FieldMeta = col("headline", FieldType::Text);
+    const NOTE_RENAMED: &[FieldMeta] = &[ID, HEADLINE];
+    const NOTE_RENAMED_META: ModelMeta = ModelMeta {
+        name: "Note",
+        table: "notes",
+        fields: NOTE_RENAMED,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    fn rename(from: &str, to: &str) -> ColumnRename {
+        ColumnRename {
+            table: "notes".to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn without_a_hint_a_rename_is_a_data_losing_drop_and_add() {
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect(&prev, &[&NOTE_RENAMED_META], Backend::Postgres).unwrap();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("ADD COLUMN") && s.contains("headline")),
+            "the new name is added: {stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("DROP COLUMN") && s.contains("title")),
+            "the old name — and its data — is dropped: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|s| s.contains("RENAME COLUMN")),
+            "no rename without a hint: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn a_hinted_rename_is_a_data_preserving_rename_column_on_postgres() {
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Postgres,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"],
+            "a pure rename is exactly one RENAME COLUMN, no drop, no add"
+        );
+    }
+
+    #[test]
+    fn a_hinted_rename_works_on_sqlite_too() {
+        // SQLite ≥ 3.25 supports RENAME COLUMN, so a pure rename needs no rebuild.
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Sqlite,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"]
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_source_is_missing_is_a_loud_error() {
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let err = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Postgres,
+            &[rename("nonexistent", "headline")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRename(_)),
+            "a mistyped rename must fail loudly, not fall back to drop+add: {err}"
+        );
+    }
+
+    #[test]
+    fn the_rename_runs_before_any_other_change_to_the_table() {
+        // `title` -> `headline` AND a new `body` column: the RENAME must come
+        // first so the later statements see the new name.
+        const BODY2: FieldMeta = col("body", FieldType::Text);
+        const RENAMED_PLUS_BODY: &[FieldMeta] = &[ID, HEADLINE, BODY2];
+        const META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: RENAMED_PLUS_BODY,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&META],
+            Backend::Postgres,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert!(
+            stmts[0].contains("RENAME COLUMN title TO headline"),
+            "{stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("ADD COLUMN") && s.contains("body")),
+            "the new column is still added: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|s| s.contains("DROP COLUMN")),
+            "nothing is dropped — the rename replaced the drop: {stmts:?}"
+        );
     }
 }
