@@ -140,14 +140,21 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// The SQL dialect a plan is compiled for. Only the placeholder style (`$n` vs
-/// `?n`) and case-insensitive `LIKE` differ between the two today; identifiers,
-/// joins and clause structure are shared (ADR 0002). PostgreSQL is the default,
-/// so every existing caller and every snapshot is unchanged.
+/// The SQL dialect a plan is compiled for. The placeholder style, case-insensitive
+/// `LIKE`, and `now()` spelling differ between backends; identifiers, joins and
+/// clause structure are shared (ADR 0002). PostgreSQL is the default, so every
+/// existing caller and every snapshot is unchanged.
+///
+/// `MySql` is the dialect *profile* for the forthcoming MySQL backend (ADR 0011
+/// Phase 2.2): its capabilities and its simple dialect choices are declared here,
+/// so the capability matrix and the SQL shape are settled before the driver lands.
+/// The one thing still to wire is positional parameters — MySQL binds a bare `?`
+/// by order, not the numbered `$n`/`?n` the compiler renumbers today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,
     Sqlite,
+    MySql,
 }
 
 /// A backend feature DORM relies on but cannot assume every engine has (ADR
@@ -184,29 +191,38 @@ impl Dialect {
     fn ilike(self) -> &'static str {
         match self {
             Dialect::Postgres => "ILIKE",
-            Dialect::Sqlite => "LIKE",
+            // SQLite's and MySQL's `LIKE` are case-insensitive under their default
+            // collations, so neither needs a dedicated operator.
+            Dialect::Sqlite | Dialect::MySql => "LIKE",
         }
     }
 
     /// The character that introduces a bound-parameter placeholder: `$` on
-    /// PostgreSQL (`$1`), `?` on SQLite (`?1`). Numbered on both, which is what
-    /// lets [`shift_placeholders`] renumber a subquery's parameters.
+    /// PostgreSQL (`$1`), `?` on SQLite (`?1`) and MySQL (`?`). Numbered on
+    /// Postgres/SQLite, which is what lets [`shift_placeholders`] renumber a
+    /// subquery's parameters.
     fn placeholder_marker(self) -> char {
         match self {
             Dialect::Postgres => '$',
-            Dialect::Sqlite => '?',
+            Dialect::Sqlite | Dialect::MySql => '?',
         }
     }
 
-    /// A bound-parameter placeholder for binding position `n` (1-based).
+    /// A bound-parameter placeholder for binding position `n` (1-based). MySQL
+    /// ignores the number — it binds a bare `?` positionally — so the number is
+    /// only meaningful for the numbered dialects.
     fn placeholder(self, n: usize) -> String {
-        format!("{}{n}", self.placeholder_marker())
+        match self {
+            Dialect::MySql => "?".to_string(),
+            _ => format!("{}{n}", self.placeholder_marker()),
+        }
     }
 
     /// The SQL expression for "now", used to refresh `auto_now` columns on write.
     fn now(self) -> &'static str {
         match self {
-            Dialect::Postgres => "now()",
+            // `now()` is PostgreSQL's and MySQL's spelling alike.
+            Dialect::Postgres | Dialect::MySql => "now()",
             Dialect::Sqlite => "CURRENT_TIMESTAMP",
         }
     }
@@ -226,6 +242,16 @@ impl Dialect {
                 // No `CONCURRENTLY`, no dedicated boolean, no `ILIKE` keyword
                 // (its `LIKE` is already case-insensitive for ASCII).
                 ConcurrentIndex | NativeBoolean | IlikeOperator => false,
+            },
+            Dialect::MySql => match cap {
+                // MySQL has SAVEPOINT, but no `RETURNING` (a write reads the row
+                // back via `last_insert_id`), most DDL auto-commits (no DDL in a
+                // transaction), there is no `CREATE INDEX CONCURRENTLY`, a boolean
+                // is `TINYINT(1)`, and there is no `ILIKE` keyword.
+                Savepoints => true,
+                Returning | DdlInTransaction | ConcurrentIndex | NativeBoolean | IlikeOperator => {
+                    false
+                }
             },
         }
     }
@@ -1208,6 +1234,29 @@ mod tests {
             Dialect::Postgres.supports(IlikeOperator),
             Dialect::Postgres.ilike() == "ILIKE"
         );
+    }
+
+    #[test]
+    fn the_mysql_dialect_profile_is_declared_before_its_driver() {
+        use Capability::*;
+        // MySQL's simple dialect choices.
+        assert_eq!(Dialect::MySql.ilike(), "LIKE");
+        assert_eq!(Dialect::MySql.now(), "now()");
+        // It binds a bare positional `?`, ignoring the number.
+        assert_eq!(Dialect::MySql.placeholder(1), "?");
+        assert_eq!(Dialect::MySql.placeholder(7), "?");
+        // Its capability profile: savepoints yes; RETURNING, transactional DDL,
+        // CONCURRENTLY, a native boolean and ILIKE all no.
+        assert!(Dialect::MySql.supports(Savepoints));
+        for cap in [
+            Returning,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(!Dialect::MySql.supports(cap), "mysql should lack {cap:?}");
+        }
     }
 
     #[test]
