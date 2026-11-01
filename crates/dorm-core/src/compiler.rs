@@ -208,14 +208,26 @@ impl Dialect {
         }
     }
 
-    /// A bound-parameter placeholder for binding position `n` (1-based). MySQL
-    /// ignores the number — it binds a bare `?` positionally — so the number is
-    /// only meaningful for the numbered dialects.
+    /// A bound-parameter placeholder for binding position `n` (1-based).
+    ///
+    /// **Numbered on every dialect, MySQL included.** MySQL ultimately binds a
+    /// bare positional `?`, but numbering it here (`?1`, `?2`) is what keeps the
+    /// compiler's one invariant intact: a `SELECT` with `HAVING` binds the HAVING
+    /// parameter before the WHERE one, so bind-order ≠ textual order, and a bare
+    /// `?` would then bind the values in the wrong slots. The number disambiguates
+    /// during compilation and `shift_placeholders` can renumber a subquery; the
+    /// numbered `?n` is converted to the bare positional `?` — reordering the
+    /// parameter vector by textual appearance — once, in the MySQL driver, by
+    /// [`positionalize`]. See ADR 0018.
     fn placeholder(self, n: usize) -> String {
-        match self {
-            Dialect::MySql => "?".to_string(),
-            _ => format!("{}{n}", self.placeholder_marker()),
-        }
+        format!("{}{n}", self.placeholder_marker())
+    }
+
+    /// Whether this dialect binds a bare positional `?` (by order), rather than a
+    /// numbered placeholder. True only for MySQL; the executor (its driver) then
+    /// runs [`positionalize`] on the compiled SQL before sending it.
+    pub fn positional_unnumbered(self) -> bool {
+        matches!(self, Dialect::MySql)
     }
 
     /// The SQL expression for "now", used to refresh `auto_now` columns on write.
@@ -1116,6 +1128,47 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     out
 }
 
+/// Convert numbered `?n` placeholders to the bare positional `?` MySQL binds by
+/// order, reordering `params` into the order the placeholders appear in the text
+/// (ADR 0018). Pure, so it is unit-tested. The one step that makes the compiler's
+/// numbered output executable on MySQL; it runs once, in the MySQL driver.
+///
+/// The input `params` are in *bind* order; the output are in *textual* order. A
+/// `?k` emits `?` and takes `params[k-1]`; a repeated `?k` repeats that value; an
+/// out-of-order `?2 … ?1` — which a `SELECT` with `HAVING` produces — comes out
+/// correctly, because the output order is derived from the text, the single
+/// source of truth for positional binding. Only the compiler's own output is
+/// passed here, so every `?n` is a numbered placeholder in range.
+pub fn positionalize(sql: &str, params: &[Value]) -> (String, Vec<Value>) {
+    let mut out = String::with_capacity(sql.len());
+    let mut ordered = Vec::with_capacity(params.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '?' {
+            out.push(c);
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(*d);
+            chars.next();
+        }
+        match digits.parse::<usize>() {
+            Ok(n) if (1..=params.len()).contains(&n) => {
+                out.push('?');
+                ordered.push(params[n - 1].clone());
+            }
+            // A bare `?` or an out-of-range index: copy verbatim and bind nothing.
+            // Unreachable for compiler output, which always numbers in range.
+            _ => {
+                out.push('?');
+                out.push_str(&digits);
+            }
+        }
+    }
+    (out, ordered)
+}
+
 /// Compile an `INSERT` of one or more rows.
 ///
 /// Every row must offer the same columns, which `bulk_create` guarantees by
@@ -1242,9 +1295,14 @@ mod tests {
         // MySQL's simple dialect choices.
         assert_eq!(Dialect::MySql.ilike(), "LIKE");
         assert_eq!(Dialect::MySql.now(), "now()");
-        // It binds a bare positional `?`, ignoring the number.
-        assert_eq!(Dialect::MySql.placeholder(1), "?");
-        assert_eq!(Dialect::MySql.placeholder(7), "?");
+        // It compiles with numbered `?n` (like SQLite) — the bare positional `?`
+        // is produced later by `positionalize`, in the driver — and declares that
+        // it ultimately binds positionally.
+        assert_eq!(Dialect::MySql.placeholder(1), "?1");
+        assert_eq!(Dialect::MySql.placeholder(7), "?7");
+        assert!(Dialect::MySql.positional_unnumbered());
+        assert!(!Dialect::Postgres.positional_unnumbered());
+        assert!(!Dialect::Sqlite.positional_unnumbered());
         // Its capability profile: savepoints yes; RETURNING, transactional DDL,
         // CONCURRENTLY, a native boolean and ILIKE all no.
         assert!(Dialect::MySql.supports(Savepoints));
@@ -1257,6 +1315,31 @@ mod tests {
         ] {
             assert!(!Dialect::MySql.supports(cap), "mysql should lack {cap:?}");
         }
+    }
+
+    #[test]
+    fn positionalize_rewrites_numbered_placeholders_to_bare_and_reorders_params() {
+        let p = |n: i64| Value::I64(n);
+        // In textual order: straightforward 1:1.
+        let (sql, params) = positionalize("a = ?1 AND b = ?2", &[p(10), p(20)]);
+        assert_eq!(sql, "a = ? AND b = ?");
+        assert_eq!(params, vec![p(10), p(20)]);
+
+        // Out of order — the shape a HAVING-before-WHERE select binds: the text is
+        // `?2 … ?1`, and the output params must come out in textual order.
+        let (sql, params) = positionalize("where c = ?2 having n = ?1", &[p(1), p(2)]);
+        assert_eq!(sql, "where c = ? having n = ?");
+        assert_eq!(params, vec![p(2), p(1)], "reordered to textual order");
+
+        // A repeated placeholder repeats its value.
+        let (sql, params) = positionalize("?1 or ?1", &[p(5)]);
+        assert_eq!(sql, "? or ?");
+        assert_eq!(params, vec![p(5), p(5)]);
+
+        // No placeholders: unchanged, empty params.
+        let (sql, params) = positionalize("SELECT 1", &[p(9)]);
+        assert_eq!(sql, "SELECT 1");
+        assert!(params.is_empty());
     }
 
     #[test]
