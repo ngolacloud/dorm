@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compiler;
+pub mod cqrs;
 pub mod db;
 pub mod error;
 pub mod expr;
@@ -72,6 +73,7 @@ pub mod __private {
 /// use dorm_core::prelude::*;
 /// ```
 pub mod prelude {
+    pub use crate::cqrs;
     pub use crate::db::{self, atomic, Tx};
     pub use crate::error::{Error, Result};
     pub use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, F, Q};

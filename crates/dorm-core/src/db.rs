@@ -1013,63 +1013,110 @@ pub fn dialect() -> Dialect {
     }
 }
 
-/// Run a row-returning statement against the configured backend, taking ORM
-/// values and handing back backend-agnostic [`Row`]s.
-///
-/// Both paths keep the transaction-in-scope routing: PostgreSQL reuses [`query`]
-/// (routed by `CURRENT_TX`); SQLite checks its own transaction task-local and,
-/// inside an [`atomic`], runs on the connection the transaction already holds.
+/// Whether the active backend supports `cap` (ADR 0011) — a convenience over
+/// [`dialect`]`().supports(cap)` for callers outside the compiler, e.g. a
+/// migrator deciding whether it may emit `CREATE INDEX CONCURRENTLY`.
+pub fn supports(cap: crate::compiler::Capability) -> bool {
+    dialect().supports(cap)
+}
+
+// -------------------------------------------------------- the backend driver
+//
+// ADR 0011. `Driver` is the per-statement runtime seam a backend implements:
+// given a compiled statement, run it. It is the extension point a non-PG-wire
+// engine (MySQL, SQL Server, Oracle) plugs into — it brings its own wire driver,
+// parameter binding and row type, and implements these three verbs. The
+// transaction *openers* stay backend-split (`atomic_pg`, the `sqlite` module);
+// these are the per-statement verbs the typed path funnels through, and the free
+// functions below select the driver from the active backend and delegate.
+
+trait Driver {
+    /// Run a row-returning statement; `route` lets a read prefer a replica.
+    async fn fetch(&self, sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>>;
+    /// Run a statement for its affected-row count.
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64>;
+    /// Run one or more parameterless DDL statements.
+    async fn run_ddl(&self, ddl: &str) -> Result<()>;
+}
+
+/// The PostgreSQL driver: the pooled, replica-aware path built on [`query`]/
+/// [`query_read`]/[`execute`], and so on the [`Database`] in scope.
+struct PostgresDriver;
+
+impl Driver for PostgresDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>> {
+        let borrowed: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+        let rows = match route {
+            Route::ReadReplica => query_read(sql, &borrowed).await?,
+            Route::Primary => query(sql, &borrowed).await?,
+        };
+        Ok(rows.into_iter().map(Row::Pg).collect())
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let borrowed: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+        execute(sql, &borrowed).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        simple(&acquire(Route::Primary).await?, ddl).await
+    }
+}
+
+/// The SQLite driver: the single shared connection. It has no replica, so `route`
+/// does not change where a statement runs.
+#[cfg(feature = "sqlite")]
+struct SqliteDriver;
+
+#[cfg(feature = "sqlite")]
+impl Driver for SqliteDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], _route: Route) -> Result<Vec<Row>> {
+        sqlite::fetch(sql, params).await
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        sqlite::run(sql, params).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        sqlite::run_ddl(ddl).await
+    }
+}
+
+/// Run a row-returning statement on the active backend's [`Driver`], taking ORM
+/// values and handing back backend-agnostic [`Row`]s. Keeps the
+/// transaction-in-scope routing (PostgreSQL via `CURRENT_TX`; SQLite via its own
+/// task-local), and always runs on the primary.
 pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-    match backend()? {
-        Backend::Postgres => {
-            let borrowed: Vec<&(dyn ToSql + Sync)> =
-                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            Ok(query(sql, &borrowed)
-                .await?
-                .into_iter()
-                .map(Row::Pg)
-                .collect())
-        }
-        #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::fetch(sql, params).await,
-        #[cfg(not(feature = "sqlite"))]
-        Backend::Sqlite => Err(sqlite_disabled()),
-    }
+    fetch_routed(sql, params, Route::Primary).await
 }
 
-/// Run a read that may be served by a read replica, handing back
-/// backend-agnostic [`Row`]s. This is [`fetch`] for a `StatementKind::Read`: on
-/// PostgreSQL it routes through [`query_read`], so the active [`Database`]'s
-/// replica serves it when there is one (and no transaction is open). SQLite has
-/// no replica, so it is identical to [`fetch`] there.
+/// Run a read that may be served by a read replica. This is [`fetch`] for a
+/// `StatementKind::Read`: on PostgreSQL the active [`Database`]'s replica serves
+/// it when there is one (and no transaction is open); SQLite has no replica, so
+/// it is identical to [`fetch`] there.
 pub async fn fetch_read(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    fetch_routed(sql, params, Route::ReadReplica).await
+}
+
+async fn fetch_routed(sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>> {
     match backend()? {
-        Backend::Postgres => {
-            let borrowed: Vec<&(dyn ToSql + Sync)> =
-                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            Ok(query_read(sql, &borrowed)
-                .await?
-                .into_iter()
-                .map(Row::Pg)
-                .collect())
-        }
+        Backend::Postgres => PostgresDriver.fetch(sql, params, route).await,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::fetch(sql, params).await,
+        Backend::Sqlite => SqliteDriver.fetch(sql, params, route).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
     }
 }
 
-/// Run a statement for its row count against the configured backend.
+/// Run a statement for its row count on the active backend's [`Driver`].
 pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
     match backend()? {
-        Backend::Postgres => {
-            let borrowed: Vec<&(dyn ToSql + Sync)> =
-                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            execute(sql, &borrowed).await
-        }
+        Backend::Postgres => PostgresDriver.run(sql, params).await,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::run(sql, params).await,
+        Backend::Sqlite => SqliteDriver.run(sql, params).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
     }
@@ -1106,9 +1153,9 @@ pub async fn sql_execute(sql: &str, params: &[Value]) -> Result<u64> {
 /// backend. Used to stand a schema up before the typed path queries it.
 pub async fn run_ddl(ddl: &str) -> Result<()> {
     match backend()? {
-        Backend::Postgres => simple(&acquire(Route::Primary).await?, ddl).await,
+        Backend::Postgres => PostgresDriver.run_ddl(ddl).await,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::run_ddl(ddl).await,
+        Backend::Sqlite => SqliteDriver.run_ddl(ddl).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
     }

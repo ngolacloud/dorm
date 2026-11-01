@@ -150,6 +150,30 @@ pub enum Dialect {
     Sqlite,
 }
 
+/// A backend feature DORM relies on but cannot assume every engine has (ADR
+/// 0011). The core asks [`Dialect::supports`] before it emits something a backend
+/// lacks, so partial support is **honest**: a backend without a capability gets a
+/// documented degradation or a named refusal, never silently-wrong SQL. As
+/// backends are added (MySQL, SQL Server, Oracle…) each declares its answer here,
+/// in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// `INSERT`/`UPDATE`/`DELETE … RETURNING` — read the written row back in the
+    /// same statement. Absent on MySQL/Oracle, which need a second round trip.
+    Returning,
+    /// Nested transactions via `SAVEPOINT`, which is how `atomic` nests.
+    Savepoints,
+    /// DDL participates in a transaction (so a failed migration step rolls back).
+    /// False on MySQL, where most DDL auto-commits.
+    DdlInTransaction,
+    /// `CREATE INDEX CONCURRENTLY` — build an index without locking writes.
+    ConcurrentIndex,
+    /// A real boolean column type, rather than an integer/`BIT` stand-in.
+    NativeBoolean,
+    /// A dedicated case-insensitive `ILIKE` operator (versus folding to `LIKE`).
+    IlikeOperator,
+}
+
 // Everything a dialect decides differently lives here, as methods on `Dialect` —
 // not as `match`es scattered through the compiler. Adding a SQL backend (ADR
 // 0011) is adding an arm to each of these, in one place, which is what keeps the
@@ -184,6 +208,25 @@ impl Dialect {
         match self {
             Dialect::Postgres => "now()",
             Dialect::Sqlite => "CURRENT_TIMESTAMP",
+        }
+    }
+
+    /// Whether this dialect's backend has `cap`. The single source of truth for
+    /// what a backend can do (ADR 0011); the core consults it before emitting a
+    /// feature not every engine has.
+    pub fn supports(self, cap: Capability) -> bool {
+        use Capability::*;
+        match self {
+            // PostgreSQL (and the PG-wire CockroachDB) has all of these.
+            Dialect::Postgres => true,
+            Dialect::Sqlite => match cap {
+                // SQLite ≥ 3.35 has RETURNING and SAVEPOINT, and its DDL is
+                // transactional.
+                Returning | Savepoints | DdlInTransaction => true,
+                // No `CONCURRENTLY`, no dedicated boolean, no `ILIKE` keyword
+                // (its `LIKE` is already case-insensitive for ASCII).
+                ConcurrentIndex | NativeBoolean | IlikeOperator => false,
+            },
         }
     }
 }
@@ -1130,6 +1173,42 @@ pub fn compile_insert_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_supports_every_capability_sqlite_only_a_subset() {
+        use Capability::*;
+        // PostgreSQL (and PG-wire CockroachDB) has them all.
+        for cap in [
+            Returning,
+            Savepoints,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(
+                Dialect::Postgres.supports(cap),
+                "postgres should have {cap:?}"
+            );
+        }
+        // SQLite has RETURNING, savepoints and transactional DDL…
+        assert!(Dialect::Sqlite.supports(Returning));
+        assert!(Dialect::Sqlite.supports(Savepoints));
+        assert!(Dialect::Sqlite.supports(DdlInTransaction));
+        // …but no CONCURRENTLY, no native boolean, no ILIKE keyword.
+        assert!(!Dialect::Sqlite.supports(ConcurrentIndex));
+        assert!(!Dialect::Sqlite.supports(NativeBoolean));
+        assert!(!Dialect::Sqlite.supports(IlikeOperator));
+        // The ILIKE capability and the operator the compiler emits must agree.
+        assert_eq!(
+            Dialect::Sqlite.supports(IlikeOperator),
+            Dialect::Sqlite.ilike() == "ILIKE"
+        );
+        assert_eq!(
+            Dialect::Postgres.supports(IlikeOperator),
+            Dialect::Postgres.ilike() == "ILIKE"
+        );
+    }
 
     #[test]
     fn like_metacharacters_in_the_value_are_escaped() {
