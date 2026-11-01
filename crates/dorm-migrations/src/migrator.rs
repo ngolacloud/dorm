@@ -12,14 +12,25 @@ use dorm_core::db;
 use dorm_core::meta::ModelMeta;
 use dorm_core::value::Value;
 
-/// A versioned migration: a monotonically increasing version, a name, and the
-/// statements to run. The statements are expected to be idempotent
-/// (`IF NOT EXISTS`), which is what lets [`migrate`] adopt a pre-existing schema.
+/// A versioned migration: a monotonically increasing version, a name, the
+/// statements to apply, and the statements to undo it. The `statements` are
+/// expected to be idempotent (`IF NOT EXISTS`), which is what lets [`migrate`]
+/// adopt a pre-existing schema.
+///
+/// `down` is the inverse — what [`revert`] runs to roll the migration back. It is
+/// **empty when the migration is not losslessly reversible**: a migration that
+/// drops a column or changes a type cannot be undone without the data it
+/// discarded, so rather than fabricate a wrong inverse, DORM records no `down`
+/// and [`revert`] refuses to cross it (the same honesty Django's
+/// non-reversible migrations keep). An additive migration — new tables, columns,
+/// indexes, renames — has a full `down`.
 #[derive(Debug, Clone)]
 pub struct Migration {
     pub version: i64,
     pub name: String,
     pub statements: Vec<String>,
+    /// The inverse statements, or empty when the migration is irreversible.
+    pub down: Vec<String>,
 }
 
 /// The initial migration (version 1): create every table and index for `models`.
@@ -36,10 +47,18 @@ pub fn initial(models: &[&'static ModelMeta]) -> Result<Migration> {
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect();
+    // The inverse of "create every table" is "drop every table", in reverse
+    // declaration order so a child table goes before the parent it references.
+    let down = models
+        .iter()
+        .rev()
+        .map(|m| ddl::drop_table(m.table))
+        .collect();
     Ok(Migration {
         version: 1,
         name: "initial".to_string(),
         statements,
+        down,
     })
 }
 
@@ -129,6 +148,83 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
     })
     .await?;
     Ok(applied)
+}
+
+/// Roll the schema back to `to_version`, undoing every migration applied after it
+/// in reverse order. Pass `0` to undo everything. This is Django's `migrate <app>
+/// <version>` run backwards; Prisma has no exact twin.
+///
+/// Each crossed migration's [`down`](Migration::down) is run and its ledger row
+/// removed, newest first, all in one transaction under the same advisory lock as
+/// [`migrate`]. A migration that is **not reversible** — empty `down`, because it
+/// dropped a column or changed a type — stops the revert with a named error
+/// *before* anything past it is undone: DORM will not fabricate an inverse that
+/// loses data. Idempotent: a version already absent from the ledger is skipped.
+///
+/// Returns the versions reverted, newest-first.
+pub async fn revert(migrations: &[Migration], to_version: i64) -> Result<Vec<i64>> {
+    db::guard_write("revert")?;
+    let is_postgres = db::backend_of(&db::dsn()?) == db::Backend::Postgres;
+
+    // Only migrations strictly above the target, newest first.
+    let mut to_undo: Vec<&Migration> = migrations
+        .iter()
+        .filter(|m| m.version > to_version)
+        .collect();
+    to_undo.sort_by_key(|m| std::cmp::Reverse(m.version));
+
+    let reverted = db::atomic(|_tx| async move {
+        if is_postgres {
+            db::run(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[Value::I64(MIGRATE_LOCK)],
+            )
+            .await?;
+        }
+        db::run(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {LEDGER} (\
+                 version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_unix BIGINT NOT NULL)"
+            ),
+            &[],
+        )
+        .await?;
+
+        let done: std::collections::HashSet<i64> =
+            db::fetch(&format!("SELECT version FROM {LEDGER}"), &[])
+                .await?
+                .iter()
+                .map(|r| r.try_get::<i64>(0))
+                .collect::<dorm_core::Result<_>>()?;
+
+        let delete = if is_postgres {
+            format!("DELETE FROM {LEDGER} WHERE version = $1")
+        } else {
+            format!("DELETE FROM {LEDGER} WHERE version = ?1")
+        };
+
+        let mut undone = Vec::new();
+        for m in &to_undo {
+            if !done.contains(&m.version) {
+                continue; // not applied — nothing to undo
+            }
+            if m.down.is_empty() && !m.statements.is_empty() {
+                return Err(dorm_core::Error::Config(format!(
+                    "migration {} (`{}`) is not reversible: it has no `down` (it dropped data \
+                     or changed a type), so revert stops before undoing it",
+                    m.version, m.name
+                )));
+            }
+            for stmt in &m.down {
+                db::run(stmt, &[]).await?;
+            }
+            db::run(&delete, &[Value::I64(m.version)]).await?;
+            undone.push(m.version);
+        }
+        Ok(undone)
+    })
+    .await?;
+    Ok(reverted)
 }
 
 /// Bring the live schema in line with `models`, **additively**: create any table

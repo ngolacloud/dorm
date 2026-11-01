@@ -76,4 +76,4 @@ pub use autodetect::{
     Snapshot,
 };
 pub use history::{History, StoredMigration};
-pub use migrator::{diff, initial, migrate, sync, Migration};
+pub use migrator::{diff, initial, migrate, revert, sync, Migration};

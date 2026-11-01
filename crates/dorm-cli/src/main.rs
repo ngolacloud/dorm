@@ -304,6 +304,16 @@ enum MigrateAction {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Roll the schema back to a version, undoing every migration applied after
+    /// it in reverse order — Django's `migrate <app> <version>` backwards. Each
+    /// crossed migration's recorded `down` is run and its ledger row removed, in
+    /// one transaction. A migration that dropped a column or changed a type is
+    /// **not reversible** and stops the revert by name rather than losing data.
+    Down {
+        /// Revert down to (and keeping) this version. `0` undoes everything. The
+        /// operator must name it — there is no default and no "one step".
+        to: i64,
+    },
     /// Show which migration versions the database has recorded as applied.
     Status,
     /// Show the additive changes `push` would apply, without touching the
@@ -423,6 +433,7 @@ fn main() -> ExitCode {
             MigrateAction::Resolve { version, name } => {
                 on_runtime(migrate_resolve(version, name, json))
             }
+            MigrateAction::Down { to } => on_runtime(migrate_down(to, json)),
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
         },
@@ -745,6 +756,40 @@ async fn migrate_status(json: bool) -> CliResult {
         let name: String = row.get(1);
         let applied_unix: i64 = row.get(2);
         println!("  v{version:<4} {name:<24} {}", applied_at(applied_unix));
+    }
+    Ok(0)
+}
+
+/// `dorm migrate down <to>`: roll the recorded chain back to version `to`.
+///
+/// It reads the on-disk history in `migrations/` — which carries each migration's
+/// `down` — converts it to runnable migrations, and hands them to
+/// [`dorm_migrations::revert`], which undoes every applied version above `to` in
+/// one transaction, refusing by name at the first irreversible one. A history
+/// with no files has nothing to reverse, which is an error, not a silent no-op.
+async fn migrate_down(to: i64, json: bool) -> CliResult {
+    let recorded = dorm_migrations::History::open("migrations")
+        .load()
+        .map_err(|e| format!("reading the migrations/ history: {e}"))?;
+    if recorded.is_empty() {
+        return Err("no migrations recorded in migrations/, so there is nothing to revert".into());
+    }
+    let migrations: Vec<dorm_migrations::Migration> =
+        recorded.iter().map(|m| m.to_migration()).collect();
+
+    let undone = dorm_migrations::revert(&migrations, to)
+        .await
+        .map_err(|e| format!("reverting to v{to}: {e}"))?;
+
+    if json {
+        println!("{}", json!({ "reverted": undone, "to": to }));
+    } else if undone.is_empty() {
+        println!("nothing to revert — the database is already at or below v{to}.");
+    } else {
+        println!("reverted to v{to}:");
+        for v in &undone {
+            println!("  undid v{v}");
+        }
     }
     Ok(0)
 }

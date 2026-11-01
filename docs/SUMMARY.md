@@ -37,3 +37,4 @@
   - [0011 — Multi-backend & production roadmap](adr/0011-multi-backend-and-production-roadmap.md)
   - [0012 — Native CQRS](adr/0012-native-cqrs.md)
   - [0013 — prefetch (reverse relation, no N+1)](adr/0013-prefetch-related.md)
+  - [0014 — Reversible migrations](adr/0014-reversible-migrations.md)

@@ -257,6 +257,106 @@ pub fn autodetect_with_renames(
     Ok(b.into_ordered())
 }
 
+/// The inverse of the migration [`autodetect_with_renames`] produces — the
+/// statements that undo it — or **empty when the change is not losslessly
+/// reversible**. A drop (table or column), a type change, or a removed index
+/// cannot be undone without the data or definition it discarded, so rather than
+/// fabricate a wrong inverse DORM records no `down` and [`revert`](crate::revert)
+/// refuses to cross it. An additive change — new tables, columns, indexes,
+/// renames — is inverted by dropping what it added and renaming back what it
+/// renamed, computed from the two snapshots directly.
+pub fn down_for(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Vec<String>> {
+    let current = Snapshot::from_models(models);
+    let cur_tables: BTreeMap<&str, &Table> = current
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+
+    // Reversibility: every previous table and column (under its post-rename name)
+    // must still be present and unchanged. A removal or alteration anywhere makes
+    // the whole migration irreversible — there is no partial `down`.
+    for prev in &previous.tables {
+        let Some(cur) = cur_tables.get(prev.name.as_str()) else {
+            return Ok(Vec::new()); // a table the models dropped
+        };
+        let prev_cols = renamed(prev, cur, prev.name.as_str(), renames)?;
+        let cur_by_name: BTreeMap<&str, &Column> =
+            cur.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        for pc in &prev_cols.columns {
+            match cur_by_name.get(pc.name.as_str()) {
+                None => return Ok(Vec::new()), // dropped column
+                Some(cc) if !same_except_index(pc, cc) => return Ok(Vec::new()), // altered
+                Some(cc) if pc.index && !cc.index => return Ok(Vec::new()), // dropped index
+                _ => {}
+            }
+        }
+    }
+
+    // Purely additive: invert it.
+    let prev_tables: BTreeMap<&str, &Table> = previous
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    let (mut drop_tables, mut drop_cols, mut drop_idx) = (Vec::new(), Vec::new(), Vec::new());
+    for cur in &current.tables {
+        match prev_tables.get(cur.name.as_str()) {
+            None => drop_tables.push(ddl::drop_table(&cur.name)), // a new table
+            Some(prev) => {
+                let prev_cols = renamed(prev, cur, cur.name.as_str(), renames)?;
+                let prev_by_name: BTreeMap<&str, &Column> = prev_cols
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c))
+                    .collect();
+                for cc in &cur.columns {
+                    match prev_by_name.get(cc.name.as_str()) {
+                        None => drop_cols.push(ddl::drop_column(&cur.name, &cc.name, backend)),
+                        // An index added to a column that already existed; a
+                        // brand-new column's index goes with the column it drops.
+                        Some(pc) if cc.index && !pc.index => {
+                            drop_idx.push(ddl::drop_index(&cur.name, &cc.name))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    // Drop new tables child-first, mirroring the parent-first create order.
+    drop_tables.reverse();
+
+    // Order mirrors the forward migration undone: added indexes, then columns,
+    // then tables, then the renames (which ran first on the way up, so last here).
+    let mut down = Vec::new();
+    down.extend(drop_idx);
+    down.extend(drop_cols);
+    down.extend(drop_tables);
+    down.extend(
+        renames
+            .iter()
+            .map(|r| ddl::rename_column(&r.table, &r.to, &r.from)),
+    );
+    Ok(down)
+}
+
+/// `prev`'s columns under their post-rename names for `table`, or `prev`
+/// unchanged when the table has no renames. A thin wrapper over [`apply_renames`].
+fn renamed(prev: &Table, cur: &Table, table: &str, renames: &[ColumnRename]) -> Result<Table> {
+    let table_renames: Vec<&ColumnRename> = renames.iter().filter(|r| r.table == table).collect();
+    if table_renames.is_empty() {
+        Ok(prev.clone())
+    } else {
+        apply_renames(prev, cur, &table_renames)
+    }
+}
+
 /// Rewrite `prev`'s column names per the table's declared renames, returning a
 /// snapshot table the diff can compare under the new names. Each rename is
 /// validated: its source must exist in `prev` and its target in `cur`, or it is
@@ -578,10 +678,12 @@ pub fn make_migration_with_renames(
     if statements.is_empty() {
         return Ok(None);
     }
+    let down = down_for(previous, models, backend, renames)?;
     let migration = Migration {
         version,
         name: name.to_string(),
         statements,
+        down,
     };
     Ok(Some((migration, Snapshot::from_models(models))))
 }

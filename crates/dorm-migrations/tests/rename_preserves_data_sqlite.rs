@@ -75,6 +75,7 @@ fn a_hinted_rename_keeps_the_rows_data() {
         version: 1,
         name: "initial".into(),
         statements: autodetect(&Snapshot::empty(), &[v1], Backend::Sqlite).unwrap(),
+        down: vec![],
     };
     // v2: rename `title` -> `headline`, declared by the author.
     let m2 = Migration {
@@ -91,6 +92,7 @@ fn a_hinted_rename_keeps_the_rows_data() {
             }],
         )
         .unwrap(),
+        down: vec![],
     };
     // The rename migration is exactly a RENAME COLUMN — no drop, no add.
     assert_eq!(
