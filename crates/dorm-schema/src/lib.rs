@@ -92,7 +92,7 @@ pub struct Model {
 /// A model's `@@rag(..)` declaration, parsed from the schema.
 ///
 /// Compiled by [`generate_rust`] into `#[derive(Rag)]` + `#[rag(..)]` and checked
-/// by [`validate`]. The field names are the schema spellings; the generator
+/// by [`validate()`]. The field names are the schema spellings; the generator
 /// snake_cases them to match the generated Rust fields and columns.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RagBlock {

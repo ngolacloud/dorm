@@ -8,7 +8,7 @@
 //!
 //! # The shape of it
 //!
-//! `#[derive(Rag)]` emits a [`RagMeta`](meta::RagMeta) and submits it into a
+//! `#[derive(Rag)]` emits a [`RagMeta`] and submits it into a
 //! distributed slice this crate owns — the RAG analogue of the `ModelMeta` slice
 //! in `dorm-core`. The RagMeta is tied to its model by **name**, so the two
 //! derives stay independent and `ModelMeta` does not change.
@@ -64,7 +64,7 @@ pub fn validate() -> Vec<Issue> {
     validate_against(&rags, &models)
 }
 
-/// The pure core of [`validate`], taking its inputs explicitly so it can be
+/// The pure core of [`validate()`], taking its inputs explicitly so it can be
 /// unit-tested without a linked registry.
 ///
 /// Per RAG model it checks: the named model is registered; every `fields` entry

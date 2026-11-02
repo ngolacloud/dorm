@@ -11,7 +11,7 @@
 
 use crate::{Field, Scalar, Schema};
 
-/// How serious a [`validate`] finding is.
+/// How serious a [`validate()`] finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     /// The schema will not work as written — generation or a later query fails.
@@ -29,7 +29,7 @@ impl Severity {
     }
 }
 
-/// One thing [`validate`] found wrong with the schema.
+/// One thing [`validate()`] found wrong with the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     pub severity: Severity,

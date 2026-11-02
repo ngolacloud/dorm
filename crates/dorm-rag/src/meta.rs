@@ -48,7 +48,7 @@ impl DistanceMetric {
 /// One model's RAG configuration.
 ///
 /// Emitted by `#[derive(Rag)]`, one per RAG model, and gathered by
-/// [`inventory`](crate::inventory). The `model` field is the registered model
+/// [`inventory`]. The `model` field is the registered model
 /// name (`"Ticket"`), which is how this joins its [`ModelMeta`](dorm_core::meta::ModelMeta)
 /// without holding its type.
 #[derive(Debug, Clone, Copy)]

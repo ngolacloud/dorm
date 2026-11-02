@@ -4,11 +4,12 @@
 //! model id the shadow table and the staleness check need. The worker is generic
 //! over this trait, so the choice of backend is the embedding project's.
 //!
-//! Backends: [`LocalEmbedder`] (feature `embed-local`, ONNX on the host via
-//! `fastembed` — the privacy-first default, data never leaves the box),
-//! [`OllamaEmbedder`] (feature `embed-ollama`), [`OpenAIEmbedder`] for any
-//! OpenAI-compatible `/v1/embeddings` endpoint (feature `embed-openai-compat`),
-//! and a deterministic [`HashEmbedder`] for offline tests.
+//! Backends (feature-gated, so named here as plain types rather than doc links):
+//! `LocalEmbedder` (`embed-local`, ONNX on the host via `fastembed` — the
+//! privacy-first default, data never leaves the box), `OllamaEmbedder`
+//! (`embed-ollama`), `OpenAIEmbedder` for any OpenAI-compatible `/v1/embeddings`
+//! endpoint (`embed-openai-compat`), and a deterministic [`HashEmbedder`] for
+//! offline tests.
 
 use std::future::Future;
 use std::pin::Pin;
