@@ -1,0 +1,66 @@
+[package]
+name = "dorm-rag"
+# Independent line: RAG is an optional product on top of the core, and moves on
+# its own cadence (ADR 0019). Pre-1.0, which is also why `RagMeta` may stay a
+# plain (non-`#[non_exhaustive]`) struct that this crate alone owns.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Optional RAG for DORM — a model marked #[derive(Rag)] is indexed in pgvector and gains semantic/hybrid search with the same filters and tenant isolation as any query (ADR 0019)."
+readme = "README.md"
+keywords = ["orm", "rag", "pgvector", "embeddings", "postgres"]
+categories = ["database"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# dorm-core is a one-way dependency: dorm-rag reads `ModelMeta`/the registry; the
+# core never depends on dorm-rag, so a crate that does not use RAG sees an
+# unchanged dorm-core graph (ADR 0019, acceptance #1).
+#
+# `dorm-derive` is pulled with its non-default `rag` feature ON, purely to
+# re-export `#[derive(Rag)]`. The derive emits `::dorm_rag::…` *token paths* for
+# the user's crate to compile; it takes no Cargo dependency back on dorm-rag, so
+# there is no cycle.
+[dependencies]
+dorm-core = { version = "0.6", path = "../dorm-core" }
+dorm-derive = { version = "0.3", path = "../dorm-derive", features = ["rag"] }
+# For `ddl::Backend` and to prove RAG DDL flows through the versioned migrator
+# (`Migration.statements`). dorm-migrations does NOT depend on dorm-rag, so the
+# migrator stays ignorant of RAG and a non-RAG project is unaffected (ADR 0019).
+dorm-migrations = { version = "0.7", path = "../dorm-migrations" }
+inventory = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The worker's poll loop sleeps; `run_once` needs no runtime of its own. `rt` is
+# for `spawn_blocking`, which the local ONNX embedder uses to keep the sync
+# inference off the async executor.
+tokio = { workspace = true, features = ["time", "rt"] }
+# The Ollama embedder (feature-gated): rustls so it builds offline/static and can
+# also reach a remote Ollama over TLS. Only compiled when `embed-ollama` is on, so
+# a build without it pulls no HTTP stack.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# The local ONNX embedder (feature-gated): runs the model on the host via ONNX
+# Runtime, so data never leaves the box. Heavy, hence strictly opt-in.
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+# Embedder backends (ADR 0019 brick 4). Both are HTTP clients, so they share the
+# optional `reqwest`. `embed-local` (ONNX/fastembed, data stays on the host) needs
+# the `ort` runtime, which does not vendor/build offline here — it is the one
+# backend still to land.
+embed-ollama = ["dep:reqwest"]
+embed-openai-compat = ["dep:reqwest"]
+embed-local = ["dep:fastembed"]
+
+[dev-dependencies]
+# The live proofs need a runtime; a pgvector DSN (docker-compose.rag.yml) runs
+# them, otherwise they skip.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -26,4 +26,11 @@ dorm-core = { path = "../dorm-core" }
 # model's metadata in `main` is what stops the linker from dropping the crate —
 # and with it the `inventory::submit!` that registers the models.
 dorm-models = { path = "../dorm-models" }
+# RAG in the REPL (ADR 0019, brick 6): the `search` verb and `:rag`. A binary may
+# depend on the optional crates; no shared library gains an edge from this. The
+# derive lets the shell declare its own RAG model to search over.
+dorm-derive = { path = "../dorm-derive", features = ["rag"] }
+dorm-rag = { path = "../dorm-rag", features = ["embed-ollama"] }
+# `:rag setup` creates the RAG shadow tables and triggers so `search` works.
+dorm-migrations = { path = "../dorm-migrations" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }

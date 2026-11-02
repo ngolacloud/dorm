@@ -148,6 +148,20 @@ enum CliCommand {
         #[command(subcommand)]
         action: ApiAction,
     },
+    /// Optional RAG (ADR 0019): index models in pgvector and run the worker.
+    /// `dorm rag generate` writes `src/bin/rag.rs`; `worker`/`status`/`reindex`
+    /// build and run it. Needs `dorm-rag` in your Cargo.toml.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
+    /// Optional MCP server (ADR 0020): expose your models to an agent as tools and
+    /// resources. `dorm mcp generate` writes `src/bin/mcp.rs`; run it with
+    /// `cargo run --bin mcp -- --transport stdio`. Needs `dorm-mcp` in Cargo.toml.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Create an administrator account (`is_superuser`), Django-style. Native —
     /// writes a hashed password into the `orm_accounts` table (created on demand),
     /// never the plaintext. Prompts without echo; `--password`/`--password-stdin`
@@ -238,6 +252,46 @@ enum ApiAction {
     },
     /// Build and run the generated API. (`cargo run --bin api`.)
     Serve,
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Write `src/bin/mcp.rs` — a native MCP server over your models (ADR 0020).
+    /// Needs `dorm-mcp` in Cargo.toml.
+    Generate {
+        /// Where to write the MCP binary.
+        #[arg(long, default_value = "src/bin/mcp.rs")]
+        out: String,
+    },
+    /// Build and run the MCP server over stdio. (`cargo run --bin mcp`.)
+    Serve,
+}
+
+#[derive(Subcommand)]
+enum RagAction {
+    /// Write `src/bin/rag.rs` — the RAG worker/status/reindex over your models
+    /// (ADR 0019). Needs `dorm-rag` in Cargo.toml with an embedder feature.
+    Generate {
+        /// Where to write the RAG binary.
+        #[arg(long, default_value = "src/bin/rag.rs")]
+        out: String,
+    },
+    /// Drain `dorm_rag_outbox`, embedding changed chunks, until stopped.
+    /// (`cargo run --bin rag -- worker`.)
+    Worker,
+    /// Show index health per model: indexed, pending, dead-letter, embedder.
+    /// (`cargo run --bin rag -- status`; `--json`.)
+    Status,
+    /// Enqueue records for re-indexing; scope with `--model`/`--tenant`.
+    /// (`cargo run --bin rag -- reindex`.)
+    Reindex {
+        /// Only this model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Only this tenant (a tenant-scoped model).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -424,7 +478,7 @@ fn main() -> ExitCode {
         } => scaffold::new_model(&name).map(|()| 0),
         CliCommand::Generate { schema, out } => scaffold::generate(&schema, &out).map(|()| 0),
         CliCommand::Format { schema, check } => scaffold::format(&schema, check),
-        CliCommand::Validate => cargo_run("validate", json),
+        CliCommand::Validate => validate(json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
             MigrateAction::Make { name } => cargo_run_args("makemigration", &[&name], false),
@@ -453,6 +507,28 @@ fn main() -> ExitCode {
                 scaffold::api_generate(&schema, &out).map(|()| 0)
             }
             ApiAction::Serve => cargo_run("api", false),
+        },
+        CliCommand::Rag { action } => match action {
+            RagAction::Generate { out } => scaffold::rag_generate(&out).map(|()| 0),
+            RagAction::Worker => cargo_run_args("rag", &["worker"], false),
+            RagAction::Status => cargo_run_args("rag", &["status"], json),
+            RagAction::Reindex { model, tenant } => {
+                let mut args = vec!["reindex".to_string()];
+                if let Some(m) = model {
+                    args.push("--model".to_string());
+                    args.push(m);
+                }
+                if let Some(t) = tenant {
+                    args.push("--tenant".to_string());
+                    args.push(t);
+                }
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                cargo_run_args("rag", &refs, false)
+            }
+        },
+        CliCommand::Mcp { action } => match action {
+            McpAction::Generate { out } => scaffold::mcp_generate(&out).map(|()| 0),
+            McpAction::Serve => cargo_run_args("mcp", &["--transport", "stdio"], false),
         },
         CliCommand::Createsuperuser {
             username,
@@ -521,6 +597,25 @@ fn on_runtime(fut: impl std::future::Future<Output = CliResult>) -> CliResult {
         .enable_all()
         .build()?
         .block_on(fut)
+}
+
+/// `dorm validate` — two passes, cheapest first.
+///
+/// 1. **Schema level** (native, no build, no database): parse `dorm.schema` and
+///    run `dorm_schema::validate`, which includes the ADR 0019 `@@rag` checks.
+///    If it finds errors, stop and surface exit `3` — no point building a project
+///    whose schema is already wrong.
+/// 2. **Registry level** (the cargo lane): build and run the project's `validate`
+///    binary, which links the models and runs `registry::validate` (and
+///    `dorm_rag::validate` when the project uses RAG).
+///
+/// A project with no `dorm.schema` (hand-written models) simply skips pass 1.
+fn validate(json: bool) -> CliResult {
+    let code = scaffold::validate_schema("dorm.schema")?;
+    if code != 0 {
+        return Ok(code);
+    }
+    cargo_run("validate", json)
 }
 
 /// The cargo lane: build and run one of the project's binaries, forwarding

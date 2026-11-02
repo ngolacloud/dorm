@@ -45,11 +45,13 @@ mod codegen_api;
 mod format;
 mod lexer;
 mod parser;
+mod validate;
 
 pub use codegen::generate_rust;
 pub use codegen_api::generate_axum;
 pub use format::format;
 pub use parser::{parse, ParseError};
+pub use validate::{validate, Issue, Severity};
 
 /// A parsed `dorm.schema`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,33 @@ pub struct Model {
     /// The table, defaulting to the snake_case plural of `name`.
     pub table: String,
     pub fields: Vec<Field>,
+    /// The `@@rag(..)` block, when the model opts into RAG (ADR 0019). `None`
+    /// for an ordinary model — and a schema with no `@@rag` anywhere generates
+    /// byte-for-byte what it did before, pulling in no `dorm-rag` dependency.
+    pub rag: Option<RagBlock>,
+}
+
+/// A model's `@@rag(..)` declaration, parsed from the schema.
+///
+/// Compiled by [`generate_rust`] into `#[derive(Rag)]` + `#[rag(..)]` and checked
+/// by [`validate`]. The field names are the schema spellings; the generator
+/// snake_cases them to match the generated Rust fields and columns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RagBlock {
+    /// The source fields to embed (`fields: [title, body]`).
+    pub fields: Vec<String>,
+    /// The document template (`template: "{title}\n\n{body}"`), if given.
+    pub template: Option<String>,
+    /// The embedder id (`embedder: "default"`), if given.
+    pub embedder: Option<String>,
+    /// `chunk_size: 800`, if given.
+    pub chunk_size: Option<u32>,
+    /// `chunk_overlap: 100`, if given.
+    pub chunk_overlap: Option<u32>,
+    /// Filterable metadata columns (`metadata: [status]`).
+    pub metadata: Vec<String>,
+    /// `distance: "cosine"`, if given.
+    pub distance: Option<String>,
 }
 
 impl Model {
