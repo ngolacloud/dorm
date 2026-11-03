@@ -239,24 +239,33 @@ impl ToSql for Value {
             // No type is named: the server infers it from where the placeholder
             // sits. Every path that could produce an untyped NULL in a bare
             // comparison compiles to `IS NULL` instead, so this stays unambiguous.
+            // Each arm delegates to the inner type's `to_sql_checked`, **not** its
+            // `to_sql`: `to_sql_checked` consults that type's own `accepts` first,
+            // so a variant bound where the server inferred an incompatible type
+            // (an `i64` into a `numeric`/`interval`/`pg_lsn` parameter) fails with a
+            // clean type error instead of writing the native bytes into the wrong
+            // type — the silent-corruption trap ADRs 0025/0030 worked around. The
+            // bare `to_sql` skips that check, which is exactly what let the bytes
+            // through.
             Value::Null => Ok(IsNull::Yes),
-            Value::Bool(v) => v.to_sql(ty, out),
-            Value::I32(v) => v.to_sql(ty, out),
-            Value::I64(v) => v.to_sql(ty, out),
-            Value::F64(v) => v.to_sql(ty, out),
-            Value::Text(v) => v.to_sql(ty, out),
-            Value::Decimal(v) => v.to_sql(ty, out),
-            Value::Timestamp(v) => v.to_sql(ty, out),
-            Value::Uuid(v) => v.to_sql(ty, out),
-            Value::Json(v) => v.to_sql(ty, out),
-            Value::Bytes(v) => v.to_sql(ty, out),
+            Value::Bool(v) => v.to_sql_checked(ty, out),
+            Value::I32(v) => v.to_sql_checked(ty, out),
+            Value::I64(v) => v.to_sql_checked(ty, out),
+            Value::F64(v) => v.to_sql_checked(ty, out),
+            Value::Text(v) => v.to_sql_checked(ty, out),
+            Value::Decimal(v) => v.to_sql_checked(ty, out),
+            Value::Timestamp(v) => v.to_sql_checked(ty, out),
+            Value::Uuid(v) => v.to_sql_checked(ty, out),
+            Value::Json(v) => v.to_sql_checked(ty, out),
+            Value::Bytes(v) => v.to_sql_checked(ty, out),
         }
     }
 
     fn accepts(_ty: &Type) -> bool {
-        // The variant decides, not the declared column type: `accepts` runs
-        // before the variant is known. A genuine mismatch still fails, inside
-        // `to_sql` above, with the driver's own message.
+        // The variant decides, not the declared column type: `accepts` runs before
+        // the variant is known, so it must admit any type a `Value` could hold. The
+        // real per-variant check happens in `to_sql` above, via each inner type's
+        // `to_sql_checked`.
         true
     }
 
@@ -425,6 +434,35 @@ pub fn read_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_bound_to_an_incompatible_type_is_refused_not_corrupted() {
+        // The hardening (ADR 0037): delegating to each inner type's
+        // `to_sql_checked` makes a type mismatch a clean error, instead of writing
+        // the native bytes into a server-inferred type that does not match — the
+        // silent-corruption trap that recurred as `::numeric`/`::interval`/`::pg_lsn`.
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        assert!(
+            Value::I64(5)
+                .to_sql_checked(&Type::NUMERIC, &mut buf)
+                .is_err(),
+            "an i64 must not serialize into a numeric parameter"
+        );
+        buf.clear();
+        assert!(
+            Value::Text("x".into())
+                .to_sql_checked(&Type::INT8, &mut buf)
+                .is_err(),
+            "text must not serialize into a bigint parameter"
+        );
+        buf.clear();
+        // The matching cases still work.
+        assert!(Value::I64(5).to_sql_checked(&Type::INT8, &mut buf).is_ok());
+        buf.clear();
+        assert!(Value::Text("x".into())
+            .to_sql_checked(&Type::TEXT, &mut buf)
+            .is_ok());
+    }
 
     #[test]
     fn widening_an_integer_is_allowed_and_narrowing_only_when_it_fits() {
