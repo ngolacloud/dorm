@@ -1136,6 +1136,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dorm-jobs"
+version = "0.1.0"
+dependencies = [
+ "dorm-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dorm-mcp"
 version = "0.1.0"
 dependencies = [

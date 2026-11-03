@@ -41,6 +41,9 @@ members = [
     # drain them with independent cursor-tracking consumers (ADR 0026). dorm-core
     # never depends on it.
     "crates/dorm-outbox",
+    # Optional durable PostgreSQL job queue + expiring leases (ADR 0027). dorm-core
+    # never depends on it.
+    "crates/dorm-jobs",
 ]
 
 [workspace.package]
