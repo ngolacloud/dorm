@@ -1,4 +1,4 @@
-//! Composite primary key against a real PostgreSQL (ADR 0042 / L5-composite-PK).
+//! Composite primary key against a real PostgreSQL (ADR 0042 + 0045 / L5-composite-PK).
 //!
 //! ```text
 //! DELONIX_ORM_TEST_DSN='host=127.0.0.1 port=5432 user=orm dbname=ormtest' \
@@ -124,12 +124,48 @@ fn a_composite_key_table_creates_inserts_queries_and_enforces_uniqueness() {
             "a duplicate composite key is a unique violation, got {dup:?}"
         );
 
-        // Instance save is refused on a composite key (honest limitation, ADR 0042).
+        // Instance save now works on a composite key (ADR 0045): the UPDATE is
+        // located by the whole (region, code) key, not by a single value.
         let mut row = one;
         row.label = "changed".into();
-        assert!(
-            matches!(row.save().await, Err(Error::Config(ref m)) if m.contains("composite")),
-            "instance save on a composite key is refused for now"
-        );
+        row.save().await.expect("instance save on a composite key");
+
+        // Re-read it to prove the change hit the row the key names, and only it.
+        let reread = RegionCode::objects()
+            .filter(
+                region_code::region
+                    .eq("eu")
+                    .and(region_code::code.eq("mad")),
+            )
+            .get()
+            .await
+            .expect("re-read after save");
+        assert_eq!(reread.label, "changed", "the composite-key save persisted");
+
+        // Instance delete also works (ADR 0045): it removes exactly the keyed row.
+        let removed = reread
+            .delete()
+            .await
+            .expect("instance delete on a composite key");
+        assert_eq!(removed, 1, "exactly the (eu, mad) row is deleted");
+
+        // It is gone: the full-key lookup now finds nothing, and the table holds
+        // the two rows that were left untouched.
+        let gone = RegionCode::objects()
+            .filter(
+                region_code::region
+                    .eq("eu")
+                    .and(region_code::code.eq("mad")),
+            )
+            .count()
+            .await
+            .expect("count after delete");
+        assert_eq!(gone, 0, "the deleted composite-key row is gone");
+        let remaining = RegionCode::objects()
+            .all()
+            .count()
+            .await
+            .expect("total count");
+        assert_eq!(remaining, 2, "only the keyed row was removed");
     });
 }

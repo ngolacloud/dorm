@@ -69,14 +69,12 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
             meta.name
         ))
     })?;
-    // Composite-key tables create and query fine (ADR 0042), but instance save by
-    // key needs all key columns, which `Model::pk` (one value) does not carry yet.
+    // A composite-key instance is located by all its key columns, which
+    // `Model::pk` (one value) cannot carry — so it takes a dedicated UPDATE that
+    // reads the whole key out of `column_values` (ADR 0045). Create on a composite
+    // key stays on the QuerySet, and an instance save is always an update.
     if meta.is_composite_pk() {
-        return Err(Error::Config(format!(
-            "model `{}` has a composite primary key; save it with an explicit insert/update \
-             (QuerySet) until instance save on composite keys lands (ADR 0042)",
-            meta.name
-        )));
+        return composite_update(obj).await;
     }
 
     if obj.pk().is_null() {
@@ -184,6 +182,91 @@ async fn versioned_update<T: Model>(obj: &mut T, expected: Option<i64>) -> Resul
     Ok(())
 }
 
+/// The update half of [`save_instance`] for a composite primary key (ADR 0045).
+///
+/// A composite key row is located by **every** key column, not by the single
+/// value `Model::pk` carries, so the `WHERE` is built by reading each key column
+/// out of the instance's [`column_values`](Model::column_values). The `SET` is
+/// the non-key, non-`auto_now_add` columns — the same filter the simple-key path
+/// uses, with the key columns held out of the assignment list since they already
+/// pin the row in the `WHERE`.
+///
+/// This is last-write-wins: an instance save on a composite key is always an
+/// UPDATE (create stays on the QuerySet, which supplies the whole key). Optimistic
+/// concurrency by instance on a composite key is out of scope this round — a
+/// composite model that also declares `#[field(version)]` is refused here and told
+/// to update through a QuerySet, rather than silently skipping the version guard.
+async fn composite_update<T: Model>(obj: &T) -> Result<()> {
+    let meta = T::meta();
+    if meta.version_field().is_some() {
+        return Err(Error::Config(format!(
+            "model `{}` has both a composite primary key and a version field; optimistic \
+             concurrency by instance on a composite key is not supported yet (ADR 0045) — \
+             update it through a QuerySet",
+            meta.name
+        )));
+    }
+    let values = obj.column_values();
+    let mut plan = compiler::Plan::new(meta);
+    push_key_filters(&mut plan, meta, &values)?;
+
+    let mut sets: Vec<crate::expr::Assignment> = Vec::new();
+    for (name, v) in &values {
+        let f = meta.field(name).ok_or_else(|| Error::UnknownField {
+            model: meta.name.to_string(),
+            field: name.clone(),
+        })?;
+        // The key columns pin the row in the WHERE, not the SET.
+        if f.primary_key {
+            continue;
+        }
+        // `auto_now_add` is the creation stamp; rewriting it on every save would
+        // make it a modification stamp, which is what `auto_now` is for.
+        if f.auto_now_add {
+            continue;
+        }
+        sets.push(crate::expr::Assignment::new(
+            name.clone(),
+            crate::expr::F::Lit(v.clone()),
+        ));
+    }
+
+    let sql = scope::compile_update(&plan, &sets)?;
+    run_execute(&sql).await?;
+    Ok(())
+}
+
+/// Push one `WHERE` filter per primary-key column onto `plan`, reading each key
+/// value out of `values` (an instance's [`column_values`](Model::column_values)).
+///
+/// This is how an instance operation on a composite primary key locates its row:
+/// `Model::pk` carries only the first key column, so the whole key is recovered
+/// from the column values the instance already hands the write path. A key column
+/// with no value is a model/decoder bug, named as a config error rather than
+/// silently widening the statement to match more rows.
+fn push_key_filters(
+    plan: &mut compiler::Plan,
+    meta: &'static ModelMeta,
+    values: &[(String, Value)],
+) -> Result<()> {
+    for key in meta.primary_keys() {
+        let value = values
+            .iter()
+            .find(|(n, _)| n == key.name)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "model `{}` key column `{}` has no value, so the instance cannot be \
+                     located by its composite key",
+                    meta.name, key.name
+                ))
+            })?;
+        plan.filters
+            .push(crate::expr::Q::new(key.name.to_string(), value));
+    }
+    Ok(())
+}
+
 /// Save `obj` only if its version column still equals `expected`, otherwise
 /// [`Error::Conflict`] — the explicit form of the optimistic check that `save`
 /// does implicitly, for an `If-Match`/`ETag` request that carries the expected
@@ -251,12 +334,14 @@ pub async fn delete_instance<T: Model>(obj: &T) -> Result<u64> {
             meta.name
         ))
     })?;
+    // A composite key is located by all its columns, read from the instance's
+    // column values, since `Model::pk` carries only the first (ADR 0045).
     if meta.is_composite_pk() {
-        return Err(Error::Config(format!(
-            "model `{}` has a composite primary key; delete it with a filtered QuerySet \
-             until instance delete on composite keys lands (ADR 0042)",
-            meta.name
-        )));
+        let values = obj.column_values();
+        let mut plan = compiler::Plan::new(meta);
+        push_key_filters(&mut plan, meta, &values)?;
+        let sql = scope::compile_delete(&plan)?;
+        return run_execute(&sql).await;
     }
     if obj.pk().is_null() {
         return Err(Error::Config(

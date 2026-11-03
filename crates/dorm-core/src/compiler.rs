@@ -1224,12 +1224,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
     if assignments.is_empty() {
         return Err(Error::Config("update() was given nothing to set".into()));
     }
-    let pk = plan.model.primary_key().ok_or_else(|| {
-        Error::Config(format!(
-            "model `{}` declares no primary key, so it cannot be updated by query",
-            plan.model.name
-        ))
-    })?;
+    let keys = key_fields(plan.model, "updated")?;
 
     let mut binder = Binder::with_dialect(dialect);
     let mut sets = Vec::new();
@@ -1257,7 +1252,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
 
     let mut selector = plan.clone();
     selector.unordered = true;
-    selector.values = vec![pk.name.to_string()];
+    selector.values = keys.iter().map(|f| f.name.to_string()).collect();
     let inner = compile_select_on(&selector, dialect)?;
 
     let mut text = format!(
@@ -1269,7 +1264,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
     // clause's. Done by compiling the selector against a binder that already
     // holds the SET parameters.
     let shifted = shift_placeholders(&inner.text, binder.params.len(), dialect);
-    write!(text, " WHERE {} IN ({})", quote(pk.column)?, shifted)
+    write!(text, " WHERE {} IN ({})", key_in_lhs(&keys)?, shifted)
         .map_err(|e| Error::Config(e.to_string()))?;
     let mut params = binder.params;
     params.extend(inner.params);
@@ -1289,27 +1284,53 @@ pub fn compile_delete(plan: &Plan) -> Result<Sql> {
 
 /// Compile a `DELETE … WHERE pk IN (subquery)` for `dialect`.
 pub fn compile_delete_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
-    let pk = plan.model.primary_key().ok_or_else(|| {
-        Error::Config(format!(
-            "model `{}` declares no primary key, so it cannot be deleted by query",
-            plan.model.name
-        ))
-    })?;
+    let keys = key_fields(plan.model, "deleted")?;
     let mut selector = plan.clone();
     selector.unordered = true;
-    selector.values = vec![pk.name.to_string()];
+    selector.values = keys.iter().map(|f| f.name.to_string()).collect();
     let inner = compile_select_on(&selector, dialect)?;
 
     Ok(Sql {
         text: format!(
             "DELETE FROM {} WHERE {} IN ({})",
             quote(plan.model.table)?,
-            quote(pk.column)?,
+            key_in_lhs(&keys)?,
             inner.text
         ),
         params: inner.params,
         columns: vec![],
         kind: StatementKind::Write,
+    })
+}
+
+/// The primary-key fields an `UPDATE`/`DELETE` locates its rows by, errored if the
+/// model declares none. One field for a simple key, several for a composite one.
+fn key_fields(model: &'static ModelMeta, verb: &str) -> Result<Vec<&'static FieldMeta>> {
+    let keys: Vec<&'static FieldMeta> = model.primary_keys().collect();
+    if keys.is_empty() {
+        return Err(Error::Config(format!(
+            "model `{}` declares no primary key, so it cannot be {verb} by query",
+            model.name
+        )));
+    }
+    Ok(keys)
+}
+
+/// The left-hand side of the `key IN (subquery)` an `UPDATE`/`DELETE` compiles to:
+/// the bare column for a simple key, a row-value tuple `(a, b)` for a composite
+/// one (ADR 0045). The tuple matches the `SELECT a, b` the subquery projects, so
+/// the statement touches exactly the keyed rows — not every row that happens to
+/// share the first key column, which a single-column `IN` would wrongly sweep up.
+fn key_in_lhs(keys: &[&'static FieldMeta]) -> Result<String> {
+    let cols = keys
+        .iter()
+        .map(|f| quote(f.column))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(if keys.len() == 1 {
+        cols
+    } else {
+        format!("({cols})")
     })
 }
 

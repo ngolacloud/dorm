@@ -26,11 +26,14 @@ Vários `#[field(primary_key)]` declaram uma PK composta, emitida como um
 
 - **Prós:** chaves naturais compostas criam, inserem, consultam e impõem
   unicidade.
-- **Por fazer (declarado, honesto):** `save`/`delete` **por instância** numa
-  tabela de PK composta são **recusados** por agora — o `Model::pk()` devolve um só
-  valor, e uma operação por instância precisa de todas as colunas da chave; usa-se
-  um insert/update/delete por `QuerySet` entretanto. A emissão de `@@id([a,b])` a
-  partir do `dorm.schema` assenta neste mecanismo (parser à parte).
+- **Aterrou depois (ADR 0045):** `save`/`delete` **por instância** numa tabela de
+  PK composta **já funcionam** — a operação lê todas as colunas-chave do
+  `column_values()` (o `Model::pk()` só carrega a primeira) e o compilador localiza
+  a linha por tupla row-value `(a, b) IN (…)`. Continuam de fora: o create por
+  instância (fica pelo `QuerySet`) e a concorrência otimista por instância
+  (`#[field(version)]`) numa PK composta — ver ADR 0045.
+- A emissão de `@@id([a,b])` a partir do `dorm.schema` assenta neste mecanismo
+  (parser à parte).
 
 ## Proof
 
