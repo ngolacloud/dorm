@@ -38,6 +38,7 @@ pub mod ddl;
 pub mod history;
 pub mod lint;
 pub mod migrator;
+pub mod online;
 pub mod partition;
 
 /// What can go wrong building or applying a migration.
@@ -79,3 +80,7 @@ pub use autodetect::{
 };
 pub use history::{History, StoredMigration};
 pub use migrator::{diff, initial, migrate, revert, sync, Migration};
+pub use online::{
+    backfill, check_compat, is_non_transactional, migrate_online, BackfillReport, BackfillSpec,
+    Incompatibility,
+};

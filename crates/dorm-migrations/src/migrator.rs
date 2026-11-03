@@ -65,7 +65,7 @@ pub fn initial(models: &[&'static ModelMeta]) -> Result<Migration> {
 /// The migrations ledger. Separate from `delonix-api`'s `schema_migrations` on
 /// purpose: while the two migrators coexist (ADR 0072 transition) they must not
 /// write the same table. The `contract` step folds them.
-const LEDGER: &str = "orm_schema_migrations";
+pub(crate) const LEDGER: &str = "orm_schema_migrations";
 
 /// A fixed, arbitrary advisory-lock key. Every process applying migrations takes
 /// it, so two `migrate` calls serialise instead of racing on `CREATE TABLE`.

@@ -217,6 +217,104 @@ pub fn rename_column(table: &str, from: &str, to: &str) -> String {
     format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")
 }
 
+/// Reject anything that is not a plain SQL identifier before it is spliced into
+/// DDL. The expand/contract builders below take table/column/constraint names as
+/// *configuration*, never bound parameters, so each one passes through here — the
+/// same gate `partition.rs` keeps (ADR 0022: identifiers come from the schema,
+/// not from a caller; **I1**).
+fn ident(name: &str) -> Result<&str> {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err(Error::Orm(dorm_core::Error::Config(format!(
+            "`{name}` is not a usable SQL identifier"
+        ))))
+    }
+}
+
+/// The conventional name of the `NOT NULL` guard constraint for a column:
+/// `<table>_<column>_not_null`. The one place it is spelled, so the `ADD` of
+/// [`add_not_null_check_not_valid`] and the `VALIDATE`/`DROP` of
+/// [`validate_not_null`]/[`drop_constraint`] always agree on the name.
+pub fn not_null_constraint(table: &str, column: &str) -> String {
+    format!("{table}_{column}_not_null")
+}
+
+/// `ALTER TABLE <t> ADD CONSTRAINT <t>_<c>_not_null CHECK (<c> IS NOT NULL) NOT VALID`
+/// — the first step of enforcing `NOT NULL` online (ADR 0038 / expand/contract).
+///
+/// `NOT VALID` means PostgreSQL adds the constraint **without scanning the table**,
+/// taking only a brief lock: new and updated rows are checked immediately, but the
+/// existing rows are left for a later [`validate_not_null`]. That split is what
+/// lets a populated table gain a `NOT NULL` guard without a long `ACCESS EXCLUSIVE`
+/// lock or a table rewrite — unlike `ALTER COLUMN … SET NOT NULL`, which scans the
+/// whole table under an exclusive lock.
+pub fn add_not_null_check_not_valid(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    let name = not_null_constraint(table, column);
+    Ok(format!(
+        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({column} IS NOT NULL) NOT VALID"
+    ))
+}
+
+/// `ALTER TABLE <t> VALIDATE CONSTRAINT <t>_<c>_not_null` — the second step.
+///
+/// Validation scans the table to prove every existing row satisfies the check, but
+/// under a `SHARE UPDATE EXCLUSIVE` lock that lets reads and writes keep flowing —
+/// the lock a non-blocking operation can afford. Run it after the backfill has
+/// filled the column, so the scan finds no violations.
+pub fn validate_not_null(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    let name = not_null_constraint(table, column);
+    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+}
+
+/// `ALTER TABLE <t> ADD CONSTRAINT <name> CHECK (<expr>) NOT VALID` for an
+/// arbitrary author-written `check_expr` — the general form of
+/// [`add_not_null_check_not_valid`]. The check expression is the author's SQL (the
+/// same trust `ModelMeta::checks` and ADR 0005 raw SQL already carry); `table` and
+/// `name` are validated identifiers.
+pub fn add_check_not_valid(table: &str, name: &str, check_expr: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!(
+        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({check_expr}) NOT VALID"
+    ))
+}
+
+/// `ALTER TABLE <t> VALIDATE CONSTRAINT <name>` for an arbitrary constraint name.
+pub fn validate_constraint(table: &str, name: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+}
+
+/// `ALTER TABLE <t> DROP CONSTRAINT IF EXISTS <name>` — the `contract`-step inverse
+/// of an added constraint, or the cleanup once the column is a real `NOT NULL`.
+pub fn drop_constraint(table: &str, name: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!(
+        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}"
+    ))
+}
+
+/// `ALTER TABLE <t> ALTER COLUMN <c> SET NOT NULL` — the optional final step.
+///
+/// On PostgreSQL 12+ a *validated* `CHECK (<c> IS NOT NULL)` lets this `SET NOT NULL`
+/// be proven from the constraint and **skip the full-table scan**, so the column
+/// becomes a genuine `NOT NULL` cheaply; the guard check can then be dropped with
+/// [`drop_constraint`]. Run it only after [`validate_not_null`] has succeeded.
+pub fn set_not_null(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    Ok(format!(
+        "ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"
+    ))
+}
+
 /// `CREATE INDEX IF NOT EXISTS <table>_<column>_idx ON <table> (<column>)` — the
 /// one place the index name is spelled, shared by [`indexes`] and the
 /// autodetector so a dropped index names exactly what a created one made.
@@ -471,6 +569,51 @@ mod tests {
             indexes(&M),
             vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
         );
+    }
+
+    // ADR 0038: the expand/contract vocabulary — `CHECK … NOT VALID` then
+    // `VALIDATE` — turns a nullable column into a `NOT NULL` one without a long
+    // exclusive lock, and names the guard constraint the same way every time.
+    #[test]
+    fn a_not_null_check_is_added_not_valid_then_validated_under_a_stable_name() {
+        assert_eq!(
+            add_not_null_check_not_valid("accounts", "email").unwrap(),
+            "ALTER TABLE accounts ADD CONSTRAINT accounts_email_not_null \
+             CHECK (email IS NOT NULL) NOT VALID"
+        );
+        assert_eq!(
+            validate_not_null("accounts", "email").unwrap(),
+            "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_email_not_null"
+        );
+        assert_eq!(
+            set_not_null("accounts", "email").unwrap(),
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL"
+        );
+        assert_eq!(
+            drop_constraint("accounts", "accounts_email_not_null").unwrap(),
+            "ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_email_not_null"
+        );
+    }
+
+    #[test]
+    fn a_general_check_carries_the_author_expression_and_validates_by_name() {
+        assert_eq!(
+            add_check_not_valid("orders", "orders_total_positive", "total >= 0").unwrap(),
+            "ALTER TABLE orders ADD CONSTRAINT orders_total_positive CHECK (total >= 0) NOT VALID"
+        );
+        assert_eq!(
+            validate_constraint("orders", "orders_total_positive").unwrap(),
+            "ALTER TABLE orders VALIDATE CONSTRAINT orders_total_positive"
+        );
+    }
+
+    #[test]
+    fn an_injection_in_a_constraint_table_or_column_name_is_refused() {
+        assert!(add_not_null_check_not_valid("evil; DROP TABLE x", "c").is_err());
+        assert!(add_not_null_check_not_valid("t", "c; DROP").is_err());
+        assert!(add_check_not_valid("t", "name; DROP", "c IS NOT NULL").is_err());
+        assert!(validate_constraint("t", "bad name").is_err());
+        assert!(set_not_null("", "c").is_err());
     }
 
     // B-22: the concurrent variant builds without blocking writes on PostgreSQL
