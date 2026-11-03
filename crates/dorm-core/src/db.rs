@@ -514,9 +514,33 @@ impl Database {
     /// primary/replica pair; it needs no process environment set, which is what
     /// frees the module from requiring the global pool.
     pub fn connect(primary_dsn: &str, replica_dsn: Option<&str>, read_only: bool) -> Result<Self> {
-        let primary = build_pool(primary_dsn)?;
+        Self::connect_in(primary_dsn, replica_dsn, read_only, None)
+    }
+
+    /// Connect a database **bound to a PostgreSQL `schema`** (ADR 0028): every
+    /// connection this handle makes sets `search_path = <schema>,public`, so the
+    /// same models resolve to this schema with no change to the compiler. A
+    /// process holds one handle per module — `compute`, `billing` — and a module
+    /// cannot reach another's schema through the ORM. Combine with
+    /// [`with_session`] to pick the handle for a unit of work.
+    pub fn connect_schema(
+        primary_dsn: &str,
+        replica_dsn: Option<&str>,
+        read_only: bool,
+        schema: &str,
+    ) -> Result<Self> {
+        Self::connect_in(primary_dsn, replica_dsn, read_only, Some(schema))
+    }
+
+    fn connect_in(
+        primary_dsn: &str,
+        replica_dsn: Option<&str>,
+        read_only: bool,
+        schema: Option<&str>,
+    ) -> Result<Self> {
+        let primary = build_pool(primary_dsn, schema)?;
         let replica = match replica_dsn {
-            Some(r) if !r.trim().is_empty() => Some(build_pool(r)?),
+            Some(r) if !r.trim().is_empty() => Some(build_pool(r, schema)?),
             _ => None,
         };
         Ok(Database {
@@ -553,7 +577,7 @@ impl Database {
 
 /// Build one connection pool for a DSN. This is the former body of `pool()`,
 /// lifted so a [`Database`] can build a primary and a replica the same way.
-fn build_pool(raw: &str) -> Result<Pool> {
+fn build_pool(raw: &str, schema: Option<&str>) -> Result<Pool> {
     // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
     // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
     // the parse; verification is done by the connector, not the driver.
@@ -562,11 +586,12 @@ fn build_pool(raw: &str) -> Result<Pool> {
         .parse()
         .map_err(|e| Error::Config(format!("the DSN is not usable: {e}")))?;
 
-    // Server-side `statement_timeout` (ADR 0004): injected as a libpq option so
-    // PostgreSQL itself cancels an over-running statement. `0` leaves it off.
-    if let Some(opts) =
-        merge_statement_timeout(config.get_options(), env_u64(STATEMENT_TIMEOUT_MS_ENV, 0))
-    {
+    // Server-side `statement_timeout` (ADR 0004) and, for a schema-bound handle,
+    // `search_path` (ADR 0028) are injected as libpq options — one `-c key=value`
+    // clause each. The `search_path` makes the same models resolve to this
+    // handle's schema with no change to the compiler or the metadata.
+    let opts = merge_statement_timeout(config.get_options(), env_u64(STATEMENT_TIMEOUT_MS_ENV, 0));
+    if let Some(opts) = merge_search_path(opts, schema)? {
         config.options(opts);
     }
 
@@ -704,6 +729,31 @@ fn extract_tls_params(dsn: &str) -> (String, Option<String>, Option<String>) {
 
 /// Fold a server-side `statement_timeout` into libpq `options`. `ms == 0` is
 /// "no timeout" and leaves the options untouched. Pure, so it is unit-tested.
+/// Append a `-c search_path=<schema>,public` clause for a schema-bound handle
+/// (ADR 0028). The schema is validated as a plain identifier before it is spliced
+/// into the options string — it is a configuration value, not a query parameter,
+/// and libpq options take no bound parameters, so it must not carry anything that
+/// could break out of the clause.
+fn merge_search_path(options: Option<String>, schema: Option<&str>) -> Result<Option<String>> {
+    let Some(schema) = schema.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(options);
+    };
+    if !schema
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(Error::Config(format!(
+            "`{schema}` is not a usable schema name (letters, digits and underscore only)"
+        )));
+    }
+    // The schema first, then `public` so shared extensions/types still resolve.
+    let clause = format!("-c search_path={schema},public");
+    Ok(Some(match options {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing} {clause}"),
+        _ => clause,
+    }))
+}
+
 fn merge_statement_timeout(options: Option<&str>, ms: u64) -> Option<String> {
     if ms == 0 {
         return options.map(str::to_string);
@@ -2542,6 +2592,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("inside a transaction"), "{e}");
+    }
+
+    #[test]
+    fn search_path_is_appended_and_the_schema_name_is_validated() {
+        // Appended alongside any existing options, schema first then public.
+        let merged = merge_search_path(Some("-c statement_timeout=1000".into()), Some("compute"))
+            .unwrap()
+            .unwrap();
+        assert!(merged.contains("-c statement_timeout=1000"));
+        assert!(merged.contains("-c search_path=compute,public"));
+        // No schema leaves options untouched.
+        assert_eq!(merge_search_path(None, None).unwrap(), None);
+        // A name that could break out of the clause is refused.
+        assert!(merge_search_path(None, Some("evil; DROP SCHEMA x")).is_err());
     }
 
     #[test]
