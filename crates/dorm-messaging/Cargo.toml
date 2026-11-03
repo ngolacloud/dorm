@@ -1,5 +1,9 @@
 [package]
 name = "dorm-messaging"
+# DEPRECATED: moved to `seiva-messaging` (Delonix Seiva repo) per ADR 0054 — broker
+# messaging is cross-service communication, not the ORM's job. Kept, deprecated,
+# until a future release removes it; no longer published.
+publish = false
 # Independent line: messaging is an optional product on top of the core and the
 # outbox (ADR 0031). Pre-1.0.
 version = "0.1.0"

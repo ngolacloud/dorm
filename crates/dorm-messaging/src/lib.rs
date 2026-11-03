@@ -1,5 +1,14 @@
 //! Messaging for DORM: a CloudEvents envelope and a transactional bus (ADR 0031).
 //!
+//! # Deprecated — moved to `seiva-messaging`
+//!
+//! Broker messaging is cross-service communication, not the ORM's job (ADR 0054,
+//! the ORM boundary). This crate has **moved to `seiva-messaging`** in the Delonix
+//! Seiva repository, with its history preserved, and will be **removed from DORM
+//! in a future release**. The in-database outbox it rode (`dorm-outbox`) stays
+//! here; the relay loop and broker backends live in Seiva now. Downstream code
+//! should depend on `seiva-messaging` (and the Seiva outbox relay) instead.
+//!
 //! The envelope is [CloudEvents 1.0](https://cloudevents.io): every message
 //! carries `id`, `source`, `type`, `specversion`, an optional `time` and a
 //! W3C `traceparent`, plus a JSON `data` body. The default transport is the
@@ -15,12 +24,21 @@
 //! **Kafka** (`kafka`, ADR 0053) are implemented, each behind its feature and
 //! each proven against a live broker through the one bridge.
 
+// This crate is deprecated and its internals still use its own (now-deprecated)
+// types; allow that here so the move's deprecation notices do not fail DORM's
+// `-D warnings` gate while the crate waits to be removed.
+#![allow(deprecated)]
+
 use std::future::Future;
 
 use dorm_core::db;
 use dorm_core::error::{Error, Result};
 
 /// A CloudEvents 1.0 envelope.
+#[deprecated(
+    since = "0.7.0",
+    note = "moved to `seiva-messaging` (Delonix Seiva repo); see DORM ADR 0054. dorm-messaging will be removed in a future DORM release."
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloudEvent {
     /// Unique per `(source, id)` — the idempotency key the inbox dedupes on.
@@ -106,6 +124,10 @@ impl CloudEvent {
 
 /// Publish a [`CloudEvent`] to a topic. The outbox-backed implementation requires
 /// a transaction; a broker implementation does not.
+#[deprecated(
+    since = "0.7.0",
+    note = "moved to `seiva-messaging` (Delonix Seiva repo); see DORM ADR 0054."
+)]
 pub trait Publisher {
     fn publish(&self, topic: &str, event: &CloudEvent) -> impl Future<Output = Result<()>>;
 }
@@ -113,6 +135,10 @@ pub trait Publisher {
 /// The default bus: events ride the generic outbox (ADR 0026), so publishing is
 /// transactional with the business write and consumption is at-least-once with
 /// exactly-once effect.
+#[deprecated(
+    since = "0.7.0",
+    note = "the outbox→broker relay moved to `seiva-outbox-relay` (Delonix Seiva repo); see DORM ADR 0054. The in-database outbox stays in `dorm-outbox`."
+)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboxBus;
 

@@ -1,5 +1,11 @@
 # ADR 0031 — Mensageria (`dorm-messaging`)
 
+> **Moved (ADR 0054).** The implementation moved out of DORM to `seiva-messaging`
+> / `seiva-outbox-relay` (Delonix Seiva repo), with history preserved — broker
+> messaging is cross-service communication, not the ORM's. `dorm-outbox` (the
+> in-database outbox) stays. This ADR is kept for the record.
+
+
 Status: Accepted — núcleo (envelope + bus outbox) implementado (Fase 5/L7) · 2026-11-03
 
 ## Context
