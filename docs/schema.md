@@ -54,6 +54,9 @@ becomes a `ForeignKey<Tenant>` whose `related_name` is `posts` (read off
 | `Decimal` | `Decimal` | |
 | `Json` | `serde_json::Value` | |
 | `Uuid` | `uuid::Uuid` | |
+| `Inet` | `std::net::IpAddr` | `INET`, PostgreSQL only (ADR 0040) |
+| `Cidr` | `cidr::IpCidr` | `CIDR`, PostgreSQL only; needs the `cidr` crate (ADR 0048) |
+| `MacAddr` | `eui48::MacAddress` | `MACADDR`, PostgreSQL only; needs the `eui48` crate (ADR 0048) |
 | `<Model>` | `ForeignKey<Model>` | a to-one relation; needs `@relation` |
 | `<Model>[]` | *(no column)* | a to-many back-relation; names the `related_name` |
 | `<Enum>` | `String` | a field typed as a top-level `enum`; a native database enum ([see below](#enums)) |

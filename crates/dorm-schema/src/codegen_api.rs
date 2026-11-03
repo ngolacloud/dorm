@@ -375,6 +375,10 @@ fn openapi_scalar(ty: Scalar, nullable: bool) -> J {
         Scalar::Decimal => ("string", None),
         Scalar::Json => ("object", None),
         Scalar::Uuid => ("string", Some("uuid")),
+        // The network scalars are strings in JSON, with a format hint (ADR 0040/0048).
+        Scalar::Inet => ("string", Some("ipv4")),
+        Scalar::Cidr => ("string", Some("cidr")),
+        Scalar::MacAddr => ("string", Some("macaddr")),
     };
     let mut obj = Map::new();
     obj.insert("type".into(), J::String(t.into()));

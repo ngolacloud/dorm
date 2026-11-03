@@ -471,6 +471,25 @@ mod tests {
         assert!(!rust.contains("index_together"), "{rust}");
     }
 
+    /// The network scalars reach the generated struct as the fully-qualified Rust
+    /// types the `Model` derive infers `FieldType::Inet`/`Cidr`/`MacAddr` from —
+    /// no new `use` in the generated file (ADR 0040/0048).
+    #[test]
+    fn network_scalars_generate_fully_qualified_rust_types() {
+        let src = r#"
+            model Host {
+              id   Int     @id @default(autoincrement())
+              addr Inet
+              net  Cidr
+              mac  MacAddr
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        assert!(rust.contains("pub addr: std::net::IpAddr,"), "{rust}");
+        assert!(rust.contains("pub net: cidr::IpCidr,"), "{rust}");
+        assert!(rust.contains("pub mac: eui48::MacAddress,"), "{rust}");
+    }
+
     /// `@@index([a, b])` round-trips to `index_together`, one per group (ADR 0044).
     #[test]
     fn composite_indexes_reach_the_derive() {

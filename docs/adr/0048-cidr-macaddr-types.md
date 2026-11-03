@@ -54,6 +54,15 @@ compilador.
   dia o PostgreSQL inferir o parâmetro como `cidr` (não acontece hoje), o caminho
   `*ty == INET` simplesmente não dispara e usa-se o `cidr` nativo.
 
+## Follow-up landed
+
+O `dorm.schema` passou a declarar estes tipos (e o `Inet` do [[0040]]):
+`addr Inet`, `net Cidr`, `mac MacAddr` geram os tipos Rust totalmente-qualificados
+(`std::net::IpAddr`/`cidr::IpCidr`/`eui48::MacAddress`) de que o derive infere o
+`FieldType` — sem `use` novo no ficheiro gerado (um projecto que os use depende das
+crates `cidr`/`eui48`, como um de `Decimal` depende de `rust_decimal`). Prova:
+`dorm-schema` `codegen::tests::network_scalars_generate_fully_qualified_rust_types`.
+
 ## Proof
 
 - **Unit (offline, `cidr_macaddr_live.rs::the_sql_types_are_cidr_and_macaddr_and_the_ddl_uses_them`):**

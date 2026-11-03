@@ -213,10 +213,22 @@ pub enum Scalar {
     Decimal,
     Json,
     Uuid,
+    /// A host address, `INET` (ADR 0040). PostgreSQL only.
+    Inet,
+    /// A network block, `CIDR` (ADR 0048). PostgreSQL only.
+    Cidr,
+    /// A MAC address, `MACADDR` (ADR 0048). PostgreSQL only.
+    MacAddr,
 }
 
 impl Scalar {
     /// The Rust type the column decodes as.
+    ///
+    /// Fully-qualified for the network types so the generated file needs no new
+    /// `use`: the `Model` derive infers the `FieldType` from the path's last
+    /// segment (`IpAddr`→INET, `IpCidr`→CIDR, `MacAddress`→MACADDR), so these
+    /// resolve with no import even though a project that uses them must depend on
+    /// the `cidr`/`eui48` crates (as a `Decimal` project depends on `rust_decimal`).
     pub fn rust_type(self) -> &'static str {
         match self {
             Scalar::Int => "i32",
@@ -227,6 +239,9 @@ impl Scalar {
             Scalar::Decimal => "Decimal",
             Scalar::Json => "serde_json::Value",
             Scalar::Uuid => "uuid::Uuid",
+            Scalar::Inet => "std::net::IpAddr",
+            Scalar::Cidr => "cidr::IpCidr",
+            Scalar::MacAddr => "eui48::MacAddress",
         }
     }
 
@@ -240,6 +255,9 @@ impl Scalar {
             "Decimal" => Scalar::Decimal,
             "Json" => Scalar::Json,
             "Uuid" => Scalar::Uuid,
+            "Inet" => Scalar::Inet,
+            "Cidr" => Scalar::Cidr,
+            "MacAddr" => Scalar::MacAddr,
             _ => return None,
         })
     }
