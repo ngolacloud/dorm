@@ -126,6 +126,24 @@ const SQL_LOG_MAX: usize = 300;
 /// it used to be locked to.
 static DEFAULT_DB: OnceLock<Database> = OnceLock::new();
 
+/// Strict-session mode (DORM-B1). When on, a statement with no session in scope
+/// is a typed error ([`Error::SessionMissing`]) instead of silently falling back
+/// to `DEFAULT_DB`. Off by default, so the embedded single-database and CLI
+/// paths are unchanged; a framework that owns a session per request turns it on
+/// once at startup so a stray statement is caught rather than run on the global.
+static STRICT_SESSIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns strict-session mode on or off (DORM-B1). A framework calls this once at
+/// startup; the default is off.
+pub fn set_strict_sessions(on: bool) {
+    STRICT_SESSIONS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether strict-session mode is on.
+pub fn strict_sessions() -> bool {
+    STRICT_SESSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 tokio::task_local! {
     /// The [`Database`] in scope for this task, if any. Set by [`with_session`]
     /// and consulted by every statement before it falls back to `DEFAULT_DB`.
@@ -965,6 +983,19 @@ fn build_pool(raw: &str, schema: Option<&str>) -> Result<Pool> {
         .map_err(|e| Error::Pool(e.to_string()))
 }
 
+/// The decision for a statement that finds no session in scope: in strict mode
+/// it is a typed error; otherwise it proceeds to the process default. Pure, so
+/// the guarantee is tested without the process-global flag or a database.
+fn no_session_decision(strict: bool) -> Result<()> {
+    if strict {
+        return Err(Error::SessionMissing(
+            "no database session in scope and strict sessions are enabled; run \
+             this statement inside dorm_core::db::with_session(..)",
+        ));
+    }
+    Ok(())
+}
+
 /// The process-default database, built from the environment on first use.
 fn default_db() -> Result<&'static Database> {
     if let Some(d) = DEFAULT_DB.get() {
@@ -1395,6 +1426,10 @@ async fn acquire_once(route: Route) -> Result<Object> {
     if let Ok(db) = SESSION.try_with(|d| d.clone()) {
         return db.acquire(route).await;
     }
+    // No session in scope: in strict mode this is a typed error, never a silent
+    // fall-back to the process default (DORM-B1). The error is returned before
+    // any connection is attempted.
+    no_session_decision(strict_sessions())?;
     default_db()?.acquire(route).await
 }
 
@@ -1601,8 +1636,15 @@ fn active_dsn() -> Result<String> {
     dsn()
 }
 
-/// The configured backend, or an error if no DSN is set.
+/// The configured backend, or an error if no DSN is set. This is the
+/// pre-execution resolver for the raw-SQL path (`run`/`run_ddl`), so it enforces
+/// strict sessions here too (DORM-B1): with no session in scope and strict mode
+/// on, it is a typed error before any DSN is read. `dialect()` stays lenient for
+/// offline compilation — it uses `active_dsn()` directly, not this.
 fn backend() -> Result<Backend> {
+    if SESSION.try_with(|_| ()).is_err() {
+        no_session_decision(strict_sessions())?;
+    }
     Ok(backend_of(&active_dsn()?))
 }
 
@@ -3046,6 +3088,26 @@ mod tests {
         let err = sql_execute("delete from whatever", &[]).await.unwrap_err();
         assert!(matches!(err, Error::ReadOnly("sql_execute")), "{err}");
         set_read_only(false);
+    }
+
+    #[test]
+    fn strict_mode_turns_a_missing_session_into_a_typed_error() {
+        // Pure decision, independent of the global flag and any database.
+        assert!(matches!(
+            no_session_decision(true),
+            Err(Error::SessionMissing(_))
+        ));
+        assert!(no_session_decision(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_statement_with_no_session_is_refused_in_strict_mode_before_connecting() {
+        // Strict mode on, no session in scope: the statement errors with
+        // SessionMissing before any connection is attempted — no DSN needed.
+        set_strict_sessions(true);
+        let err = sql_execute("select 1", &[]).await.unwrap_err();
+        assert!(matches!(err, Error::SessionMissing(_)), "{err:?}");
+        set_strict_sessions(false);
     }
 
     #[test]
