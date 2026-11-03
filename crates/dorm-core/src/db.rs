@@ -126,6 +126,24 @@ const SQL_LOG_MAX: usize = 300;
 /// it used to be locked to.
 static DEFAULT_DB: OnceLock<Database> = OnceLock::new();
 
+/// Strict-session mode (DORM-B1). When on, a statement with no session in scope
+/// is a typed error ([`Error::SessionMissing`]) instead of silently falling back
+/// to `DEFAULT_DB`. Off by default, so the embedded single-database and CLI
+/// paths are unchanged; a framework that owns a session per request turns it on
+/// once at startup so a stray statement is caught rather than run on the global.
+static STRICT_SESSIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns strict-session mode on or off (DORM-B1). A framework calls this once at
+/// startup; the default is off.
+pub fn set_strict_sessions(on: bool) {
+    STRICT_SESSIONS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether strict-session mode is on.
+pub fn strict_sessions() -> bool {
+    STRICT_SESSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 tokio::task_local! {
     /// The [`Database`] in scope for this task, if any. Set by [`with_session`]
     /// and consulted by every statement before it falls back to `DEFAULT_DB`.
@@ -716,6 +734,62 @@ struct Replica {
     ejected_until: AtomicU64,
 }
 
+/// Connection-defining options a caller sets **by API** instead of the
+/// environment (DORM-B1): pool sizing, the acquire timeout, the server-side
+/// `statement_timeout`, and a TLS override. [`ConnectOptions::default`] is the
+/// built-in defaults (TLS then comes from the DSN, ADR 0004);
+/// [`ConnectOptions::from_env`] reads the `DELONIX_ORM_*` variables and is the
+/// single place the library consults the pool/TLS environment — used by
+/// [`Database::from_env`] and, for backward compatibility, by the DSN-only
+/// [`connect`](Database::connect) family. A framework builds these
+/// programmatically and calls [`connect_with`](Database::connect_with), reading
+/// no environment at all.
+#[derive(Debug, Clone)]
+pub struct ConnectOptions {
+    /// Maximum pooled connections (default 8).
+    pub pool_max: usize,
+    /// How long to wait for a free connection before erroring, in ms (default 5000).
+    pub acquire_timeout_ms: u64,
+    /// Server-side `statement_timeout` in ms; `0` disables it (default 0).
+    pub statement_timeout_ms: u64,
+    /// TLS mode override (`disable`/`require`/`verify-ca`/`verify-full`). `None`
+    /// takes the mode from the DSN (ADR 0004).
+    pub ssl_mode: Option<String>,
+    /// Path to the TLS root certificate. `None` takes it from the DSN.
+    pub ssl_root_cert: Option<String>,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            pool_max: POOL_MAX_DEFAULT,
+            acquire_timeout_ms: POOL_ACQUIRE_TIMEOUT_DEFAULT_MS,
+            statement_timeout_ms: 0,
+            ssl_mode: None,
+            ssl_root_cert: None,
+        }
+    }
+}
+
+impl ConnectOptions {
+    /// Read the pool and TLS options from the `DELONIX_ORM_*` environment. The
+    /// one function in the library that consults the pool/TLS environment.
+    pub fn from_env() -> Self {
+        Self {
+            pool_max: env_usize(POOL_MAX_ENV, POOL_MAX_DEFAULT),
+            acquire_timeout_ms: env_u64(
+                POOL_ACQUIRE_TIMEOUT_MS_ENV,
+                POOL_ACQUIRE_TIMEOUT_DEFAULT_MS,
+            ),
+            statement_timeout_ms: env_u64(STATEMENT_TIMEOUT_MS_ENV, 0),
+            ssl_mode: std::env::var(SSLMODE_ENV).ok().filter(|s| !s.is_empty()),
+            ssl_root_cert: std::env::var(SSLROOTCERT_ENV)
+                .ok()
+                .filter(|s| !s.is_empty()),
+        }
+    }
+}
+
 impl Database {
     /// Connect a database from explicit DSNs: a required primary and an optional
     /// read replica. `read_only` becomes the default for sessions that run
@@ -725,7 +799,30 @@ impl Database {
     /// primary/replica pair; it needs no process environment set, which is what
     /// frees the module from requiring the global pool.
     pub fn connect(primary_dsn: &str, replica_dsn: Option<&str>, read_only: bool) -> Result<Self> {
-        Self::connect_in(primary_dsn, replica_dsn, read_only, None)
+        Self::connect_in(
+            primary_dsn,
+            replica_dsn,
+            read_only,
+            None,
+            &ConnectOptions::from_env(),
+        )
+    }
+
+    /// Connect with explicit [`ConnectOptions`], reading **no** environment — the
+    /// API path a framework uses to set pool sizing and TLS per module without
+    /// the process environment overriding it (DORM-B1). An empty `replica_dsns`
+    /// is simply no replica; `schema` binds every connection's `search_path`
+    /// (ADR 0028) as in [`connect_schema`](Database::connect_schema).
+    pub fn connect_with(
+        primary_dsn: &str,
+        replica_dsns: &[&str],
+        read_only: bool,
+        schema: Option<&str>,
+        options: &ConnectOptions,
+    ) -> Result<Self> {
+        let joined = replica_dsns.join(",");
+        let replica = (!joined.is_empty()).then_some(joined.as_str());
+        Self::connect_in(primary_dsn, replica, read_only, schema, options)
     }
 
     /// Connect with several read replicas, balanced and ejected as in
@@ -737,7 +834,13 @@ impl Database {
         read_only: bool,
     ) -> Result<Self> {
         let joined = replica_dsns.join(",");
-        Self::connect_in(primary_dsn, Some(joined.as_str()), read_only, None)
+        Self::connect_in(
+            primary_dsn,
+            Some(joined.as_str()),
+            read_only,
+            None,
+            &ConnectOptions::from_env(),
+        )
     }
 
     /// Connect a database **bound to a PostgreSQL `schema`** (ADR 0028): every
@@ -752,7 +855,13 @@ impl Database {
         read_only: bool,
         schema: &str,
     ) -> Result<Self> {
-        Self::connect_in(primary_dsn, replica_dsn, read_only, Some(schema))
+        Self::connect_in(
+            primary_dsn,
+            replica_dsn,
+            read_only,
+            Some(schema),
+            &ConnectOptions::from_env(),
+        )
     }
 
     fn connect_in(
@@ -760,15 +869,16 @@ impl Database {
         replica_dsn: Option<&str>,
         read_only: bool,
         schema: Option<&str>,
+        opts: &ConnectOptions,
     ) -> Result<Self> {
-        let primary = build_pool(primary_dsn, schema)?;
+        let primary = build_pool(primary_dsn, schema, opts)?;
         // One DSN string may carry several replicas, comma-separated (ADR 0050).
         let mut replicas = Vec::new();
         for r in replica_dsn.into_iter().flat_map(|s| s.split(',')) {
             let r = r.trim();
             if !r.is_empty() {
                 replicas.push(Replica {
-                    pool: build_pool(r, schema)?,
+                    pool: build_pool(r, schema, opts)?,
                     ejected_until: AtomicU64::new(0),
                 });
             }
@@ -788,9 +898,12 @@ impl Database {
         self.replicas.len()
     }
 
-    /// Build the process-default database from the environment: [`DSN_ENV`] for
-    /// the primary and [`REPLICA_DSN_ENV`] for the optional replica.
-    fn from_env() -> Result<Self> {
+    /// Build a database from the environment: [`DSN_ENV`] for the primary,
+    /// [`REPLICA_DSN_ENV`] for the optional replica, and the pool/TLS variables
+    /// via [`ConnectOptions::from_env`]. This is the explicit, named convenience
+    /// (DORM-B1): the CLI uses it; a framework uses [`connect_with`](Database::connect_with)
+    /// instead so it reads no environment.
+    pub fn from_env() -> Result<Self> {
         let primary = dsn()?;
         let replica = std::env::var(REPLICA_DSN_ENV)
             .ok()
@@ -926,7 +1039,7 @@ fn now_unix() -> u64 {
 
 /// Build one connection pool for a DSN. This is the former body of `pool()`,
 /// lifted so a [`Database`] can build a primary and a replica the same way.
-fn build_pool(raw: &str, schema: Option<&str>) -> Result<Pool> {
+fn build_pool(raw: &str, schema: Option<&str>, opts: &ConnectOptions) -> Result<Pool> {
     // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
     // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
     // the parse; verification is done by the connector, not the driver.
@@ -939,14 +1052,17 @@ fn build_pool(raw: &str, schema: Option<&str>) -> Result<Pool> {
     // `search_path` (ADR 0028) are injected as libpq options — one `-c key=value`
     // clause each. The `search_path` makes the same models resolve to this
     // handle's schema with no change to the compiler or the metadata.
-    let opts = merge_statement_timeout(config.get_options(), env_u64(STATEMENT_TIMEOUT_MS_ENV, 0));
-    if let Some(opts) = merge_search_path(opts, schema)? {
-        config.options(opts);
+    let libpq_opts = merge_statement_timeout(config.get_options(), opts.statement_timeout_ms);
+    if let Some(libpq_opts) = merge_search_path(libpq_opts, schema)? {
+        config.options(libpq_opts);
     }
 
-    // TLS selection: env overrides the DSN, which overrides "disable".
-    let mode = std::env::var(SSLMODE_ENV).ok().or(dsn_mode);
-    let root = std::env::var(SSLROOTCERT_ENV).ok().or(dsn_root);
+    // TLS selection: the explicit option overrides the DSN, which overrides
+    // "disable". `ConnectOptions::from_env` sources the option from the
+    // environment for the CLI/default path; a programmatic caller sets it or
+    // leaves it to the DSN (DORM-B1 — the library itself reads no env here).
+    let mode = opts.ssl_mode.clone().or(dsn_mode);
+    let root = opts.ssl_root_cert.clone().or(dsn_root);
     let requirement = ssl_requirement(mode.as_deref())?;
 
     let manager = build_manager(config, requirement, root.as_deref())?;
@@ -955,14 +1071,24 @@ fn build_pool(raw: &str, schema: Option<&str>) -> Result<Pool> {
         // to arm them against, and without this it refuses to build with
         // "Timeouts require a runtime" rather than silently ignoring them.
         .runtime(Runtime::Tokio1)
-        .max_size(env_usize(POOL_MAX_ENV, POOL_MAX_DEFAULT))
-        .wait_timeout(Some(Duration::from_millis(env_usize(
-            POOL_ACQUIRE_TIMEOUT_MS_ENV,
-            POOL_ACQUIRE_TIMEOUT_DEFAULT_MS as usize,
-        ) as u64)))
+        .max_size(opts.pool_max)
+        .wait_timeout(Some(Duration::from_millis(opts.acquire_timeout_ms)))
         .create_timeout(Some(Duration::from_millis(POOL_ACQUIRE_TIMEOUT_DEFAULT_MS)))
         .build()
         .map_err(|e| Error::Pool(e.to_string()))
+}
+
+/// The decision for a statement that finds no session in scope: in strict mode
+/// it is a typed error; otherwise it proceeds to the process default. Pure, so
+/// the guarantee is tested without the process-global flag or a database.
+fn no_session_decision(strict: bool) -> Result<()> {
+    if strict {
+        return Err(Error::SessionMissing(
+            "no database session in scope and strict sessions are enabled; run \
+             this statement inside dorm_core::db::with_session(..)",
+        ));
+    }
+    Ok(())
 }
 
 /// The process-default database, built from the environment on first use.
@@ -1395,6 +1521,10 @@ async fn acquire_once(route: Route) -> Result<Object> {
     if let Ok(db) = SESSION.try_with(|d| d.clone()) {
         return db.acquire(route).await;
     }
+    // No session in scope: in strict mode this is a typed error, never a silent
+    // fall-back to the process default (DORM-B1). The error is returned before
+    // any connection is attempted.
+    no_session_decision(strict_sessions())?;
     default_db()?.acquire(route).await
 }
 
@@ -1601,8 +1731,15 @@ fn active_dsn() -> Result<String> {
     dsn()
 }
 
-/// The configured backend, or an error if no DSN is set.
+/// The configured backend, or an error if no DSN is set. This is the
+/// pre-execution resolver for the raw-SQL path (`run`/`run_ddl`), so it enforces
+/// strict sessions here too (DORM-B1): with no session in scope and strict mode
+/// on, it is a typed error before any DSN is read. `dialect()` stays lenient for
+/// offline compilation — it uses `active_dsn()` directly, not this.
 fn backend() -> Result<Backend> {
+    if SESSION.try_with(|_| ()).is_err() {
+        no_session_decision(strict_sessions())?;
+    }
     Ok(backend_of(&active_dsn()?))
 }
 
@@ -3046,6 +3183,41 @@ mod tests {
         let err = sql_execute("delete from whatever", &[]).await.unwrap_err();
         assert!(matches!(err, Error::ReadOnly("sql_execute")), "{err}");
         set_read_only(false);
+    }
+
+    #[test]
+    fn connect_with_sets_the_pool_size_by_api_not_the_environment() {
+        // deadpool is lazy, so building the handle opens no connection: a bogus
+        // but parseable DSN is enough to prove the pool is sized from the API
+        // option, not DELONIX_ORM_POOL_MAX.
+        let opts = ConnectOptions {
+            pool_max: 3,
+            ssl_mode: Some("disable".into()),
+            ..ConnectOptions::default()
+        };
+        let db = Database::connect_with("host=localhost user=u dbname=x", &[], false, None, &opts)
+            .expect("the handle builds without connecting");
+        assert_eq!(db.primary.status().max_size, 3);
+    }
+
+    #[test]
+    fn strict_mode_turns_a_missing_session_into_a_typed_error() {
+        // Pure decision, independent of the global flag and any database.
+        assert!(matches!(
+            no_session_decision(true),
+            Err(Error::SessionMissing(_))
+        ));
+        assert!(no_session_decision(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_statement_with_no_session_is_refused_in_strict_mode_before_connecting() {
+        // Strict mode on, no session in scope: the statement errors with
+        // SessionMissing before any connection is attempted — no DSN needed.
+        set_strict_sessions(true);
+        let err = sql_execute("select 1", &[]).await.unwrap_err();
+        assert!(matches!(err, Error::SessionMissing(_)), "{err:?}");
+        set_strict_sessions(false);
     }
 
     #[test]
