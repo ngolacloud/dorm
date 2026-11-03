@@ -1,6 +1,13 @@
-# ADR 0010 — Query IR (`dorm.v1`), serializável e versionado
+# ADR 0055 — Query IR (`dorm.v1`), serializável e versionado
 
-Status: Proposed · 2026-10-31
+Status: **Rejected** · superseded by [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0010 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0010](0010-database-handle-and-read-replica-routing.md).
+> **Rejected:** a serialized, versioned query IR exists only so a non-Rust client
+> can build queries over the wire — polyglot/data-plane access. That is outside
+> the ORM boundary (ADR 0054). A library consumer builds queries in Rust against
+> the typed `QuerySet`; the `Plan` stays in-process.
 
 ## Context
 
@@ -34,7 +41,7 @@ A diferença essencial e deliberada face ao `Plan` interno:
   com o nome lógico do modelo.** O servidor resolve-a com `registry::model(name)`
   (`crates/dorm-core/src/registry.rs:19`) e recusa um nome que o catálogo não
   declare. O cliente nunca envia tabelas nem colunas físicas — só nomes lógicos
-  que o servidor valida (o catálogo em runtime é o ADR 0011).
+  que o servidor valida (o catálogo em runtime é o ADR 0056).
 - **`Sql` (`compiler.rs:39`) nunca é uma mensagem de entrada.** É saída pura do
   compilador, produzida só no servidor; expô-lo como entrada seria abrir SQL
   livre e violar o invariante nuclear. O IR não tem mensagem que transporte
@@ -64,7 +71,7 @@ servidor; uma `string` que não resolva é um erro de validação do IR, não SQ
 ## Consequences
 
 - **Prós:** existe pela primeira vez um contrato de consulta que atravessa um
-  processo, versionado e verificável. É o alicerce do Data Plane gRPC (ADR 0012)
+  processo, versionado e verificável. É o alicerce do Data Plane gRPC (ADR 0057)
   e dos SDKs poliglotas (gerados do mesmo `.proto`). O `.proto` torna-se a fonte
   única: `buf lint`/`buf breaking` podem ser portões de CI, à imagem do que os
   *snapshots* SQL já fazem para o núcleo.
@@ -78,4 +85,4 @@ servidor; uma `string` que não resolva é um erro de validação do IR, não SQ
   inexistente → erro, não SQL); confirmação por teste de que não existe caminho
   de entrada para `Sql.text`.
 - **Dependências:** base dos ADRs 0012 (Data Plane), 0013 (objectos remotos) e
-  do catálogo do ADR 0011 (o IR nomeia o que o descritor declara).
+  do catálogo do ADR 0056 (o IR nomeia o que o descritor declara).
