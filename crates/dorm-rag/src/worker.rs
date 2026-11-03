@@ -32,12 +32,18 @@ use crate::{chunk, rags};
 /// How the worker runs.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Events claimed per transaction.
+    /// Events claimed per batch.
     pub batch_size: i64,
     /// After this many failed attempts an event is left as a dead-letter.
     pub max_attempts: i32,
     /// How long [`run`] sleeps when the outbox is empty.
     pub poll_interval: Duration,
+    /// The claim lease: a claimed event is invisible to other workers for this
+    /// long. If a worker crashes mid-process the lease expires and the event is
+    /// re-claimed, so a slow embedder (run **outside** the transaction) never
+    /// holds a row lock and a crash never strands an event. Set it comfortably
+    /// above the slowest expected embed of one record.
+    pub lease_secs: i32,
 }
 
 impl Default for WorkerConfig {
@@ -46,6 +52,7 @@ impl Default for WorkerConfig {
             batch_size: 64,
             max_attempts: 5,
             poll_interval: Duration::from_secs(2),
+            lease_secs: 300,
         }
     }
 }
@@ -67,31 +74,84 @@ enum Handled {
     Delete,
 }
 
+/// One coalesced unit of work: a model, a record, the last op, and the outbox row
+/// ids it stands for.
+struct Claim {
+    model: String,
+    pk: String,
+    op: String,
+    ids: Vec<i64>,
+}
+
 /// Drain one batch. Returns what it did; `processed == 0` means the outbox was
-/// empty (or every pending event is dead-lettered).
+/// empty (or every pending event is dead-lettered or already claimed elsewhere).
+///
+/// The embedding — a network round-trip — runs **outside** any transaction, so a
+/// slow embedder never holds a database lock. The two are decoupled by a lease:
+/// phase 1 claims a batch in a short transaction (stamping `claimed_at`, which
+/// hides the rows from other workers for `lease_secs`) and releases the row
+/// locks; phase 2 embeds and writes with no transaction open; phase 3 drops the
+/// handled events or, on failure, raises `attempts` and clears the lease. A crash
+/// in phase 2 leaves the lease to expire, after which the event is re-claimed —
+/// so delivery stays at-least-once without the batch holding locks across I/O.
 pub async fn run_once<E: Embedder>(embedder: &E, cfg: &WorkerConfig) -> Result<WorkerStats> {
-    let batch = cfg.batch_size;
+    let claims = claim_batch(cfg).await?;
+    let mut stats = WorkerStats::default();
+    for claim in claims {
+        match process_record(embedder, &claim.model, &claim.pk, &claim.op).await {
+            Ok(kind) => {
+                stats.processed += 1;
+                match kind {
+                    Handled::Upsert => stats.upserts += 1,
+                    Handled::Delete => stats.deletes += 1,
+                }
+                finish_ok(&claim.ids).await?;
+            }
+            Err(e) => {
+                stats.failed += 1;
+                tracing::warn!(
+                    target: "dorm::rag",
+                    model = %claim.model,
+                    record_pk = %claim.pk,
+                    error = %e,
+                    "rag worker failed an event; will retry"
+                );
+                finish_fail(&claim.ids, &e.to_string()).await?;
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Phase 1: claim a batch under a lease, in a short transaction. Rows already
+/// claimed (and not yet lease-expired) and dead-lettered rows are skipped.
+async fn claim_batch(cfg: &WorkerConfig) -> Result<Vec<Claim>> {
     let max = cfg.max_attempts;
+    let lease = cfg.lease_secs;
+    let batch = cfg.batch_size;
     db::atomic(|_tx| async move {
         let rows = db::fetch(
             &format!(
                 "SELECT id, model, record_pk, op FROM {OUTBOX_TABLE} \
-                 WHERE attempts < $1 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $2"
+                 WHERE attempts < $1 \
+                   AND (claimed_at IS NULL OR claimed_at < now() - ($2::integer * interval '1 second')) \
+                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $3"
             ),
-            &[Value::I32(max), Value::I64(batch)],
+            &[Value::I32(max), Value::I32(lease), Value::I64(batch)],
         )
         .await?;
 
-        // Coalesce events per (model, record): several edits to one row collapse
-        // to one re-index, taking the last op. Keep first-seen order for stable,
-        // debuggable processing.
+        // Coalesce events per (model, record): several edits to one row collapse to
+        // one re-index, taking the last op. First-seen order is stable/debuggable.
         let mut order: Vec<(String, String)> = Vec::new();
         let mut groups: HashMap<(String, String), (String, Vec<i64>)> = HashMap::new();
+        let mut all_ids: Vec<i64> = Vec::new();
         for r in &rows {
             let id = r.try_get::<i64>(0)?;
             let model = r.try_get::<String>(1)?;
             let pk = r.try_get::<String>(2)?;
             let op = r.try_get::<String>(3)?;
+            all_ids.push(id);
             let key = (model, pk);
             let entry = groups.entry(key.clone()).or_insert_with(|| {
                 order.push(key.clone());
@@ -101,71 +161,69 @@ pub async fn run_once<E: Embedder>(embedder: &E, cfg: &WorkerConfig) -> Result<W
             entry.1.push(id);
         }
 
-        let mut stats = WorkerStats::default();
-        let mut done_ids: Vec<i64> = Vec::new();
-        let mut failed: Vec<(Vec<i64>, String)> = Vec::new();
-
-        for key in &order {
-            let (op, ids) = groups.remove(key).expect("group present");
-            // A SAVEPOINT per record: on Postgres a failed statement aborts the
-            // whole transaction, so without this one bad record would poison the
-            // batch (and the bookkeeping below). Rolling back to the savepoint
-            // leaves the transaction usable for the next record and the writes.
-            db::run("SAVEPOINT rag_record", &[]).await?;
-            match process_record(embedder, &key.0, &key.1, &op).await {
-                Ok(kind) => {
-                    db::run("RELEASE SAVEPOINT rag_record", &[]).await?;
-                    stats.processed += 1;
-                    match kind {
-                        Handled::Upsert => stats.upserts += 1,
-                        Handled::Delete => stats.deletes += 1,
-                    }
-                    done_ids.extend(ids);
-                }
-                Err(e) => {
-                    db::run("ROLLBACK TO SAVEPOINT rag_record", &[]).await?;
-                    stats.failed += 1;
-                    tracing::warn!(
-                        target: "dorm::rag",
-                        model = %key.0,
-                        record_pk = %key.1,
-                        error = %e,
-                        "rag worker failed an event; will retry"
-                    );
-                    failed.push((ids, e.to_string()));
-                }
-            }
-        }
-
-        // Bookkeeping, in the same transaction as the work: drop the handled
-        // events, raise attempts on the failed ones. A failed record does not roll
-        // back the batch — its own events keep their place with a higher count.
-        if !done_ids.is_empty() {
+        // Stamp the lease on the claimed rows, still holding their locks, so no
+        // other worker can take them until we finish or the lease expires.
+        if !all_ids.is_empty() {
             db::run(
                 &format!(
-                    "DELETE FROM {OUTBOX_TABLE} WHERE id IN ({})",
-                    in_list(1, done_ids.len())
+                    "UPDATE {OUTBOX_TABLE} SET claimed_at = now() WHERE id IN ({})",
+                    in_list(1, all_ids.len())
                 ),
-                &id_params(&done_ids),
+                &id_params(&all_ids),
             )
             .await?;
         }
-        for (ids, err) in &failed {
-            let mut params = vec![Value::Text(truncate(err, 500))];
-            params.extend(id_params(ids));
-            db::run(
-                &format!(
-                    "UPDATE {OUTBOX_TABLE} SET attempts = attempts + 1, last_error = $1, \
-                     updated_at = now() WHERE id IN ({})",
-                    in_list(2, ids.len())
-                ),
-                &params,
-            )
-            .await?;
-        }
-        Ok(stats)
+
+        Ok(order
+            .into_iter()
+            .map(|key| {
+                let (op, ids) = groups.remove(&key).expect("group present");
+                Claim {
+                    model: key.0,
+                    pk: key.1,
+                    op,
+                    ids,
+                }
+            })
+            .collect())
     })
     .await
+}
+
+/// Phase 3 (success): the record is indexed, so its events are done.
+async fn finish_ok(ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    db::run(
+        &format!(
+            "DELETE FROM {OUTBOX_TABLE} WHERE id IN ({})",
+            in_list(1, ids.len())
+        ),
+        &id_params(ids),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Phase 3 (failure): raise `attempts` and release the lease so the event retries
+/// (or dead-letters once `attempts` reaches the ceiling).
+async fn finish_fail(ids: &[i64], err: &str) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut params = vec![Value::Text(truncate(err, 500))];
+    params.extend(id_params(ids));
+    db::run(
+        &format!(
+            "UPDATE {OUTBOX_TABLE} SET attempts = attempts + 1, last_error = $1, \
+             claimed_at = NULL, updated_at = now() WHERE id IN ({})",
+            in_list(2, ids.len())
+        ),
+        &params,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Run until cancelled: drain, and when the outbox is empty, sleep for the poll

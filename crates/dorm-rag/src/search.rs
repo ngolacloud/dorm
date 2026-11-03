@@ -159,13 +159,15 @@ fn build_search_sql(
     (format!("{core}\n{tail}"), params)
 }
 
-/// Compile the pre-filter: the plan's filters (tenant included), as a subquery
-/// selecting only the primary key — no order, no limit, no joins beyond those the
-/// filters need.
-fn prefilter_sql(plan: &Plan) -> Result<Sql> {
+/// Compile a plan's filters (the tenant included) into a subquery that selects
+/// only the primary key — no order, no limit, no annotations. The one place this
+/// "pre-filter as a pk subquery" is built, shared by RAG search here and by the
+/// MCP `count`/`aggregate` tools, so a change to the pre-filtering rule lives in
+/// a single spot.
+pub fn pk_subquery(plan: &Plan) -> Result<Sql> {
     let pk = plan.model.primary_key().ok_or_else(|| {
         Error::Config(format!(
-            "model `{}` has no primary key, so it cannot be RAG-searched",
+            "model `{}` has no primary key, so it cannot be pre-filtered",
             plan.model.name
         ))
     })?;
@@ -198,7 +200,7 @@ async fn execute(
         )));
     }
     let shadow = shadow_table(meta.table);
-    let prefilter = prefilter_sql(plan)?;
+    let prefilter = pk_subquery(plan)?;
     let (sql, params) = build_search_sql(
         &shadow,
         &prefilter,

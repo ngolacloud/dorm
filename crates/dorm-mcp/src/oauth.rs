@@ -97,13 +97,18 @@ impl TokenStore {
     }
 
     /// Issue a token for `principal`, valid for `ttl`. Returns `(token, expiry)`.
+    ///
+    /// Sweeps expired entries on each mint, so a long-lived server does not leak
+    /// memory on tokens whose client never presents them again (lazy removal on
+    /// [`TokenStore::validate`] alone would keep those forever). Minting is
+    /// infrequent relative to tool calls, so the `O(n)` sweep is cheap.
     pub fn mint(&self, principal: Principal, ttl: Duration) -> (String, Instant) {
         let token = random_token();
         let expires = Instant::now() + ttl;
-        self.issued
-            .lock()
-            .unwrap()
-            .insert(token.clone(), (principal, expires));
+        let mut g = self.issued.lock().unwrap();
+        let now = Instant::now();
+        g.retain(|_, (_, exp)| *exp > now);
+        g.insert(token.clone(), (principal, expires));
         (token, expires)
     }
 

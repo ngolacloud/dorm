@@ -18,7 +18,7 @@
 //! (discovery, token issuance, PKCE) is phase B — see ADR 0020. No `rmcp`, no
 //! axum: a hand-written HTTP/1.1 endpoint on `tokio`, so it builds at MSRV 1.75.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,11 +63,22 @@ pub fn bearer_of(header: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// How long an idle session id stays valid before it is swept. Long enough not
+/// to disrupt a working client, short enough that abandoned sessions do not
+/// accumulate forever.
+const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// How long a client may take to send its full request before the connection is
+/// dropped — the slowloris guard.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Session registry: mints opaque `Mcp-Session-Id`s and checks them. The id is
 /// not a credential (the bearer is) — it only routes a client to its session, so
-/// a process-unique value suffices.
+/// a process-unique value suffices. Each id carries a last-seen instant so
+/// abandoned sessions are evicted (otherwise the set would grow unbounded, one
+/// entry per `initialize`, for the life of the process).
 struct Sessions {
-    live: Mutex<HashSet<String>>,
+    live: Mutex<HashMap<String, Instant>>,
     counter: AtomicU64,
     salt: u64,
 }
@@ -79,7 +90,7 @@ impl Sessions {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         Self {
-            live: Mutex::new(HashSet::new()),
+            live: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             salt,
         }
@@ -87,11 +98,26 @@ impl Sessions {
     fn mint(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let id = format!("{:016x}-{n:x}", self.salt);
-        self.live.lock().unwrap().insert(id.clone());
+        let now = Instant::now();
+        let mut g = self.live.lock().unwrap();
+        g.retain(|_, seen| now.duration_since(*seen) < SESSION_TTL);
+        g.insert(id.clone(), now);
         id
     }
     fn valid(&self, id: &str) -> bool {
-        self.live.lock().unwrap().contains(id)
+        let now = Instant::now();
+        let mut g = self.live.lock().unwrap();
+        match g.get_mut(id) {
+            Some(seen) if now.duration_since(*seen) < SESSION_TTL => {
+                *seen = now; // refresh on use
+                true
+            }
+            Some(_) => {
+                g.remove(id);
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -195,8 +221,14 @@ async fn handle_connection(
     sessions: &Sessions,
     store: &TokenStore,
 ) -> std::io::Result<()> {
-    let Some(req) = read_http(&mut stream).await? else {
-        return write_simple(&mut stream, 400, "bad request").await;
+    // Bound how long a client may take to send its request: without this, a
+    // connection that sends a partial request (or nothing) holds a task forever —
+    // a slowloris. The read timeout caps that; well-behaved clients finish in ms.
+    let req = match tokio::time::timeout(READ_TIMEOUT, read_http(&mut stream)).await {
+        Ok(Ok(Some(req))) => req,
+        Ok(Ok(None)) => return write_simple(&mut stream, 400, "bad request").await,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return write_simple(&mut stream, 408, "request timed out").await,
     };
 
     // OAuth endpoints are unauthenticated (they are how you get a token) and are
@@ -452,6 +484,7 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         429 => "Too Many Requests",
         _ => "Error",
     }

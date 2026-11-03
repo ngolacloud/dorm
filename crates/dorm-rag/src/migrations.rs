@@ -234,6 +234,7 @@ pub fn preamble() -> Vec<String> {
              op TEXT NOT NULL,\n    \
              attempts INTEGER NOT NULL DEFAULT 0,\n    \
              last_error TEXT,\n    \
+             claimed_at TIMESTAMPTZ,\n    \
              enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n    \
              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\n)"
         ),

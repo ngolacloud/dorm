@@ -5,9 +5,7 @@
 //! the binary, splice no SQL, and — for a `tenant_scoped` model — never cross the
 //! tenant, which is forced from the server config, never a tool argument.
 
-use dorm_core::compiler::{
-    compile_delete_on, compile_insert_on, compile_select_on, compile_update_on, Plan, Sql,
-};
+use dorm_core::compiler::{compile_delete_on, compile_insert_on, compile_update_on, Plan, Sql};
 use dorm_core::db;
 use dorm_core::error::{Error, Result};
 use dorm_core::expr::{Assignment, OrderBy, F, Q};
@@ -610,17 +608,18 @@ async fn run_scalar_aggregate(
     let pk = meta
         .primary_key()
         .ok_or_else(|| Error::Config(format!("model `{}` has no primary key", meta.name)))?;
-    let mut pf = plan.clone();
-    pf.values = vec![pk.name.to_string()];
-    pf.unordered = true;
-    pf.order = Vec::new();
-    pf.limit = None;
-    pf.offset = None;
-    let sub = compile_select_on(&pf, db::dialect())?;
+    // The same compiler-built pk pre-filter the RAG search uses — one place.
+    let sub = dorm_rag::search::pk_subquery(plan)?;
 
+    // The SQL alias is a server-generated positional name (`a0`, `a1`, …), never
+    // the caller's `alias`: the caller's string is used only as the JSON output
+    // key below, so it can never reach the SQL text. The cell is read by index,
+    // so the alias is cosmetic in SQL anyway — splicing the caller's value would
+    // be a needless injection hole (the whole MCP design forbids caller SQL).
     let select: Vec<String> = exprs
         .iter()
-        .map(|(alias, sql)| format!("({sql})::text AS {alias}"))
+        .enumerate()
+        .map(|(i, (_, sql))| format!("({sql})::text AS a{i}"))
         .collect();
     let sql = format!(
         "SELECT {} FROM {} t WHERE t.{} IN ({})",
