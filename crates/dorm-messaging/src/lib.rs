@@ -11,9 +11,9 @@
 //!
 //! Broker backends implement the same [`Publisher`] trait behind Cargo features,
 //! and [`OutboxBus::forward`] bridges the outbox to any of them, at-least-once.
-//! **NATS** ([`nats`], feature `nats`, ADR 0051) and **AMQP/RabbitMQ** ([`amqp`],
-//! feature `amqp`, ADR 0052) are implemented and proven against live brokers;
-//! Kafka is the same shape, behind its feature, not yet wired.
+//! **NATS** ([`nats`], ADR 0051), **AMQP/RabbitMQ** ([`amqp`], ADR 0052) and
+//! **Kafka** ([`kafka`], ADR 0053) are implemented, each behind its feature and
+//! each proven against a live broker through the one bridge.
 
 use std::future::Future;
 
@@ -312,6 +312,99 @@ pub mod amqp {
                 .map_err(|e| Error::Db(format!("AMQP publish failed: {e}")))?
                 .await
                 .map_err(|e| Error::Db(format!("AMQP publish not confirmed: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+/// The Kafka broker backend (ADR 0053), behind the `kafka` feature.
+///
+/// A [`KafkaPublisher`] carries [`CloudEvent`]s to a Kafka topic as CloudEvents
+/// **structured** JSON (the event `id` is the record key, for log compaction and
+/// partitioning), using the pure-Rust `rskafka` client — no `librdkafka`/C. A
+/// `produce` returns only once the broker has acked, so the relay does not advance
+/// its cursor on an unacknowledged publish. Pair it with [`OutboxBus::forward`] for
+/// the durable, at-least-once path.
+#[cfg(feature = "kafka")]
+pub mod kafka {
+    use super::{CloudEvent, Error, Publisher, Result};
+    use rskafka::client::partition::{Compression, UnknownTopicHandling};
+    use rskafka::client::{Client, ClientBuilder};
+    use rskafka::record::Record;
+    use std::collections::BTreeMap;
+
+    /// A [`Publisher`] that produces to a Kafka broker.
+    pub struct KafkaPublisher {
+        client: Client,
+    }
+
+    impl KafkaPublisher {
+        /// Connect to a Kafka cluster — a comma-separated list of bootstrap
+        /// brokers (`host:port,host:port`).
+        pub async fn connect(brokers: &str) -> Result<Self> {
+            let boots: Vec<String> = brokers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let client = ClientBuilder::new(boots)
+                .build()
+                .await
+                .map_err(|e| Error::Db(format!("Kafka connect failed: {e}")))?;
+            Ok(KafkaPublisher { client })
+        }
+
+        /// The underlying client, for a caller that wants to consume or manage
+        /// topics directly.
+        pub fn client(&self) -> &Client {
+            &self.client
+        }
+
+        /// Create `topic` if it does not exist (idempotent) — a producer needs the
+        /// topic unless the broker auto-creates it.
+        pub async fn ensure_topic(
+            &self,
+            topic: &str,
+            partitions: i32,
+            replication: i16,
+        ) -> Result<()> {
+            let controller = self
+                .client
+                .controller_client()
+                .map_err(|e| Error::Db(format!("Kafka controller failed: {e}")))?;
+            match controller
+                .create_topic(topic, partitions, replication, 5_000)
+                .await
+            {
+                Ok(()) => Ok(()),
+                // An already-existing topic is success for an idempotent ensure.
+                Err(e) if e.to_string().to_lowercase().contains("already exists") => Ok(()),
+                Err(e) => Err(Error::Db(format!("Kafka create_topic failed: {e}"))),
+            }
+        }
+    }
+
+    impl Publisher for KafkaPublisher {
+        /// Produce the CloudEvents-JSON envelope to `topic` (partition 0), the
+        /// event `id` as the record key, and await the broker's ack.
+        async fn publish(&self, topic: &str, event: &CloudEvent) -> Result<()> {
+            let bytes = serde_json::to_vec(&event.to_json())
+                .map_err(|e| Error::Db(format!("CloudEvent serialize failed: {e}")))?;
+            let partition = self
+                .client
+                .partition_client(topic.to_string(), 0, UnknownTopicHandling::Retry)
+                .await
+                .map_err(|e| Error::Db(format!("Kafka partition_client failed: {e}")))?;
+            let record = Record {
+                key: Some(event.id.clone().into_bytes()),
+                value: Some(bytes),
+                headers: BTreeMap::new(),
+                timestamp: rskafka::chrono::Utc::now(),
+            };
+            partition
+                .produce(vec![record], Compression::NoCompression)
+                .await
+                .map_err(|e| Error::Db(format!("Kafka produce failed: {e}")))?;
             Ok(())
         }
     }
