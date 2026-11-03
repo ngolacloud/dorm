@@ -53,6 +53,13 @@ fn scoped_plan(plan: &Plan) -> Result<Plan> {
             .expect("active_tenant checked the field exists");
         p.filters.push(Q::new(tf.name.to_string(), tenant));
     }
+    // Soft delete (ADR 0033): hide `deleted_at IS NOT NULL` rows by default, unless
+    // the task opted in with `with_deleted`.
+    if !db::include_deleted() {
+        if let Some(sd) = plan.model.soft_delete_field() {
+            p.filters.push(Q::new(format!("{}__isnull", sd.name), true));
+        }
+    }
     Ok(p)
 }
 
@@ -102,12 +109,46 @@ pub fn compile_update(plan: &Plan, assignments: &[Assignment]) -> Result<Sql> {
 }
 
 pub fn compile_delete(plan: &Plan) -> Result<Sql> {
-    compiler::compile_delete_on(&scoped_plan(plan)?, db::dialect())
+    let scoped = scoped_plan(plan)?;
+    // Soft delete (ADR 0033): a `delete()` on a soft-delete model stamps
+    // `deleted_at` instead of removing the row — unless the task asked for a hard
+    // delete (the purge path). The scoped plan already carries `deleted_at IS
+    // NULL`, so only live rows are stamped.
+    if let Some(sd) = plan.model.soft_delete_field() {
+        if !db::is_hard_delete() {
+            let now = crate::value::Value::Timestamp(chrono::Utc::now());
+            let sets = [Assignment::new(
+                sd.name.to_string(),
+                crate::expr::F::Lit(now),
+            )];
+            return compiler::compile_update_on(&scoped, &sets, db::dialect());
+        }
+    }
+    compiler::compile_delete_on(&scoped, db::dialect())
 }
 
 pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -> Result<Sql> {
     let rows = scoped_rows(meta, rows)?;
     compiler::compile_insert_on(meta, &rows, db::dialect())
+}
+
+/// Hard-delete the soft-deleted rows of `meta` whose `deleted_at` is older than
+/// `retain_secs` — the retention purge for a soft-delete model (ADR 0033).
+/// Returns how many rows were removed. Run on a schedule. The table and column
+/// are `&'static` identifiers from the model's metadata, never caller input.
+pub async fn purge_soft_deleted(meta: &'static ModelMeta, retain_secs: i64) -> Result<u64> {
+    let sd = meta
+        .soft_delete_field()
+        .ok_or_else(|| Error::Config(format!("model `{}` is not soft-delete", meta.name)))?;
+    db::run(
+        &format!(
+            "DELETE FROM \"{}\" WHERE \"{}\" IS NOT NULL \
+             AND \"{}\" < now() - ($1 || ' seconds')::interval",
+            meta.table, sd.column, sd.column
+        ),
+        &[Value::Text(retain_secs.max(0).to_string())],
+    )
+    .await
 }
 
 #[cfg(test)]

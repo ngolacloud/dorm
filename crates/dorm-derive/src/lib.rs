@@ -43,6 +43,7 @@ struct ModelOpts {
     table: Option<String>,
     ordering: Vec<String>,
     tenant_scoped: bool,
+    soft_delete: bool,
     /// Each entry is a composite-unique group of column names.
     unique_together: Vec<Vec<String>>,
     /// Table-level `CHECK` predicates (raw SQL, no `CHECK (...)` wrapper).
@@ -182,6 +183,7 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
         table: None,
         ordering: Vec::new(),
         tenant_scoped: false,
+        soft_delete: false,
         unique_together: Vec::new(),
         checks: Vec::new(),
     };
@@ -212,6 +214,7 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
                         .collect();
                 }
                 "tenant_scoped" => opts.tenant_scoped = true,
+                "soft_delete" => opts.soft_delete = true,
                 "unique_together" => {
                     // One group per attribute, columns comma-separated:
                     // `unique_together = "tenant, name"`. Repeat the attribute
@@ -236,7 +239,7 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
                 other => {
                     return Err(meta.error(format!(
                         "unknown `model` option `{other}`; known: table, ordering, \
-                         tenant_scoped, unique_together, check"
+                         tenant_scoped, soft_delete, unique_together, check"
                     )))
                 }
             }
@@ -635,6 +638,19 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         }
     });
 
+    // `#[model(soft_delete)]` registers the model's `deleted_at` column (by
+    // convention) in the `SoftDeleteMeta` slice. The scope seam hides deleted rows
+    // by default (ADR 0033).
+    let soft_delete_submit = if opts.soft_delete {
+        quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::SoftDeleteMeta { model: #model_name, field: "deleted_at" }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         #[doc(hidden)]
         const #fields_const: &[::dorm_core::meta::FieldMeta] = &[#(#field_entries),*];
@@ -662,6 +678,7 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         ::dorm_core::inventory::submit! { #meta_const }
 
         #(#version_submits)*
+        #soft_delete_submit
     }
 }
 

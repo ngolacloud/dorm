@@ -93,6 +93,12 @@ pub enum Error {
     #[error("model `{0}` is tenant-scoped but no tenant is in scope (use with_tenant or with_system_scope)")]
     TenantScopeMissing(&'static str),
 
+    /// An idempotency key was reused with a **different** request — the same key
+    /// must mean the same operation, so this is refused rather than replaying a
+    /// response that does not belong to this request (ADR 0032).
+    #[error("idempotency key `{key}` was already used for a different request")]
+    IdempotencyMismatch { key: String },
+
     /// The server cancelled a statement that ran past
     /// `DELONIX_ORM_STATEMENT_TIMEOUT_MS` (SQLSTATE `57014`). Named separately
     /// from [`Error::Db`] so a caller can retry or report it as a timeout rather

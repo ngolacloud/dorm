@@ -42,6 +42,7 @@ pub mod db;
 pub mod error;
 pub mod expr;
 pub mod field;
+pub mod idempotency;
 pub mod lookup;
 pub mod m2m;
 pub mod meta;

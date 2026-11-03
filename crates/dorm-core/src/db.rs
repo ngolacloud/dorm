@@ -169,6 +169,21 @@ tokio::task_local! {
     static SYSTEM_SCOPE: bool;
 }
 
+tokio::task_local! {
+    /// Include soft-deleted rows in this task's reads (ADR 0033). Off by default,
+    /// so a soft-delete model hides `deleted_at IS NOT NULL` rows; `with_deleted`
+    /// turns it on for an explicit "show me the deleted ones too" query.
+    static WITH_DELETED: bool;
+}
+
+tokio::task_local! {
+    /// Turn a delete into a **hard** delete on a soft-delete model (ADR 0033).
+    /// Off by default, so `delete()` on a soft-delete model sets `deleted_at`
+    /// instead of removing the row; `with_hard_delete` (the purge path) really
+    /// removes it.
+    static HARD_DELETE: bool;
+}
+
 /// The slow-query threshold, read from the environment exactly once.
 ///
 /// Like the pool sizing, this is process configuration set at launch, not a
@@ -409,6 +424,34 @@ pub fn current_tenant() -> Option<Value> {
 /// Whether this task is running under [`with_system_scope`] (tenant scoping off).
 pub fn is_system_scope() -> bool {
     SYSTEM_SCOPE.try_with(|&b| b).unwrap_or(false)
+}
+
+/// Run `fut` with soft-deleted rows **included** in reads (ADR 0033) — the
+/// explicit opt-in that turns off the default `deleted_at IS NULL` filter.
+pub async fn with_deleted<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    WITH_DELETED.scope(true, fut).await
+}
+
+/// Whether soft-deleted rows should be included for this task ([`with_deleted`]).
+pub fn include_deleted() -> bool {
+    WITH_DELETED.try_with(|&b| b).unwrap_or(false)
+}
+
+/// Run `fut` with deletes made **hard** on soft-delete models (ADR 0033) — the
+/// purge path, which really removes rows instead of stamping `deleted_at`.
+pub async fn with_hard_delete<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    HARD_DELETE.scope(true, fut).await
+}
+
+/// Whether a delete on a soft-delete model should be hard for this task.
+pub fn is_hard_delete() -> bool {
+    HARD_DELETE.try_with(|&b| b).unwrap_or(false)
 }
 
 /// Whether the current context is read-only, most specific wins: the per-task

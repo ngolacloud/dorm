@@ -187,7 +187,31 @@ impl ModelMeta {
             .field;
         self.field(name)
     }
+
+    /// This model's soft-delete timestamp field, if declared with
+    /// `#[model(soft_delete)]`. Resolved through the [`SoftDeleteMeta`] slice
+    /// (ADR 0033), so `FieldMeta`/`ModelMeta` gain no field — the same discipline
+    /// as `version`. A soft-delete model's rows are hidden by `deleted_at IS NULL`
+    /// by default and removed only by a purge.
+    pub fn soft_delete_field(&self) -> Option<&'static FieldMeta> {
+        let name = inventory::iter::<SoftDeleteMeta>
+            .into_iter()
+            .find(|v| v.model == self.name)?
+            .field;
+        self.field(name)
+    }
 }
+
+/// Marks a model as soft-deleting, naming its `deleted_at`-style timestamp column
+/// (ADR 0033). In its own slice rather than on [`ModelMeta`], so the metadata is
+/// unchanged; the scope seam reads it to hide deleted rows by default.
+#[derive(Debug, Clone, Copy)]
+pub struct SoftDeleteMeta {
+    pub model: &'static str,
+    pub field: &'static str,
+}
+
+inventory::collect!(SoftDeleteMeta);
 
 #[cfg(test)]
 mod tests {
