@@ -61,7 +61,7 @@ tokio-postgres = { workspace = true }
 # generated read API uses the same version (see `scaffold.rs`), so a workspace
 # build shares one axum. `net`/`signal` on tokio above are for the listener and
 # the Ctrl-C graceful shutdown.
-axum = "0.7"
+axum = "0.8"
 # Only to render the ledger's `applied_unix` as a readable UTC timestamp.
 chrono = { workspace = true, features = ["alloc"] }
 # Account administration (ADR 0009). `argon2` hashes a password into a
