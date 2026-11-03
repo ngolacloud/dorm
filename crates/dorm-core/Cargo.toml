@@ -95,7 +95,7 @@ insta = { workspace = true }
 # ADR 0007 benchmarks. `async_tokio` lets a `&Runtime` drive the measured
 # future so each iteration is a real round trip to PostgreSQL; the models the
 # benchmark queries come from the derive, exactly as a user's would.
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 dorm-derive = { path = "../dorm-derive" }
 # ADR 0008's live proof installs a capturing subscriber to witness the
 # slow-query `warn!` event. Test-only — the library never installs a subscriber.
