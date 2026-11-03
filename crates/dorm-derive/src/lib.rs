@@ -459,6 +459,7 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
         "timestamp" | "timestamptz" => "Timestamp",
         "uuid" => "Uuid",
         "json" | "jsonb" => "Json",
+        "inet" => "Inet",
         other => {
             return Err(Error::new(
                 s.span(),
@@ -500,6 +501,8 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
         "Uuid" => "Uuid",
         // `serde_json::Value`, however it was imported.
         "Value" | "JsonValue" => "Json",
+        // `std::net::IpAddr` → INET (ADR 0040).
+        "IpAddr" => "Inet",
         other => {
             return Err(Error::new_spanned(
                 ty,

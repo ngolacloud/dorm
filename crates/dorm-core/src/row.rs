@@ -206,6 +206,18 @@ impl_decode!(
 );
 impl_decode!(f64, sqlite_real, mysql_double);
 impl_decode!(Vec<u8>, sqlite_blob, mysql_blob);
+// `INET` → `std::net::IpAddr`, native on PostgreSQL (ADR 0040). SQLite and MySQL
+// have no INET type, so a typed read there is refused rather than silently
+// reinterpreting the stored text — the same explicit refusal `cell_to_value` makes.
+impl_decode!(
+    std::net::IpAddr,
+    |_c| Err(Error::Db(
+        "inet is a PostgreSQL-only type; SQLite does not support it".into()
+    )),
+    |_c| Err(Error::Db(
+        "inet is a PostgreSQL-only type; MySQL does not support it".into()
+    ))
+);
 
 /// A SQLite integer cell, or a type error.
 #[cfg(feature = "sqlite")]
@@ -286,6 +298,9 @@ pub(crate) fn value_to_sqlite(v: &crate::value::Value) -> rusqlite::types::Value
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Json(j) => S::Text(j.to_string()),
         Value::Bytes(b) => S::Blob(b.clone()),
+        // SQLite has no INET; stored as text if it ever reaches here (the DDL
+        // refuses an inet column on SQLite — ADR 0040).
+        Value::Inet(ip) => S::Text(ip.to_string()),
     }
 }
 
@@ -337,6 +352,7 @@ pub(crate) fn cell_to_value(
                 .map_err(|_| mismatch("json"))?,
         ),
         FieldType::Bytes => Value::Bytes(sqlite_blob(cell).map_err(|_| mismatch("bytes"))?),
+        FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
     })
 }
 
@@ -438,6 +454,7 @@ pub(crate) fn value_to_mysql(v: &crate::value::Value) -> mysql_async::Value {
         Value::Uuid(u) => M::Bytes(u.to_string().into_bytes()),
         Value::Json(j) => M::Bytes(j.to_string().into_bytes()),
         Value::Bytes(b) => M::Bytes(b.clone()),
+        Value::Inet(ip) => M::Bytes(ip.to_string().into_bytes()),
     }
 }
 
@@ -487,5 +504,6 @@ pub(crate) fn mysql_cell_to_value(
                 .map_err(|_| mismatch("json"))?,
         ),
         FieldType::Bytes => Value::Bytes(mysql_blob(cell).map_err(|_| mismatch("bytes"))?),
+        FieldType::Inet => return Err(mismatch("inet, which MySQL does not support")),
     })
 }

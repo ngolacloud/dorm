@@ -328,6 +328,7 @@ async fn export_csv(
 fn value_to_cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
+        Value::Inet(ip) => ip.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::I32(n) => n.to_string(),
         Value::I64(n) => n.to_string(),
@@ -553,6 +554,7 @@ fn value_row_to_json(row: &ValueRow, meta: &ModelMeta) -> JsonValue {
 fn value_to_json(v: &Value) -> JsonValue {
     match v {
         Value::Null => JsonValue::Null,
+        Value::Inet(ip) => JsonValue::from(ip.to_string()),
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::I32(n) => JsonValue::from(*n),
         Value::I64(n) => JsonValue::from(*n),

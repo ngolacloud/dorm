@@ -143,6 +143,7 @@ fn type_tag(ty: FieldType) -> &'static str {
         FieldType::Bool => "bool",
         FieldType::Decimal => "decimal",
         FieldType::Timestamp => "timestamp",
+        FieldType::Inet => "inet",
         FieldType::Uuid => "uuid",
         FieldType::Json => "json",
         FieldType::Bytes => "bytes",

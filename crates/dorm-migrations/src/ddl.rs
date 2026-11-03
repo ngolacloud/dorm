@@ -390,6 +390,9 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Decimal => "NUMERIC",
             FieldType::F64 => "REAL",
             FieldType::Bytes => "BLOB",
+            // SQLite has no INET; the text form is stored, and a read is refused
+            // (ADR 0040) — network operators are PostgreSQL-only.
+            FieldType::Inet => "TEXT",
         }
         .to_string(),
         Backend::MySql => match ty {
@@ -410,6 +413,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Uuid => "CHAR(36)",
             FieldType::Json => "JSON",
             FieldType::Bytes => "LONGBLOB",
+            FieldType::Inet => "TEXT",
         }
         .to_string(),
     }

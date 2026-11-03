@@ -428,11 +428,15 @@ fn compile_predicate(
     lookup.validate(ty, &p.path, &p.values)?;
 
     let operand = qualified(&alias, field.column)?;
-    let values = if lookup == Lookup::IsNull {
+    let values = if lookup == Lookup::IsNull || lookup.is_network() {
         // The boolean of an `isnull` belongs to the operator — it picks between
         // `IS NULL` and `IS NOT NULL` — and is never bound to the column.
         // Coercing it towards the column's type would reject
         // `name__isnull = true` on a text column, which is a legitimate query.
+        //
+        // A network lookup's value is kept as text too: it may carry a netmask
+        // (`10.0.0.0/8`) that coercing to a host `IpAddr` would drop; it is bound
+        // as text and cast to `inet` in the comparison (ADR 0040).
         p.values.clone()
     } else {
         p.values
@@ -607,7 +611,26 @@ fn compile_comparison(
                 _ => format!("{operand} IS NOT NULL"),
             }
         }
+        // Network set operators on an `INET` column (ADR 0040): `>>` contains,
+        // `<<` contained-by, `&&` overlaps.
+        Lookup::NetContains => net_op(operand, ">>", &values[0], binder),
+        Lookup::NetContainedBy => net_op(operand, "<<", &values[0], binder),
+        Lookup::NetOverlaps => net_op(operand, "&&", &values[0], binder),
     })
+}
+
+/// A network comparison `operand OP <value>::inet` (ADR 0040). A text value (an
+/// IP/CIDR string from the REPL) is bound and cast with `($n || '')::inet` — the
+/// concatenation forces the parameter to infer as text, dodging the type-inference
+/// trap (ADR 0037); a native `Inet` value is already `inet` and binds directly.
+fn net_op(operand: &str, op: &str, value: &Value, binder: &mut Binder) -> String {
+    match value {
+        Value::Text(_) => format!(
+            "{operand} {op} ({} || '')::inet",
+            binder.bind(value.clone())
+        ),
+        _ => format!("{operand} {op} {}", binder.bind(value.clone())),
+    }
 }
 
 enum PatternShape {

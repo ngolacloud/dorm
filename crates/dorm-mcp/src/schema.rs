@@ -19,6 +19,7 @@ fn json_type(ty: FieldType) -> Value {
         FieldType::Json => json!({ "type": "object" }),
         FieldType::Bytes => json!({ "type": "string", "contentEncoding": "base16" }),
         FieldType::Text => json!({ "type": "string" }),
+        FieldType::Inet => json!({ "type": "string", "format": "ipv4" }),
     }
 }
 

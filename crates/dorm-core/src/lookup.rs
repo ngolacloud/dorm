@@ -28,6 +28,12 @@ pub enum Lookup {
     IRegex,
     IsNull,
     Range,
+    /// Network containment on an `INET` column (ADR 0040): `>>` (this column's
+    /// network contains the value), `<<` (is contained by), `&&` (overlaps). The
+    /// value is given as text (an IP or CIDR) and cast to `inet`.
+    NetContains,
+    NetContainedBy,
+    NetOverlaps,
 }
 
 /// How many values a lookup binds.
@@ -64,6 +70,9 @@ impl Lookup {
             "iregex" => Lookup::IRegex,
             "isnull" => Lookup::IsNull,
             "range" => Lookup::Range,
+            "net_contains" => Lookup::NetContains,
+            "net_contained_by" => Lookup::NetContainedBy,
+            "net_overlaps" => Lookup::NetOverlaps,
             _ => return None,
         })
     }
@@ -87,6 +96,9 @@ impl Lookup {
             Lookup::IRegex => "iregex",
             Lookup::IsNull => "isnull",
             Lookup::Range => "range",
+            Lookup::NetContains => "net_contains",
+            Lookup::NetContainedBy => "net_contained_by",
+            Lookup::NetOverlaps => "net_overlaps",
         }
     }
 
@@ -113,6 +125,15 @@ impl Lookup {
                 | Lookup::Regex
                 | Lookup::IRegex
                 | Lookup::IExact
+        )
+    }
+
+    /// Whether this is a network-set operator (`>>`/`<<`/`&&`), meaningful only
+    /// on an `INET` column (ADR 0040).
+    pub fn is_network(self) -> bool {
+        matches!(
+            self,
+            Lookup::NetContains | Lookup::NetContainedBy | Lookup::NetOverlaps
         )
     }
 
@@ -151,6 +172,13 @@ impl Lookup {
                 want: "boolean, for isnull",
             });
         }
+
+        if self.is_network() && ty != FieldType::Inet {
+            return Err(Error::UnexpectedColumnType {
+                column: path.to_string(),
+                want: "inet column, for a network lookup",
+            });
+        }
         Ok(())
     }
 }
@@ -186,6 +214,9 @@ mod tests {
             Lookup::IRegex,
             Lookup::IsNull,
             Lookup::Range,
+            Lookup::NetContains,
+            Lookup::NetContainedBy,
+            Lookup::NetOverlaps,
         ] {
             assert_eq!(Lookup::parse(l.name()), Some(l), "{}", l.name());
         }

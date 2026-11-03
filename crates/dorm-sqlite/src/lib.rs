@@ -86,6 +86,7 @@ fn to_sqlite(v: &Value) -> rusqlite::types::Value {
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Json(j) => S::Text(j.to_string()),
         Value::Bytes(b) => S::Blob(b.clone()),
+        Value::Inet(ip) => S::Text(ip.to_string()),
     }
 }
 
@@ -138,6 +139,7 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
                 .parse()
                 .map_err(|_| mismatch("uuid"))?,
         ),
+        FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
         FieldType::Json => Value::Json(
             serde_json::from_str(&as_text(&raw).ok_or(mismatch("json text"))?)
                 .map_err(|_| mismatch("json"))?,

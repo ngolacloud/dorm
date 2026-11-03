@@ -10,6 +10,7 @@
 //! accept a value typed by a human.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -38,6 +39,9 @@ pub enum FieldType {
     Json,
     /// Raw bytes (`BYTEA`/`BLOB`) — a hash, a key, a small binary blob.
     Bytes,
+    /// An IP address, `INET` (PostgreSQL only). The IPAM building block: a host
+    /// address stored natively, with network-containment lookups (ADR 0040).
+    Inet,
 }
 
 impl FieldType {
@@ -57,6 +61,7 @@ impl FieldType {
             FieldType::Uuid => "UUID",
             FieldType::Json => "JSONB",
             FieldType::Bytes => "BYTEA",
+            FieldType::Inet => "INET",
         }
     }
 
@@ -80,6 +85,7 @@ impl FieldType {
             FieldType::Uuid => "uuid",
             FieldType::Json => "json",
             FieldType::Bytes => "bytes",
+            FieldType::Inet => "inet",
         }
     }
 }
@@ -103,6 +109,7 @@ pub enum Value {
     Uuid(Uuid),
     Json(serde_json::Value),
     Bytes(Vec<u8>),
+    Inet(IpAddr),
 }
 
 impl Value {
@@ -121,6 +128,7 @@ impl Value {
             Value::Uuid(_) => FieldType::Uuid,
             Value::Json(_) => FieldType::Json,
             Value::Bytes(_) => FieldType::Bytes,
+            Value::Inet(_) => FieldType::Inet,
         })
     }
 
@@ -195,6 +203,11 @@ impl Value {
                 Value::F64(s.parse().map_err(|_| mismatch("float"))?)
             }
 
+            // A host address typed as text in the REPL (`"10.0.0.1"`).
+            (Value::Text(s), FieldType::Inet) => {
+                Value::Inet(s.parse().map_err(|_| mismatch("inet address"))?)
+            }
+
             (_, w) => return Err(mismatch(w.describe())),
         })
     }
@@ -225,6 +238,7 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
+            Value::Inet(ip) => write!(f, "{ip}"),
         }
     }
 }
@@ -258,6 +272,7 @@ impl ToSql for Value {
             Value::Uuid(v) => v.to_sql_checked(ty, out),
             Value::Json(v) => v.to_sql_checked(ty, out),
             Value::Bytes(v) => v.to_sql_checked(ty, out),
+            Value::Inet(v) => v.to_sql_checked(ty, out),
         }
     }
 
@@ -324,6 +339,9 @@ to_value!(DateTime<Utc>, Timestamp, Timestamp, |v| *v);
 to_value!(Uuid, Uuid, Uuid, |v| *v);
 to_value!(serde_json::Value, Json, Json, |v| v.clone());
 to_value!(Vec<u8>, Bytes, Bytes, |v| v.clone());
+// An `IpAddr` field maps to `INET`; the derive infers `FieldType::Inet` from it,
+// and the typed API binds it natively (ADR 0040).
+to_value!(IpAddr, Inet, Inet, |v| *v);
 
 impl ToValue for &str {
     fn to_value(&self) -> Value {
@@ -428,6 +446,10 @@ pub fn read_column(
             .try_get::<_, Option<Vec<u8>>>(idx)
             .map_err(|_| fail("bytes"))?
             .map_or(Value::Null, Value::Bytes),
+        FieldType::Inet => row
+            .try_get::<_, Option<IpAddr>>(idx)
+            .map_err(|_| fail("inet"))?
+            .map_or(Value::Null, Value::Inet),
     })
 }
 
