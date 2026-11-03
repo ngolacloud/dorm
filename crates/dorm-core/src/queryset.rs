@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use crate::compiler::{self, Plan, Sql};
 use crate::error::{Error, Result};
 use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, Q};
-use crate::model::{run_execute, run_query, Model, NewRow};
+use crate::model::{insert_returning, run_execute, run_query, Model, NewRow};
 use crate::row::Row;
 use crate::value::{read_column, ToValue, Value};
 use crate::{db, registry};
@@ -132,9 +132,9 @@ impl<T: Model> Manager<T> {
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
         db::guard_write("create")?;
         let values = new.column_values();
-        let sql =
-            compiler::compile_insert_on(T::meta(), std::slice::from_ref(&values), db::dialect())?;
-        let rows = run_query(&sql).await?;
+        let batch = std::slice::from_ref(&values);
+        let sql = compiler::compile_insert_on(T::meta(), batch, db::dialect())?;
+        let rows = insert_returning(T::meta(), &sql, batch).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
         })?;
@@ -162,19 +162,22 @@ impl<T: Model> Manager<T> {
         let cols = values[0].len().max(1);
         let per_chunk = (65_535 / cols).max(1);
 
-        // Single chunk: unchanged behaviour (one statement, implicit transaction).
+        // Single chunk: one statement. On a RETURNING backend that is its own
+        // implicit transaction, as before; on MySQL `insert_returning` wraps the
+        // insert-then-reload in one `atomic` so the two share a connection.
         if values.len() <= per_chunk {
             let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
-            let returned = run_query(&sql).await?;
+            let returned = insert_returning(T::meta(), &sql, &values).await?;
             return returned.iter().map(|r| T::from_row(r, 0)).collect();
         }
 
-        // Several chunks: one statement each, all in one transaction.
+        // Several chunks: one statement each, all in one transaction. On MySQL
+        // each chunk's `insert_returning` nests as a savepoint within it.
         db::atomic(|_tx| async move {
             let mut out = Vec::with_capacity(values.len());
             for chunk in values.chunks(per_chunk) {
                 let sql = compiler::compile_insert_on(T::meta(), chunk, db::dialect())?;
-                let returned = run_query(&sql).await?;
+                let returned = insert_returning(T::meta(), &sql, chunk).await?;
                 for r in &returned {
                     out.push(T::from_row(r, 0)?);
                 }
@@ -602,7 +605,7 @@ pub async fn insert_value_rows(
 ) -> Result<Vec<ValueRow>> {
     db::guard_write("insert")?;
     let sql = compiler::compile_insert_on(meta, rows, db::dialect())?;
-    let returned = run_query(&sql).await?;
+    let returned = insert_returning(meta, &sql, rows).await?;
     decode(&sql, &returned)
 }
 

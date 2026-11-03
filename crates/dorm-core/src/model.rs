@@ -69,8 +69,9 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
 
     if obj.pk().is_null() {
         let values = obj.column_values();
-        let sql = compiler::compile_insert(meta, std::slice::from_ref(&values))?;
-        let rows = run_query(&sql).await?;
+        let batch = std::slice::from_ref(&values);
+        let sql = compiler::compile_insert_on(meta, batch, db::dialect())?;
+        let rows = insert_returning(meta, &sql, batch).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
         })?;
@@ -152,6 +153,90 @@ pub async fn refresh_instance<T: Model>(obj: &mut T) -> Result<()> {
     })?;
     *obj = T::from_row(row, 0)?;
     Ok(())
+}
+
+/// Run a compiled `INSERT` and hand back the written rows, database-generated
+/// columns (the serial key, `auto_now_add` stamps) filled in — the same result
+/// shape on every backend, whether or not it has `RETURNING`.
+///
+/// On PostgreSQL/SQLite the compiled statement is already `INSERT … RETURNING`,
+/// so one [`run_query`] reads the rows back. MySQL has no `RETURNING` (ADR 0018):
+/// the statement is a bare `INSERT`, so this runs it, works out the keys of the
+/// rows it wrote, and reloads them by primary key. Both steps run inside one
+/// [`db::atomic`] so they share a connection — `last_insert_id` is per-connection,
+/// and the reload must see the uncommitted rows.
+///
+/// How the keys are known depends on who supplies them. A serial/identity key
+/// ([`FieldMeta::is_database_generated`]) the database assigns: `last_insert_id`
+/// is the first and a single `INSERT` lays the block down contiguously, so the
+/// keys are `first .. first + affected`. A caller-supplied key — a `TEXT`
+/// primary key like the DBaaS `tenant_databases.addon_name` — is already in the
+/// `rows` the caller handed us, so those are the keys to reload by;
+/// `last_insert_id` is `0` for such an insert and must not be read as a key
+/// (ADR 0018 Inc. 2b follow-up). `rows` is the same column-value list that
+/// compiled `sql`, in the same order.
+pub async fn insert_returning(
+    meta: &'static ModelMeta,
+    sql: &compiler::Sql,
+    rows: &[Vec<(String, Value)>],
+) -> Result<Vec<Row>> {
+    if db::dialect().supports(compiler::Capability::Returning) {
+        return run_query(sql).await;
+    }
+
+    let pk = meta.primary_key().ok_or_else(|| {
+        Error::Config(format!(
+            "model `{}` has no primary key, so an insert cannot be read back without RETURNING",
+            meta.name
+        ))
+    })?;
+
+    db::atomic(|_tx| async move {
+        let (affected, first) = db::insert(&sql.text, &sql.params).await?;
+        if affected == 0 {
+            return Ok(Vec::new());
+        }
+        // The keys of the rows just written, to reload them by.
+        let ids: Vec<Value> = if pk.is_database_generated() {
+            // Serial/identity: the database assigned them. `last_insert_id` is
+            // the first; a single `INSERT` assigns the block contiguously.
+            (first..first + affected)
+                .map(|id| match pk.ty {
+                    crate::value::FieldType::I32 => Value::I32(id as i32),
+                    _ => Value::I64(id as i64),
+                })
+                .collect()
+        } else {
+            // Caller-supplied (a `TEXT` key, say): the keys are the ones the
+            // caller put in `rows`. `last_insert_id` is `0` here, so the serial
+            // block above would reload the wrong rows.
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .find(|(name, _)| name == pk.name)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| {
+                            Error::Config(format!(
+                                "model `{}` has a caller-supplied primary key `{}`, but the \
+                                 inserted row did not set it, so it cannot be read back",
+                                meta.name, pk.name
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut plan = compiler::Plan::new(meta);
+        plan.filters
+            .push(crate::expr::Q::many(format!("{}__in", pk.name), ids));
+        plan.order = vec![crate::expr::OrderBy {
+            path: pk.name.to_string(),
+            descending: false,
+        }];
+        let reload = compiler::compile_select_on(&plan, db::dialect())?;
+        // On the primary, on the transaction's pinned connection — not a replica.
+        db::fetch(&reload.text, &reload.params).await
+    })
+    .await
 }
 
 /// Run compiled SQL that returns rows, against whichever backend the DSN names.

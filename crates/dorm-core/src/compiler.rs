@@ -1177,7 +1177,9 @@ pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -
     compile_insert_on(meta, rows, Dialect::Postgres)
 }
 
-/// Compile an `INSERT … RETURNING *` for `dialect`.
+/// Compile an `INSERT` for `dialect`, with `RETURNING *` on a backend that has it
+/// (PostgreSQL, SQLite) and a bare `INSERT` on one that does not (MySQL), whose
+/// create path reads the written rows back by key instead (ADR 0018 Inc. 2b).
 pub fn compile_insert_on(
     meta: &'static ModelMeta,
     rows: &[Vec<(String, Value)>],
@@ -1222,20 +1224,26 @@ pub fn compile_insert_on(
         .map(|f| quote(f.column))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    // Everything comes back, so the caller gets database-generated columns —
-    // the serial primary key, `auto_now_add` defaults — without a second query.
-    let returning = meta
-        .columns()
-        .map(quote)
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
+    let table = quote(meta.table)?;
+    let values = tuples.join(", ");
+    // With `RETURNING` everything comes back, so the caller gets database-generated
+    // columns — the serial primary key, `auto_now_add` defaults — without a second
+    // query. A backend that lacks it (MySQL) gets a bare `INSERT`; the create path
+    // then reloads the written rows by their generated key in the same transaction
+    // (ADR 0018 Inc. 2b), which is why it must still carry `StatementKind::Write`.
+    let text = if dialect.supports(Capability::Returning) {
+        let returning = meta
+            .columns()
+            .map(quote)
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        format!("INSERT INTO {table} ({columns}) VALUES {values} RETURNING {returning}")
+    } else {
+        format!("INSERT INTO {table} ({columns}) VALUES {values}")
+    };
 
     Ok(Sql {
-        text: format!(
-            "INSERT INTO {} ({columns}) VALUES {} RETURNING {returning}",
-            quote(meta.table)?,
-            tuples.join(", ")
-        ),
+        text,
         params: binder.params,
         columns: meta
             .fields

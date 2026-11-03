@@ -1236,6 +1236,29 @@ pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
     }
 }
 
+/// Run an `INSERT` and report `(rows affected, first generated key)` — the verb
+/// the no-`RETURNING` create path uses to learn the keys the database assigned
+/// (ADR 0018 Inc. 2b). Must run inside the `atomic` that reloads the rows, since
+/// `last_insert_id` is per-connection. Only MySQL reaches it: PostgreSQL and
+/// SQLite have `RETURNING`, so their create path reads the row back in the
+/// `INSERT` itself and never calls this.
+// Without the `mysql` feature no arm consumes the arguments — the only backend
+// that reaches `insert` is MySQL.
+#[cfg_attr(not(feature = "mysql"), allow(unused_variables))]
+pub async fn insert(sql: &str, params: &[Value]) -> Result<(u64, u64)> {
+    match backend()? {
+        #[cfg(feature = "mysql")]
+        Backend::MySql => mysql::insert(sql, params).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
+        Backend::Postgres | Backend::Sqlite => Err(Error::Db(
+            "insert()-then-reload is only for a backend without RETURNING; \
+             this backend reads the written row back with INSERT … RETURNING"
+                .into(),
+        )),
+    }
+}
+
 // ------------------------------------------------------- raw SQL (ADR 0005)
 //
 // The sanctioned escape hatch for a query the compiler cannot build. Every
@@ -1771,10 +1794,11 @@ mod sqlite {
 /// Driver refactor. The non-scalar types travel as text/native values via
 /// [`value_to_mysql`]/the `mysql_*` decoders in [`crate::row`].
 ///
-/// Each new connection runs the `init` statements: **`ANSI_QUOTES`** so the
+/// Every connection checkout runs the `setup` statements: **`ANSI_QUOTES`** so the
 /// compiler's double-quoted identifiers are identifiers, not string literals;
 /// **`time_zone='+00:00'`** so a `DATETIME` round-trips a `DateTime<Utc>`; and
-/// **`utf8mb4`**.
+/// **`utf8mb4`**. They are `setup` rather than `init` so they are re-applied after
+/// the pool resets a reused connection.
 #[cfg(feature = "mysql")]
 mod mysql {
     use std::sync::{Arc, OnceLock};
@@ -1812,8 +1836,12 @@ mod mysql {
         let url = dsn()?;
         let opts = mysql_async::Opts::from_url(&url)
             .map_err(|e| Error::Config(format!("the MySQL DSN is not usable: {e}")))?;
-        let builder = mysql_async::OptsBuilder::from_opts(opts).init(vec![
-            // Append, never overwrite, so the server's strict mode is kept.
+        let builder = mysql_async::OptsBuilder::from_opts(opts).setup(vec![
+            // `setup`, not `init`: these run on every checkout, so they survive the
+            // pool's `COM_RESET_CONNECTION` on return. `init` runs only once at
+            // connect, and the reset then wipes `sql_mode` — a reused connection
+            // would lose `ANSI_QUOTES` and reject the compiler's `"ident"` quoting.
+            // Append the mode, never overwrite, so the server's strict mode is kept.
             "SET SESSION sql_mode=CONCAT(@@sql_mode, ',ANSI_QUOTES')".to_string(),
             "SET time_zone='+00:00'".to_string(),
             "SET NAMES utf8mb4".to_string(),
@@ -1880,7 +1908,6 @@ mod mysql {
     /// no-`RETURNING` path uses to find the generated keys. `last_insert_id` is
     /// per-connection, so this must run inside the transaction that then reloads
     /// the rows. Wired by the create path in ADR 0018 Inc. 2b.
-    #[allow(dead_code)]
     pub(super) async fn insert(sql: &str, params: &[Value]) -> Result<(u64, u64)> {
         let (text, params) = positional(sql, params);
         if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
@@ -2015,6 +2042,15 @@ mod mysql {
     }
 
     fn db_err(e: mysql_async::Error) -> Error {
+        // Record a server error's code in brackets, as `from_pg` records the
+        // PostgreSQL SQLSTATE, so `is_unique_violation` can recognise a duplicate
+        // key (`ER_DUP_ENTRY`, code 1062) without parsing mysql_async's `Display`.
+        if let mysql_async::Error::Server(ref se) = e {
+            return Error::Db(format!(
+                "ERROR [{}] ({}): {}",
+                se.code, se.state, se.message
+            ));
+        }
         Error::Db(e.to_string())
     }
 }
