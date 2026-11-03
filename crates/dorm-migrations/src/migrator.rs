@@ -303,6 +303,14 @@ pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
         db::execute(idx, &[]).await?;
     }
 
+    // Also non-transactional: evolve any enum that gained a variant (ADR 0046
+    // follow-up). `ALTER TYPE … ADD VALUE` is best run outside a transaction, and
+    // `IF NOT EXISTS` makes emitting it for every declared variant idempotent, so
+    // a pre-existing type simply gains the labels it was missing.
+    for stmt in ddl::alter_enum_types(models, backend) {
+        db::execute(&stmt, &[]).await?;
+    }
+
     Ok(changes)
 }
 

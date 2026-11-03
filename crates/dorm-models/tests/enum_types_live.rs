@@ -29,6 +29,17 @@ struct Order {
     status: String,
 }
 
+/// A ticket whose `status` enum the model has *grown* to three labels — used to
+/// prove `sync` evolves a pre-existing two-label type (ADR 0046 follow-up).
+#[derive(Model, Debug, Clone)]
+#[model(table = "l5_tickets", ordering = "id")]
+struct Ticket {
+    #[field(primary_key)]
+    id: i64,
+    #[field(enum_type = "ticket_status", enum_variants = "open, closed, archived")]
+    status: String,
+}
+
 fn dsn() -> Option<String> {
     std::env::var("DELONIX_ORM_TEST_DSN")
         .ok()
@@ -138,5 +149,64 @@ fn the_database_enforces_the_enum_labels() {
         );
 
         eprintln!("ok: the native enum type enforces its labels and sync is idempotent");
+    });
+}
+
+#[test]
+#[ignore = "needs a Postgres (DELONIX_ORM_TEST_DSN)"]
+fn sync_evolves_an_enum_that_grew_a_variant() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipped: DELONIX_ORM_TEST_DSN is not set");
+        return;
+    };
+    std::env::set_var(dorm_core::db::DSN_ENV, &dsn);
+
+    runtime().block_on(async {
+        dorm_core::db::execute("DROP TABLE IF EXISTS l5_tickets", &[])
+            .await
+            .expect("clean table");
+        dorm_core::db::execute("DROP TYPE IF EXISTS ticket_status", &[])
+            .await
+            .expect("clean type");
+
+        // The type pre-exists with only TWO labels — the state before the model
+        // grew a third (`archived`).
+        dorm_core::db::execute("CREATE TYPE ticket_status AS ENUM ('open', 'closed')", &[])
+            .await
+            .expect("pre-existing two-label enum");
+
+        // `sync` sees the type exists (skips CREATE TYPE) and then adds the missing
+        // label via `ALTER TYPE … ADD VALUE IF NOT EXISTS`, and creates the table.
+        dorm_migrations::sync(&[Ticket::meta()])
+            .await
+            .expect("sync evolves the enum and creates the table");
+
+        // The grown label now exists: a row using it inserts.
+        Ticket::objects()
+            .create(NewTicket {
+                status: "archived".into(),
+            })
+            .await
+            .expect("the added label 'archived' is now valid");
+
+        // The type carries all three labels, in order.
+        let labels: Vec<String> = dorm_core::db::query(
+            "SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+             WHERE t.typname = 'ticket_status' ORDER BY e.enumsortorder",
+            &[],
+        )
+        .await
+        .expect("pg_enum")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+        assert_eq!(labels, vec!["open", "closed", "archived"]);
+
+        // A second sync is a no-op on the fully-grown type (ADD VALUE IF NOT EXISTS).
+        dorm_migrations::sync(&[Ticket::meta()])
+            .await
+            .expect("second sync is idempotent");
+
+        eprintln!("ok: sync grew the enum from {{open, closed}} to {{open, closed, archived}}");
     });
 }

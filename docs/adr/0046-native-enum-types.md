@@ -62,6 +62,18 @@ DDL — `Value` não ganha variante nenhuma:
     adiamento de índice composto incremental ([[0044]]).
   - **MySQL `ENUM(...)` nativo** — guardamos `TEXT` em MySQL/SQLite por agora.
 
+## Follow-up landed
+
+**`ALTER TYPE … ADD VALUE`** — um enum que *cresce* um rótulo é evoluído pelo
+`sync`: `ddl::alter_enum_types` emite `ALTER TYPE {name} ADD VALUE IF NOT EXISTS
+'{label}'` por cada variante declarada (idempotente — um rótulo já presente é
+no-op), corrido **fora da transação** (como os índices), simétrico ao
+`create_enum_types`. Só acrescenta (reordenar/remover não é expressável em
+PostgreSQL). Prova live (`enum_types_live.rs::sync_evolves_an_enum_that_grew_a_variant`):
+um tipo pré-existente com `{open, closed}` passa a `{open, closed, archived}` após
+`sync`, e uma linha com o rótulo novo insere. Continua de fora: a emissão de
+`CREATE TYPE`/`ALTER TYPE` nos ficheiros do `migrate` **versionado** (autodetector).
+
 ## Proof
 
 - **Unit (offline, `enum_types_live.rs::the_enum_type_resolves_and_the_ddl_creates_and_uses_it`):**

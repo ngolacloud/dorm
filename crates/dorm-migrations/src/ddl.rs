@@ -99,6 +99,30 @@ pub fn create_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec
         .collect()
 }
 
+/// `ALTER TYPE … ADD VALUE IF NOT EXISTS` for every declared enum variant, so an
+/// enum that pre-exists with fewer labels gains the ones a model added (ADR 0046
+/// follow-up). Idempotent — a label already present is a no-op — and best run
+/// **outside a transaction**, which `sync` does. Postgres-only (SQLite/MySQL store
+/// the column as `TEXT`, so there is no type to alter); returns empty otherwise.
+///
+/// `ADD VALUE` only appends a label; reordering or removing a variant is not
+/// expressible in PostgreSQL and stays out of scope.
+pub fn alter_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (name, variants) in dorm_core::meta::enum_types_of(models) {
+        for v in variants {
+            let label = v.replace('\'', "''");
+            out.push(format!(
+                "ALTER TYPE {name} ADD VALUE IF NOT EXISTS '{label}'"
+            ));
+        }
+    }
+    out
+}
+
 /// `CREATE TABLE …` for PostgreSQL. See [`create_table_on`] for another backend.
 pub fn create_table(meta: &ModelMeta) -> Result<String> {
     create_table_on(meta, Backend::Postgres)
