@@ -1,0 +1,37 @@
+[package]
+name = "dorm-mcp"
+# Independent line: the MCP server is an optional product on top of the core
+# (ADR 0020), pre-1.0.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "A native Model Context Protocol server over your DORM models — tools and resources generated from the registry, with the same tenant isolation and safety as the ORM (ADR 0020)."
+readme = "README.md"
+keywords = ["orm", "mcp", "ai", "agent", "postgres"]
+categories = ["database"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+# dorm-core for the dynamic query path and the registry; dorm-rag for
+# semantic_search and RAG-awareness in `describe_model`. Neither depends back on
+# dorm-mcp. No `rmcp`: the stdio transport is JSON-RPC 2.0 over serde_json (see
+# ADR 0020), so this builds offline at MSRV 1.75 with a tiny tree.
+[dependencies]
+dorm-core = { version = "0.6", path = "../dorm-core" }
+dorm-rag = { version = "0.1", path = "../dorm-rag" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+# The live MCP proof links a model and indexes it, then drives the server.
+dorm-derive = { path = "../dorm-derive" }
+dorm-migrations = { path = "../dorm-migrations" }
+dorm-rag = { path = "../dorm-rag", features = ["embed-ollama"] }

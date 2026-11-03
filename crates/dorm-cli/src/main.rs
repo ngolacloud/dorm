@@ -148,6 +148,20 @@ enum CliCommand {
         #[command(subcommand)]
         action: ApiAction,
     },
+    /// Optional RAG (ADR 0019): index models in pgvector and run the worker.
+    /// `dorm rag generate` writes `src/bin/rag.rs`; `worker`/`status`/`reindex`
+    /// build and run it. Needs `dorm-rag` in your Cargo.toml.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
+    /// Optional MCP server (ADR 0020): expose your models to an agent as tools and
+    /// resources. `dorm mcp generate` writes `src/bin/mcp.rs`; run it with
+    /// `cargo run --bin mcp -- --transport stdio`. Needs `dorm-mcp` in Cargo.toml.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Create an administrator account (`is_superuser`), Django-style. Native —
     /// writes a hashed password into the `orm_accounts` table (created on demand),
     /// never the plaintext. Prompts without echo; `--password`/`--password-stdin`
@@ -241,6 +255,46 @@ enum ApiAction {
 }
 
 #[derive(Subcommand)]
+enum McpAction {
+    /// Write `src/bin/mcp.rs` — a native MCP server over your models (ADR 0020).
+    /// Needs `dorm-mcp` in Cargo.toml.
+    Generate {
+        /// Where to write the MCP binary.
+        #[arg(long, default_value = "src/bin/mcp.rs")]
+        out: String,
+    },
+    /// Build and run the MCP server over stdio. (`cargo run --bin mcp`.)
+    Serve,
+}
+
+#[derive(Subcommand)]
+enum RagAction {
+    /// Write `src/bin/rag.rs` — the RAG worker/status/reindex over your models
+    /// (ADR 0019). Needs `dorm-rag` in Cargo.toml with an embedder feature.
+    Generate {
+        /// Where to write the RAG binary.
+        #[arg(long, default_value = "src/bin/rag.rs")]
+        out: String,
+    },
+    /// Drain `dorm_rag_outbox`, embedding changed chunks, until stopped.
+    /// (`cargo run --bin rag -- worker`.)
+    Worker,
+    /// Show index health per model: indexed, pending, dead-letter, embedder.
+    /// (`cargo run --bin rag -- status`; `--json`.)
+    Status,
+    /// Enqueue records for re-indexing; scope with `--model`/`--tenant`.
+    /// (`cargo run --bin rag -- reindex`.)
+    Reindex {
+        /// Only this model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Only this tenant (a tenant-scoped model).
+        #[arg(long)]
+        tenant: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum StudioAction {
     /// Write `src/bin/studio.rs` — a typed Studio over your models, run with
     /// `cargo run --bin studio`. Native; `dorm init` already writes it, so this
@@ -304,11 +358,26 @@ enum MigrateAction {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Roll the schema back to a version, undoing every migration applied after
+    /// it in reverse order — Django's `migrate <app> <version>` backwards. Each
+    /// crossed migration's recorded `down` is run and its ledger row removed, in
+    /// one transaction. A migration that dropped a column or changed a type is
+    /// **not reversible** and stops the revert by name rather than losing data.
+    Down {
+        /// Revert down to (and keeping) this version. `0` undoes everything. The
+        /// operator must name it — there is no default and no "one step".
+        to: i64,
+    },
     /// Show which migration versions the database has recorded as applied.
     Status,
     /// Show the additive changes `push` would apply, without touching the
     /// database. Read-only. (`cargo run --bin diff`.)
     Diff,
+    /// Scan the migrations in `migrations/` for operations that are unsafe under a
+    /// rolling upgrade (data loss, long exclusive locks, non-concurrent indexes,
+    /// renames) and exit non-zero on a dangerous one — a CI gate (ADR 0022). A
+    /// pure files operation: no database, no compiled models.
+    Lint,
 }
 
 #[derive(Subcommand)]
@@ -414,7 +483,7 @@ fn main() -> ExitCode {
         } => scaffold::new_model(&name).map(|()| 0),
         CliCommand::Generate { schema, out } => scaffold::generate(&schema, &out).map(|()| 0),
         CliCommand::Format { schema, check } => scaffold::format(&schema, check),
-        CliCommand::Validate => cargo_run("validate", json),
+        CliCommand::Validate => validate(json),
         CliCommand::Doctor => on_runtime(doctor(json)),
         CliCommand::Migrate { action } => match action.unwrap_or(MigrateAction::Deploy) {
             MigrateAction::Make { name } => cargo_run_args("makemigration", &[&name], false),
@@ -423,8 +492,10 @@ fn main() -> ExitCode {
             MigrateAction::Resolve { version, name } => {
                 on_runtime(migrate_resolve(version, name, json))
             }
+            MigrateAction::Down { to } => on_runtime(migrate_down(to, json)),
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
+            MigrateAction::Lint => migrate_lint(json),
         },
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
@@ -442,6 +513,28 @@ fn main() -> ExitCode {
                 scaffold::api_generate(&schema, &out).map(|()| 0)
             }
             ApiAction::Serve => cargo_run("api", false),
+        },
+        CliCommand::Rag { action } => match action {
+            RagAction::Generate { out } => scaffold::rag_generate(&out).map(|()| 0),
+            RagAction::Worker => cargo_run_args("rag", &["worker"], false),
+            RagAction::Status => cargo_run_args("rag", &["status"], json),
+            RagAction::Reindex { model, tenant } => {
+                let mut args = vec!["reindex".to_string()];
+                if let Some(m) = model {
+                    args.push("--model".to_string());
+                    args.push(m);
+                }
+                if let Some(t) = tenant {
+                    args.push("--tenant".to_string());
+                    args.push(t);
+                }
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                cargo_run_args("rag", &refs, false)
+            }
+        },
+        CliCommand::Mcp { action } => match action {
+            McpAction::Generate { out } => scaffold::mcp_generate(&out).map(|()| 0),
+            McpAction::Serve => cargo_run_args("mcp", &["--transport", "stdio"], false),
         },
         CliCommand::Createsuperuser {
             username,
@@ -510,6 +603,25 @@ fn on_runtime(fut: impl std::future::Future<Output = CliResult>) -> CliResult {
         .enable_all()
         .build()?
         .block_on(fut)
+}
+
+/// `dorm validate` — two passes, cheapest first.
+///
+/// 1. **Schema level** (native, no build, no database): parse `dorm.schema` and
+///    run `dorm_schema::validate`, which includes the ADR 0019 `@@rag` checks.
+///    If it finds errors, stop and surface exit `3` — no point building a project
+///    whose schema is already wrong.
+/// 2. **Registry level** (the cargo lane): build and run the project's `validate`
+///    binary, which links the models and runs `registry::validate` (and
+///    `dorm_rag::validate` when the project uses RAG).
+///
+/// A project with no `dorm.schema` (hand-written models) simply skips pass 1.
+fn validate(json: bool) -> CliResult {
+    let code = scaffold::validate_schema("dorm.schema")?;
+    if code != 0 {
+        return Ok(code);
+    }
+    cargo_run("validate", json)
 }
 
 /// The cargo lane: build and run one of the project's binaries, forwarding
@@ -747,6 +859,84 @@ async fn migrate_status(json: bool) -> CliResult {
         println!("  v{version:<4} {name:<24} {}", applied_at(applied_unix));
     }
     Ok(0)
+}
+
+/// `dorm migrate down <to>`: roll the recorded chain back to version `to`.
+///
+/// It reads the on-disk history in `migrations/` — which carries each migration's
+/// `down` — converts it to runnable migrations, and hands them to
+/// [`dorm_migrations::revert`], which undoes every applied version above `to` in
+/// one transaction, refusing by name at the first irreversible one. A history
+/// with no files has nothing to reverse, which is an error, not a silent no-op.
+async fn migrate_down(to: i64, json: bool) -> CliResult {
+    let recorded = dorm_migrations::History::open("migrations")
+        .load()
+        .map_err(|e| format!("reading the migrations/ history: {e}"))?;
+    if recorded.is_empty() {
+        return Err("no migrations recorded in migrations/, so there is nothing to revert".into());
+    }
+    let migrations: Vec<dorm_migrations::Migration> =
+        recorded.iter().map(|m| m.to_migration()).collect();
+
+    let undone = dorm_migrations::revert(&migrations, to)
+        .await
+        .map_err(|e| format!("reverting to v{to}: {e}"))?;
+
+    if json {
+        println!("{}", json!({ "reverted": undone, "to": to }));
+    } else if undone.is_empty() {
+        println!("nothing to revert — the database is already at or below v{to}.");
+    } else {
+        println!("reverted to v{to}:");
+        for v in &undone {
+            println!("  undid v{v}");
+        }
+    }
+    Ok(0)
+}
+
+/// `dorm migrate lint`: scan `migrations/` for rolling-upgrade hazards (ADR 0022).
+///
+/// Pure files, no database and no compiled models — the same on-disk history
+/// `migrate down` reads. Exits `1` when a `Dangerous` finding is present, so CI
+/// stops a data-losing or table-rewriting migration before it ships.
+fn migrate_lint(json: bool) -> CliResult {
+    let recorded = dorm_migrations::History::open("migrations")
+        .load()
+        .map_err(|e| format!("reading the migrations/ history: {e}"))?;
+    let migrations: Vec<dorm_migrations::Migration> =
+        recorded.iter().map(|m| m.to_migration()).collect();
+    let findings = dorm_migrations::lint::lint(&migrations);
+    let blocking = dorm_migrations::lint::has_blocking(&findings);
+
+    if json {
+        let arr: Vec<_> = findings
+            .iter()
+            .map(|f| {
+                json!({
+                    "version": f.version,
+                    "severity": f.severity.label(),
+                    "message": f.message,
+                    "statement": f.statement,
+                })
+            })
+            .collect();
+        println!("{}", json!({ "findings": arr, "blocking": blocking }));
+    } else if findings.is_empty() {
+        println!(
+            "migrate lint: no issues across {} migration(s).",
+            migrations.len()
+        );
+    } else {
+        for f in &findings {
+            println!("[{}] v{}: {}", f.severity.label(), f.version, f.message);
+            println!("    {}", f.statement);
+        }
+        if blocking {
+            eprintln!("migrate lint: dangerous operation(s) found — see above.");
+        }
+    }
+    Ok(if blocking { 1 } else { 0 })
 }
 
 /// The migrations ledger, matching `dorm_migrations::migrator` (kept out of its
@@ -1216,11 +1406,13 @@ fn render_pg_cell(full: &Row, idx: usize) -> Result<String, Box<dyn std::error::
         Type::BOOL => FieldType::Bool,
         Type::INT4 => FieldType::I32,
         Type::INT8 => FieldType::I64,
+        Type::FLOAT8 => FieldType::F64,
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => FieldType::Text,
         Type::NUMERIC => FieldType::Decimal,
         Type::TIMESTAMP | Type::TIMESTAMPTZ => FieldType::Timestamp,
         Type::UUID => FieldType::Uuid,
         Type::JSON | Type::JSONB => FieldType::Json,
+        Type::BYTEA => FieldType::Bytes,
         _ => {
             // Outside the ORM's set. Text is the escape a SELECT can always take,
             // and the error names how: `col::text`.

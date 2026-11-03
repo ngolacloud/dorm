@@ -97,18 +97,21 @@ fn a_whole_autodetected_chain_deploys_in_order_and_is_idempotent() {
         version: 1,
         name: "initial".into(),
         statements: autodetect(&s0, &[v1], Backend::Sqlite).unwrap(),
+        down: vec![],
     };
     let s1 = Snapshot::from_models(&[v1]);
     let m2 = Migration {
         version: 2,
         name: "add_body".into(),
         statements: autodetect(&s1, &[v2], Backend::Sqlite).unwrap(),
+        down: vec![],
     };
     let s2 = Snapshot::from_models(&[v2]);
     let m3 = Migration {
         version: 3,
         name: "add_note".into(),
         statements: autodetect(&s2, &[v3], Backend::Sqlite).unwrap(),
+        down: vec![],
     };
     let chain = vec![m1, m2, m3];
 

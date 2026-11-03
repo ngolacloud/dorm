@@ -1,0 +1,24 @@
+[package]
+name = "dorm-eventstore"
+# Independent line: the event store is an optional product on top of the core
+# (ADR 0039), on its own cadence. Pre-1.0.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Optional PostgreSQL event store for DORM: append-only per-aggregate event streams with optimistic-concurrency append, aggregate snapshots for fast rebuild, and event-version upcasting on load (ADR 0039)."
+keywords = ["orm", "event-sourcing", "eventstore", "cqrs", "postgres"]
+categories = ["database"]
+
+# One-way dependency on dorm-core: the core never depends on dorm-eventstore, so a
+# project that does not use it sees an unchanged dorm-core graph (ADR 0039).
+[dependencies]
+dorm-core = { version = "0.6", path = "../dorm-core" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

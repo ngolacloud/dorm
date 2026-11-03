@@ -17,10 +17,29 @@ generate`, Prisma-faithful syntax, [ADR 0001](adr/0001-declarative-schema.md),
 `QuerySet` (ADR 0001's corollary), proven serving live JSON (create → 201,
 update, delete → 204, 404 on a missing id).
 
-Next on this front: typed request/response schemas (today the write body is a
-dynamic JSON object), pagination metadata and filtering on list endpoints, then
-`db pull` (introspect → schema) and `format` (pretty-print the schema), which the
-schema file now makes tractable.
+> **Boundary note ([ADR 0054](adr/0054-orm-boundary.md)):** a generated HTTP API
+> is a service-layer concern, not the ORM's. `dorm api` is slated to **move out**
+> of DORM to the framework layer — deprecated in 0.3, removed in 0.4 — where it
+> is generated from facades, not tables. It keeps working until then; new HTTP
+> work does not happen here. The remaining ORM-side follow-ups below are the
+> ones that stay: `db pull` and `format`.
+
+Next on this front: `db pull` (introspect → schema) and `format` (pretty-print
+the schema), which the schema file now makes tractable.
+
+## The ORM boundary (ADR 0054)
+
+DORM is the data-source layer — one database, one transaction, one process.
+[ADR 0054](adr/0054-orm-boundary.md) fixes which capabilities stay and which
+move to a framework built on top: a capability enters DORM only if a plain
+command-line user with no server and no other services would need it, **and** its
+guarantee comes from a database transaction. Leaving for the layer above, with
+git history preserved: the message-broker clients, the generated REST API, user
+accounts, the looping RAG worker, the MCP HTTP transport, and command/query
+*dispatch* (the read/write routing mechanism stays). Staying, as optional crates
+that implement the ports that layer owns: the outbox, jobs/leases, the event
+store, and idempotency keys. The dependency is one-way — a framework depends on
+DORM, never the reverse.
 
 ## Guiding rules
 
@@ -137,6 +156,64 @@ administrator, and non-interactive operation over secure channels.
 - A per-backend behaviour note for identifiers/quoting, case/collation, nulls,
   booleans/decimals/timestamps, generated IDs, upsert, pagination,
   locks/isolation, transactional DDL, constraints, and cancellation/timeouts.
+
+## Phase 8 — AI: RAG and a native MCP server (optional crates)
+
+Two **optional** crates on top of the core, so a project that does not use them
+gains no new dependency and an unchanged `dorm-core` graph — the same discipline
+as the accounts adapter.
+
+- **`dorm-rag`** ([ADR 0019](adr/0019-rag.md)). A model marked `#[derive(Rag)]`
+  (or `@@rag(..)` in `dorm.schema`) is indexed in pgvector and gains semantic and
+  hybrid search with the **same filters and the same tenant isolation** as any
+  query. Change capture is a database **trigger** writing an outbox, so every
+  write path — typed, `:raw`, `dorm db execute`, Studio, `db seed`, `psql` — is
+  indexed and the core write path is untouched. A worker drains the outbox
+  (`SKIP LOCKED`), re-embedding only changed chunks. Search pre-filters through
+  the one compiler — the vector is a bound `$n::vector`, the `Value` enum gains no
+  variant. Embedders are feature-gated: `embed-local` (ONNX, default, data stays
+  on the host), `embed-ollama`, `embed-openai-compat`. SQLite is an explicit
+  capability error, never a silent non-vector fallback. Bricks: **(1) declaration
+  — `RagMeta`, `#[derive(Rag)]`, `@@rag`, `dorm validate` ✅**, **(2) migrations
+  (extension, shadow tables, outbox, HNSW + GIN, enqueue triggers) ✅ — generated
+  by `dorm_rag::migrations`, snapshot-tested and proven live on pgvector:pg16;
+  flows through `migrate deploy` by appending to a `Migration`'s statements**,
+  **(3) worker + `dorm rag status|reindex|worker` ✅ — outbox drain with
+  `SKIP LOCKED`, SAVEPOINT-isolated per record, hash/embedder staleness, retries +
+  dead-letter; proven live on pgvector + Ollama `all-minilm` (semantic search
+  returns the right record)**, **(4) the `Embedder` trait ✅ + backends —
+  `embed-local` ✅ (ONNX on the host via `fastembed`, `all-MiniLM-L6-v2`, proven
+  live — download-once then offline, semantically sane), `embed-ollama` ✅,
+  `embed-openai-compat` ✅ (any `/v1/embeddings`, proven live against Ollama's
+  OpenAI shim)**,
+  **(5) typed `RagQuerySetExt` (`semantic/hybrid/min_score/search`) + dynamic
+  `semantic_search` ✅ — compiler-reused pre-filtering (vector bound as
+  `$n::text::vector`, subquery params first so no renumbering), RRF hybrid, SQL
+  snapshot tests, and a live tenant-isolation proof on pgvector + Ollama**,
+  **(6) the REPL `search` verb and `:rag` ✅ (in `dorm-shell`; the `dorm rag` CLI
+  landed in brick 3).**
+
+- **`dorm-mcp`** ([ADR 0020](adr/0020-mcp-server.md)). A native MCP server that
+  exposes the registry as tools and resources, generated into the project with
+  `dorm mcp generate` (so it links the models), over the official `rmcp` SDK. Read
+  tools (`list_models`, `describe_model`, `query`, `get`, `count`, `aggregate`,
+  `semantic_search`) are generated from `FieldMeta`; write tools (`insert`,
+  `update`, `delete`) appear only with `--write`, each with `dry_run`, a row cap,
+  and a refusal of unfiltered mutations. **No raw SQL is exposed.** Security is the
+  design: read-only by default behind the core's `guard_write`, the tenant from
+  the credential (never a tool argument), loopback-only by default, allow/deny
+  lists, limits reusing `DELONIX_ORM_STATEMENT_TIMEOUT_MS`, a `tracing` audit event
+  per call, and record/RAG text delimited as untrusted on the way out. Bricks:
+  **(1) the read-only server + `dorm mcp generate` ✅ — JSON-RPC 2.0 over stdio
+  (no `rmcp`; see ADR 0020), the seven read tools generated from `FieldMeta`,
+  resources, prompts; tenant forced from config; proven live over the protocol on
+  pgvector + Ollama (semantic_search → query, tenant isolation)**, **(2) writes
+  ✅ — `insert`/`update`/`delete` only with `--write`, each with `dry_run`
+  (SQL+params+affected preview), a row cap, and a refused unfiltered mutation;
+  HTTP transport ✅ with bearer auth (tenant+scope from the token), loopback
+  default and a rate limit; a `dorm::mcp` audit event per call (no secrets).
+  Proven live (write tools, tenant forced on insert, cap, HTTP 401/200). The
+  full OAuth 2.1 authorization server and MCP SSE framing remain a follow-up.**
 
 ## Phase 7 — Guides and the proof journey
 

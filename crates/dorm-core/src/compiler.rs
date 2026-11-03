@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use crate::error::{Error, Result};
 use crate::expr::{Aggregate, Assignment, OrderBy, Predicate, F, Q};
 use crate::lookup::Lookup;
-use crate::meta::ModelMeta;
+use crate::meta::{FieldMeta, ModelMeta};
 use crate::registry::{self, Join, Resolved};
 use crate::value::{FieldType, Value};
 
@@ -35,12 +35,27 @@ pub struct ColumnSpec {
     pub ty: FieldType,
 }
 
+/// Whether a compiled statement only reads, or writes.
+///
+/// The executor routes by this: a [`Read`](StatementKind::Read) may run on a
+/// read replica when one is configured, while a [`Write`](StatementKind::Write)
+/// — including an `INSERT … RETURNING`, which returns rows yet still writes —
+/// always runs on the primary. It is the compiler, not a guess from the SQL
+/// text, that classifies this: the one place that knows for certain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Read,
+    Write,
+}
+
 /// Compiled SQL, its parameters in binding order, and how to read the result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sql {
     pub text: String,
     pub params: Vec<Value>,
     pub columns: Vec<ColumnSpec>,
+    /// Read or write, for replica routing. See [`StatementKind`].
+    pub kind: StatementKind,
 }
 
 /// What a `QuerySet` accumulates, and all the compiler needs.
@@ -71,6 +86,18 @@ pub struct Plan {
     pub annotations: Vec<Aggregate>,
     /// Explicit output columns: field paths, or annotation aliases.
     pub values: Vec<String>,
+    /// Keyset pagination boundary (ADR 0024): the ordering-key values of the last
+    /// row of the previous page, in effective-order order (the `order` terms, then
+    /// the primary key appended as a tiebreak). When set, the compiler adds the
+    /// strict "row after this one" predicate and appends the PK to `ORDER BY` so
+    /// the ordering is total. Decoded from a signed cursor by the `QuerySet`.
+    pub keyset: Option<Vec<Value>>,
+    /// Set by `QuerySet::fetch_page`: the query is being keyset-paginated, so the
+    /// primary-key tiebreak is appended to the ordering **from the first page**
+    /// (not only once a cursor exists) — otherwise rows with an equal sort key
+    /// could be skipped between pages. Non-paginated queries leave it `false` and
+    /// their ordering is unchanged.
+    pub paginate: bool,
 }
 
 impl Plan {
@@ -87,7 +114,40 @@ impl Plan {
             select_related: Vec::new(),
             annotations: Vec::new(),
             values: Vec::new(),
+            keyset: None,
+            paginate: false,
         }
+    }
+
+    /// The effective ordering: the explicit `order`, or the model's declared
+    /// ordering, with the primary key appended as a final tiebreak **when the
+    /// query is being keyset-paginated** so the order is total and the cursor
+    /// predicate is unambiguous. Non-paginated queries are unchanged (no snapshot
+    /// churn).
+    pub(crate) fn effective_order(&self) -> Vec<OrderBy> {
+        let mut terms: Vec<OrderBy> = if self.order.is_empty() {
+            self.model
+                .ordering
+                .iter()
+                .map(|s| OrderBy::parse(s))
+                .collect()
+        } else {
+            self.order.clone()
+        };
+        if self.paginate || self.keyset.is_some() {
+            if let Some(pk) = self.model.primary_key() {
+                if !terms.iter().any(|t| t.path == pk.name) {
+                    // Match the last term's direction so the tiebreak reads
+                    // naturally with it; default ascending when there are none.
+                    let descending = terms.last().is_some_and(|t| t.descending);
+                    terms.push(OrderBy {
+                        path: pk.name.to_string(),
+                        descending,
+                    });
+                }
+            }
+        }
+        terms
     }
 
     fn annotation(&self, alias: &str) -> Option<&Aggregate> {
@@ -125,23 +185,131 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// The SQL dialect a plan is compiled for. Only the placeholder style (`$n` vs
-/// `?n`) and case-insensitive `LIKE` differ between the two today; identifiers,
-/// joins and clause structure are shared (ADR 0002). PostgreSQL is the default,
-/// so every existing caller and every snapshot is unchanged.
+/// The SQL dialect a plan is compiled for. The placeholder style, case-insensitive
+/// `LIKE`, and `now()` spelling differ between backends; identifiers, joins and
+/// clause structure are shared (ADR 0002). PostgreSQL is the default, so every
+/// existing caller and every snapshot is unchanged.
+///
+/// `MySql` is the dialect *profile* for the forthcoming MySQL backend (ADR 0011
+/// Phase 2.2): its capabilities and its simple dialect choices are declared here,
+/// so the capability matrix and the SQL shape are settled before the driver lands.
+/// The one thing still to wire is positional parameters — MySQL binds a bare `?`
+/// by order, not the numbered `$n`/`?n` the compiler renumbers today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,
     Sqlite,
+    MySql,
 }
 
+/// A backend feature DORM relies on but cannot assume every engine has (ADR
+/// 0011). The core asks [`Dialect::supports`] before it emits something a backend
+/// lacks, so partial support is **honest**: a backend without a capability gets a
+/// documented degradation or a named refusal, never silently-wrong SQL. As
+/// backends are added (MySQL, SQL Server, Oracle…) each declares its answer here,
+/// in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// `INSERT`/`UPDATE`/`DELETE … RETURNING` — read the written row back in the
+    /// same statement. Absent on MySQL/Oracle, which need a second round trip.
+    Returning,
+    /// Nested transactions via `SAVEPOINT`, which is how `atomic` nests.
+    Savepoints,
+    /// DDL participates in a transaction (so a failed migration step rolls back).
+    /// False on MySQL, where most DDL auto-commits.
+    DdlInTransaction,
+    /// `CREATE INDEX CONCURRENTLY` — build an index without locking writes.
+    ConcurrentIndex,
+    /// A real boolean column type, rather than an integer/`BIT` stand-in.
+    NativeBoolean,
+    /// A dedicated case-insensitive `ILIKE` operator (versus folding to `LIKE`).
+    IlikeOperator,
+}
+
+// Everything a dialect decides differently lives here, as methods on `Dialect` —
+// not as `match`es scattered through the compiler. Adding a SQL backend (ADR
+// 0011) is adding an arm to each of these, in one place, which is what keeps the
+// fan-out to MySQL/MSSQL/Cockroach/Oracle tractable.
 impl Dialect {
     /// The case-insensitive pattern operator: PostgreSQL's `ILIKE`, or `LIKE` on
     /// SQLite (whose `LIKE` is already case-insensitive for ASCII).
     fn ilike(self) -> &'static str {
         match self {
             Dialect::Postgres => "ILIKE",
-            Dialect::Sqlite => "LIKE",
+            // SQLite's and MySQL's `LIKE` are case-insensitive under their default
+            // collations, so neither needs a dedicated operator.
+            Dialect::Sqlite | Dialect::MySql => "LIKE",
+        }
+    }
+
+    /// The character that introduces a bound-parameter placeholder: `$` on
+    /// PostgreSQL (`$1`), `?` on SQLite (`?1`) and MySQL (`?`). Numbered on
+    /// Postgres/SQLite, which is what lets [`shift_placeholders`] renumber a
+    /// subquery's parameters.
+    fn placeholder_marker(self) -> char {
+        match self {
+            Dialect::Postgres => '$',
+            Dialect::Sqlite | Dialect::MySql => '?',
+        }
+    }
+
+    /// A bound-parameter placeholder for binding position `n` (1-based).
+    ///
+    /// **Numbered on every dialect, MySQL included.** MySQL ultimately binds a
+    /// bare positional `?`, but numbering it here (`?1`, `?2`) is what keeps the
+    /// compiler's one invariant intact: a `SELECT` with `HAVING` binds the HAVING
+    /// parameter before the WHERE one, so bind-order ≠ textual order, and a bare
+    /// `?` would then bind the values in the wrong slots. The number disambiguates
+    /// during compilation and `shift_placeholders` can renumber a subquery; the
+    /// numbered `?n` is converted to the bare positional `?` — reordering the
+    /// parameter vector by textual appearance — once, in the MySQL driver, by
+    /// [`positionalize`]. See ADR 0018.
+    fn placeholder(self, n: usize) -> String {
+        format!("{}{n}", self.placeholder_marker())
+    }
+
+    /// Whether this dialect binds a bare positional `?` (by order), rather than a
+    /// numbered placeholder. True only for MySQL; the executor (its driver) then
+    /// runs [`positionalize`] on the compiled SQL before sending it.
+    pub fn positional_unnumbered(self) -> bool {
+        matches!(self, Dialect::MySql)
+    }
+
+    /// The SQL expression for "now", used to refresh `auto_now` columns on write.
+    fn now(self) -> &'static str {
+        match self {
+            // `now()` is PostgreSQL's and MySQL's spelling alike.
+            Dialect::Postgres | Dialect::MySql => "now()",
+            Dialect::Sqlite => "CURRENT_TIMESTAMP",
+        }
+    }
+
+    /// Whether this dialect's backend has `cap`. The single source of truth for
+    /// what a backend can do (ADR 0011); the core consults it before emitting a
+    /// feature not every engine has.
+    pub fn supports(self, cap: Capability) -> bool {
+        use Capability::*;
+        match self {
+            // PostgreSQL (and the PG-wire CockroachDB) has all of these.
+            Dialect::Postgres => true,
+            Dialect::Sqlite => match cap {
+                // SQLite ≥ 3.35 has RETURNING and SAVEPOINT, and its DDL is
+                // transactional.
+                Returning | Savepoints | DdlInTransaction => true,
+                // No `CONCURRENTLY`, no dedicated boolean, no `ILIKE` keyword
+                // (its `LIKE` is already case-insensitive for ASCII).
+                ConcurrentIndex | NativeBoolean | IlikeOperator => false,
+            },
+            Dialect::MySql => match cap {
+                // MySQL has SAVEPOINT, but no `RETURNING` (a write reads the row
+                // back via `last_insert_id`), most DDL auto-commits (no DDL in a
+                // transaction), there is no `CREATE INDEX CONCURRENTLY`, a boolean
+                // is `TINYINT(1)`, and there is no `ILIKE` keyword.
+                Savepoints => true,
+                Returning | DdlInTransaction | ConcurrentIndex | NativeBoolean | IlikeOperator => {
+                    false
+                }
+            },
         }
     }
 }
@@ -164,10 +332,7 @@ impl Binder {
     /// SQLite.
     fn bind(&mut self, v: Value) -> String {
         self.params.push(v);
-        match self.dialect {
-            Dialect::Postgres => format!("${}", self.params.len()),
-            Dialect::Sqlite => format!("?{}", self.params.len()),
-        }
+        self.dialect.placeholder(self.params.len())
     }
 }
 
@@ -243,8 +408,19 @@ fn compile_predicate(
         alias,
         field,
         lookup,
+        json_path,
     } = registry::resolve(plan.model, &p.path)?;
     joins.absorb(path_joins);
+
+    // A reach into a JSONB document (`spec__cpu__gte`): extract the path as text
+    // with each segment bound, cast to the comparison type the value implies, and
+    // compare. The document has no declared type for the path, so the value's type
+    // is what the cast follows.
+    if !json_path.is_empty() {
+        return compile_json_predicate(
+            &alias, field, &json_path, lookup, &p.path, &p.values, binder,
+        );
+    }
 
     // A foreign key compared without traversing it is compared on its own
     // column, and the value is the referenced primary key.
@@ -252,11 +428,15 @@ fn compile_predicate(
     lookup.validate(ty, &p.path, &p.values)?;
 
     let operand = qualified(&alias, field.column)?;
-    let values = if lookup == Lookup::IsNull {
+    let values = if lookup == Lookup::IsNull || lookup.is_network() {
         // The boolean of an `isnull` belongs to the operator — it picks between
         // `IS NULL` and `IS NOT NULL` — and is never bound to the column.
         // Coercing it towards the column's type would reject
         // `name__isnull = true` on a text column, which is a legitimate query.
+        //
+        // A network lookup's value is kept as text too: it may carry a netmask
+        // (`10.0.0.0/8`) that coercing to a host `IpAddr` would drop; it is bound
+        // as text and cast to `inet` in the comparison (ADR 0040).
         p.values.clone()
     } else {
         p.values
@@ -267,6 +447,82 @@ fn compile_predicate(
     };
     Ok(Clause::Where(compile_comparison(
         &operand, lookup, ty, &values, binder,
+    )?))
+}
+
+/// A lookup that reaches into a JSONB column (ADR 0025).
+///
+/// `jsonb_extract_path_text(col, $1, $2)` pulls the path out as text — each
+/// segment **bound**, never spliced, so a key named by the caller cannot break
+/// out of the path — and a cast to the type the comparison value implies makes
+/// the comparison behave like a native column (`… ::numeric >= $3`).
+#[allow(clippy::too_many_arguments)]
+fn compile_json_predicate(
+    alias: &str,
+    field: &FieldMeta,
+    json_path: &[String],
+    lookup: Lookup,
+    path: &str,
+    values: &[Value],
+    binder: &mut Binder,
+) -> Result<Clause> {
+    if binder.dialect != Dialect::Postgres {
+        return Err(Error::Config(format!(
+            "JSONB path lookups (`{path}`) are supported on PostgreSQL only"
+        )));
+    }
+
+    // The path has no declared type, so the comparison type follows the value —
+    // except `isnull`, whose boolean belongs to the operator, not the extract.
+    let json_ty = if lookup == Lookup::IsNull {
+        FieldType::Text
+    } else {
+        values
+            .first()
+            .and_then(|v| v.field_type())
+            .unwrap_or(FieldType::Text)
+    };
+    // The cast must be the value's **native** SQL type, not a convenient wider one:
+    // the server infers the bound parameter's type from this comparison, and
+    // `Value`'s `ToSql` writes each variant in its own binary format. Casting an
+    // `i64` operand to `numeric` would make the server expect a numeric parameter
+    // while the client writes int8 bytes — silently garbage. Matching the cast to
+    // the value keeps the inferred parameter type right.
+    let cast = match json_ty {
+        FieldType::I32 => "::int",
+        FieldType::I64 => "::bigint",
+        FieldType::F64 => "::double precision",
+        FieldType::Decimal => "::numeric",
+        FieldType::Bool => "::boolean",
+        FieldType::Timestamp => "::timestamptz",
+        FieldType::Uuid => "::uuid",
+        _ => "",
+    };
+
+    // Bind the path segments first — their placeholders precede the comparison
+    // value's, which `compile_comparison` binds next.
+    let segs: Vec<String> = json_path
+        .iter()
+        .map(|s| binder.bind(Value::Text(s.clone())))
+        .collect();
+    let operand = format!(
+        "(jsonb_extract_path_text({}, {})){cast}",
+        qualified(alias, field.column)?,
+        segs.join(", ")
+    );
+
+    lookup.validate(json_ty, path, values)?;
+    let values = if lookup == Lookup::IsNull {
+        values.to_vec()
+    } else {
+        values
+            .iter()
+            .cloned()
+            .map(|v| v.coerce(json_ty, field.column))
+            .collect::<Result<Vec<_>>>()?
+    };
+    Ok(Clause::Where(compile_comparison(
+        &operand, lookup, json_ty, &values, binder,
     )?))
 }
 
@@ -355,7 +611,30 @@ fn compile_comparison(
                 _ => format!("{operand} IS NOT NULL"),
             }
         }
+        // Network set operators on an `INET` column (ADR 0040): `>>` contains,
+        // `<<` contained-by, `&&` overlaps.
+        Lookup::NetContains => net_op(operand, ">>", &values[0], binder),
+        Lookup::NetContainedBy => net_op(operand, "<<", &values[0], binder),
+        Lookup::NetOverlaps => net_op(operand, "&&", &values[0], binder),
+        // Array set operators (ADR 0041): the value binds as one native array.
+        Lookup::ArrayContains => format!("{operand} @> {}", binder.bind(first())),
+        Lookup::ArrayContainedBy => format!("{operand} <@ {}", binder.bind(first())),
+        Lookup::ArrayOverlap => format!("{operand} && {}", binder.bind(first())),
     })
+}
+
+/// A network comparison `operand OP <value>::inet` (ADR 0040). A text value (an
+/// IP/CIDR string from the REPL) is bound and cast with `($n || '')::inet` — the
+/// concatenation forces the parameter to infer as text, dodging the type-inference
+/// trap (ADR 0037); a native `Inet` value is already `inet` and binds directly.
+fn net_op(operand: &str, op: &str, value: &Value, binder: &mut Binder) -> String {
+    match value {
+        Value::Text(_) => format!(
+            "{operand} {op} ({} || '')::inet",
+            binder.bind(value.clone())
+        ),
+        _ => format!("{operand} {op} {}", binder.bind(value.clone())),
+    }
 }
 
 enum PatternShape {
@@ -612,28 +891,19 @@ fn compile_select_list(plan: &Plan, joins: &mut Joins) -> Result<(String, Vec<Co
     Ok((parts.join(", "), specs))
 }
 
-/// `ORDER BY`, falling back to the model's declared ordering.
+/// `ORDER BY`, falling back to the model's declared ordering (and, under keyset
+/// pagination, the primary-key tiebreak — see [`Plan::effective_order`]).
 fn compile_order(plan: &Plan, joins: &mut Joins) -> Result<Option<String>> {
     if plan.unordered {
         return Ok(None);
     }
-    let declared: Vec<OrderBy> = plan
-        .model
-        .ordering
-        .iter()
-        .map(|s| OrderBy::parse(s))
-        .collect();
-    let terms = if plan.order.is_empty() {
-        &declared
-    } else {
-        &plan.order
-    };
+    let terms = plan.effective_order();
     if terms.is_empty() {
         return Ok(None);
     }
 
     let mut parts = Vec::new();
-    for t in terms {
+    for t in &terms {
         let direction = if t.descending { "DESC" } else { "ASC" };
         if let Some(agg) = plan.annotation(&t.path) {
             parts.push(format!("{} {direction}", quote(&agg.alias)?));
@@ -647,6 +917,69 @@ fn compile_order(plan: &Plan, joins: &mut Joins) -> Result<Option<String>> {
         ));
     }
     Ok(Some(parts.join(", ")))
+}
+
+/// The keyset "row strictly after the cursor" predicate (ADR 0024).
+///
+/// For effective order terms `(c0 d0), (c1 d1), …, (pk dpk)` and boundary values
+/// `b0, b1, …`, it is the lexicographic expansion
+///
+/// ```text
+/// (c0 >|< b0)
+///   OR (c0 = b0 AND c1 >|< b1)
+///   OR (c0 = b0 AND c1 = b1 AND pk >|< bpk)
+/// ```
+///
+/// where each comparison is `>` for an ascending term and `<` for a descending
+/// one — the direction each term's page advances. Every boundary value is bound
+/// once and its placeholder reused across the equality prefixes, so the parameter
+/// list stays minimal and nothing is formatted into the text.
+fn compile_keyset(plan: &Plan, binder: &mut Binder, joins: &mut Joins) -> Result<Option<String>> {
+    let Some(boundary) = &plan.keyset else {
+        return Ok(None);
+    };
+    let terms = plan.effective_order();
+    if terms.is_empty() {
+        return Err(Error::Config(
+            "keyset pagination needs an ordering (declare one or give the model a default)".into(),
+        ));
+    }
+    if terms.len() != boundary.len() {
+        return Err(Error::Config(format!(
+            "this cursor has {} values but the query orders by {} columns — it is from a \
+             different query",
+            boundary.len(),
+            terms.len()
+        )));
+    }
+
+    // Resolve each term to its column SQL (keyset keys must be plain columns, not
+    // aggregates), binding each boundary value once.
+    let mut cols = Vec::with_capacity(terms.len());
+    for t in &terms {
+        if plan.annotation(&t.path).is_some() {
+            return Err(Error::Config(
+                "keyset pagination cannot order by an annotation; order by columns".into(),
+            ));
+        }
+        let r = registry::resolve(plan.model, &t.path)?;
+        joins.absorb(r.joins);
+        cols.push((qualified(&r.alias, r.field.column)?, t.descending));
+    }
+    let placeholders: Vec<String> = boundary.iter().map(|v| binder.bind(v.clone())).collect();
+
+    let mut disjuncts = Vec::with_capacity(cols.len());
+    for i in 0..cols.len() {
+        let mut conj = Vec::with_capacity(i + 1);
+        for (col, ph) in cols.iter().zip(&placeholders).take(i) {
+            conj.push(format!("{} = {}", col.0, ph));
+        }
+        let (col, descending) = &cols[i];
+        let cmp = if *descending { "<" } else { ">" };
+        conj.push(format!("{} {cmp} {}", col, placeholders[i]));
+        disjuncts.push(format!("({})", conj.join(" AND ")));
+    }
+    Ok(Some(format!("({})", disjuncts.join(" OR "))))
 }
 
 /// Compile a `SELECT` for PostgreSQL. See [`compile_select_on`] for SQLite.
@@ -664,7 +997,16 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
     // compiled in the order they will appear, so placeholder numbers match.
     let (select_list, columns) = compile_select_list(plan, &mut joins)?;
     let (where_clause, having_clause) = compile_conditions(plan, &mut binder, &mut joins)?;
+    let keyset_clause = compile_keyset(plan, &mut binder, &mut joins)?;
     let order_clause = compile_order(plan, &mut joins)?;
+
+    // The keyset predicate is `AND`ed onto whatever the filters already produced.
+    let where_clause = match (where_clause, keyset_clause) {
+        (Some(w), Some(k)) => Some(format!("{w} AND {k}")),
+        (Some(w), None) => Some(w),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    };
 
     let mut text = String::from("SELECT ");
     if plan.distinct {
@@ -712,6 +1054,7 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -738,6 +1081,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
                 name: "count".into(),
                 ty: FieldType::I64,
             }],
+            kind: StatementKind::Read,
         });
     }
 
@@ -759,6 +1103,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "count".into(),
             ty: FieldType::I64,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -781,6 +1126,7 @@ pub fn compile_exists_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "exists".into(),
             ty: FieldType::Bool,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -823,6 +1169,7 @@ pub fn compile_aggregate_on(plan: &Plan, aggs: &[Aggregate], dialect: Dialect) -
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -877,12 +1224,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
     if assignments.is_empty() {
         return Err(Error::Config("update() was given nothing to set".into()));
     }
-    let pk = plan.model.primary_key().ok_or_else(|| {
-        Error::Config(format!(
-            "model `{}` declares no primary key, so it cannot be updated by query",
-            plan.model.name
-        ))
-    })?;
+    let keys = key_fields(plan.model, "updated")?;
 
     let mut binder = Binder::with_dialect(dialect);
     let mut sets = Vec::new();
@@ -901,10 +1243,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         ));
     }
     // `auto_now` columns are refreshed on every write without the caller asking.
-    let now = match dialect {
-        Dialect::Postgres => "now()",
-        Dialect::Sqlite => "CURRENT_TIMESTAMP",
-    };
+    let now = dialect.now();
     for f in plan.model.fields {
         if f.auto_now && !assignments.iter().any(|a| a.field == f.name) {
             sets.push(format!("{} = {now}", quote(f.column)?));
@@ -913,7 +1252,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
 
     let mut selector = plan.clone();
     selector.unordered = true;
-    selector.values = vec![pk.name.to_string()];
+    selector.values = keys.iter().map(|f| f.name.to_string()).collect();
     let inner = compile_select_on(&selector, dialect)?;
 
     let mut text = format!(
@@ -925,7 +1264,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
     // clause's. Done by compiling the selector against a binder that already
     // holds the SET parameters.
     let shifted = shift_placeholders(&inner.text, binder.params.len(), dialect);
-    write!(text, " WHERE {} IN ({})", quote(pk.column)?, shifted)
+    write!(text, " WHERE {} IN ({})", key_in_lhs(&keys)?, shifted)
         .map_err(|e| Error::Config(e.to_string()))?;
     let mut params = binder.params;
     params.extend(inner.params);
@@ -934,6 +1273,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         text,
         params,
         columns: vec![],
+        kind: StatementKind::Write,
     })
 }
 
@@ -944,26 +1284,53 @@ pub fn compile_delete(plan: &Plan) -> Result<Sql> {
 
 /// Compile a `DELETE … WHERE pk IN (subquery)` for `dialect`.
 pub fn compile_delete_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
-    let pk = plan.model.primary_key().ok_or_else(|| {
-        Error::Config(format!(
-            "model `{}` declares no primary key, so it cannot be deleted by query",
-            plan.model.name
-        ))
-    })?;
+    let keys = key_fields(plan.model, "deleted")?;
     let mut selector = plan.clone();
     selector.unordered = true;
-    selector.values = vec![pk.name.to_string()];
+    selector.values = keys.iter().map(|f| f.name.to_string()).collect();
     let inner = compile_select_on(&selector, dialect)?;
 
     Ok(Sql {
         text: format!(
             "DELETE FROM {} WHERE {} IN ({})",
             quote(plan.model.table)?,
-            quote(pk.column)?,
+            key_in_lhs(&keys)?,
             inner.text
         ),
         params: inner.params,
         columns: vec![],
+        kind: StatementKind::Write,
+    })
+}
+
+/// The primary-key fields an `UPDATE`/`DELETE` locates its rows by, errored if the
+/// model declares none. One field for a simple key, several for a composite one.
+fn key_fields(model: &'static ModelMeta, verb: &str) -> Result<Vec<&'static FieldMeta>> {
+    let keys: Vec<&'static FieldMeta> = model.primary_keys().collect();
+    if keys.is_empty() {
+        return Err(Error::Config(format!(
+            "model `{}` declares no primary key, so it cannot be {verb} by query",
+            model.name
+        )));
+    }
+    Ok(keys)
+}
+
+/// The left-hand side of the `key IN (subquery)` an `UPDATE`/`DELETE` compiles to:
+/// the bare column for a simple key, a row-value tuple `(a, b)` for a composite
+/// one (ADR 0045). The tuple matches the `SELECT a, b` the subquery projects, so
+/// the statement touches exactly the keyed rows — not every row that happens to
+/// share the first key column, which a single-column `IN` would wrongly sweep up.
+fn key_in_lhs(keys: &[&'static FieldMeta]) -> Result<String> {
+    let cols = keys
+        .iter()
+        .map(|f| quote(f.column))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(if keys.len() == 1 {
+        cols
+    } else {
+        format!("({cols})")
     })
 }
 
@@ -977,10 +1344,7 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     if by == 0 {
         return sql.to_string();
     }
-    let marker = match dialect {
-        Dialect::Postgres => '$',
-        Dialect::Sqlite => '?',
-    };
+    let marker = dialect.placeholder_marker();
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1007,6 +1371,47 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     out
 }
 
+/// Convert numbered `?n` placeholders to the bare positional `?` MySQL binds by
+/// order, reordering `params` into the order the placeholders appear in the text
+/// (ADR 0018). Pure, so it is unit-tested. The one step that makes the compiler's
+/// numbered output executable on MySQL; it runs once, in the MySQL driver.
+///
+/// The input `params` are in *bind* order; the output are in *textual* order. A
+/// `?k` emits `?` and takes `params[k-1]`; a repeated `?k` repeats that value; an
+/// out-of-order `?2 … ?1` — which a `SELECT` with `HAVING` produces — comes out
+/// correctly, because the output order is derived from the text, the single
+/// source of truth for positional binding. Only the compiler's own output is
+/// passed here, so every `?n` is a numbered placeholder in range.
+pub fn positionalize(sql: &str, params: &[Value]) -> (String, Vec<Value>) {
+    let mut out = String::with_capacity(sql.len());
+    let mut ordered = Vec::with_capacity(params.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '?' {
+            out.push(c);
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(*d);
+            chars.next();
+        }
+        match digits.parse::<usize>() {
+            Ok(n) if (1..=params.len()).contains(&n) => {
+                out.push('?');
+                ordered.push(params[n - 1].clone());
+            }
+            // A bare `?` or an out-of-range index: copy verbatim and bind nothing.
+            // Unreachable for compiler output, which always numbers in range.
+            _ => {
+                out.push('?');
+                out.push_str(&digits);
+            }
+        }
+    }
+    (out, ordered)
+}
+
 /// Compile an `INSERT` of one or more rows.
 ///
 /// Every row must offer the same columns, which `bulk_create` guarantees by
@@ -1015,7 +1420,9 @@ pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -
     compile_insert_on(meta, rows, Dialect::Postgres)
 }
 
-/// Compile an `INSERT … RETURNING *` for `dialect`.
+/// Compile an `INSERT` for `dialect`, with `RETURNING *` on a backend that has it
+/// (PostgreSQL, SQLite) and a bare `INSERT` on one that does not (MySQL), whose
+/// create path reads the written rows back by key instead (ADR 0018 Inc. 2b).
 pub fn compile_insert_on(
     meta: &'static ModelMeta,
     rows: &[Vec<(String, Value)>],
@@ -1060,20 +1467,26 @@ pub fn compile_insert_on(
         .map(|f| quote(f.column))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    // Everything comes back, so the caller gets database-generated columns —
-    // the serial primary key, `auto_now_add` defaults — without a second query.
-    let returning = meta
-        .columns()
-        .map(quote)
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
+    let table = quote(meta.table)?;
+    let values = tuples.join(", ");
+    // With `RETURNING` everything comes back, so the caller gets database-generated
+    // columns — the serial primary key, `auto_now_add` defaults — without a second
+    // query. A backend that lacks it (MySQL) gets a bare `INSERT`; the create path
+    // then reloads the written rows by their generated key in the same transaction
+    // (ADR 0018 Inc. 2b), which is why it must still carry `StatementKind::Write`.
+    let text = if dialect.supports(Capability::Returning) {
+        let returning = meta
+            .columns()
+            .map(quote)
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        format!("INSERT INTO {table} ({columns}) VALUES {values} RETURNING {returning}")
+    } else {
+        format!("INSERT INTO {table} ({columns}) VALUES {values}")
+    };
 
     Ok(Sql {
-        text: format!(
-            "INSERT INTO {} ({columns}) VALUES {} RETURNING {returning}",
-            quote(meta.table)?,
-            tuples.join(", ")
-        ),
+        text,
         params: binder.params,
         columns: meta
             .fields
@@ -1083,12 +1496,102 @@ pub fn compile_insert_on(
                 ty: f.ty,
             })
             .collect(),
+        kind: StatementKind::Write,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_supports_every_capability_sqlite_only_a_subset() {
+        use Capability::*;
+        // PostgreSQL (and PG-wire CockroachDB) has them all.
+        for cap in [
+            Returning,
+            Savepoints,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(
+                Dialect::Postgres.supports(cap),
+                "postgres should have {cap:?}"
+            );
+        }
+        // SQLite has RETURNING, savepoints and transactional DDL…
+        assert!(Dialect::Sqlite.supports(Returning));
+        assert!(Dialect::Sqlite.supports(Savepoints));
+        assert!(Dialect::Sqlite.supports(DdlInTransaction));
+        // …but no CONCURRENTLY, no native boolean, no ILIKE keyword.
+        assert!(!Dialect::Sqlite.supports(ConcurrentIndex));
+        assert!(!Dialect::Sqlite.supports(NativeBoolean));
+        assert!(!Dialect::Sqlite.supports(IlikeOperator));
+        // The ILIKE capability and the operator the compiler emits must agree.
+        assert_eq!(
+            Dialect::Sqlite.supports(IlikeOperator),
+            Dialect::Sqlite.ilike() == "ILIKE"
+        );
+        assert_eq!(
+            Dialect::Postgres.supports(IlikeOperator),
+            Dialect::Postgres.ilike() == "ILIKE"
+        );
+    }
+
+    #[test]
+    fn the_mysql_dialect_profile_is_declared_before_its_driver() {
+        use Capability::*;
+        // MySQL's simple dialect choices.
+        assert_eq!(Dialect::MySql.ilike(), "LIKE");
+        assert_eq!(Dialect::MySql.now(), "now()");
+        // It compiles with numbered `?n` (like SQLite) — the bare positional `?`
+        // is produced later by `positionalize`, in the driver — and declares that
+        // it ultimately binds positionally.
+        assert_eq!(Dialect::MySql.placeholder(1), "?1");
+        assert_eq!(Dialect::MySql.placeholder(7), "?7");
+        assert!(Dialect::MySql.positional_unnumbered());
+        assert!(!Dialect::Postgres.positional_unnumbered());
+        assert!(!Dialect::Sqlite.positional_unnumbered());
+        // Its capability profile: savepoints yes; RETURNING, transactional DDL,
+        // CONCURRENTLY, a native boolean and ILIKE all no.
+        assert!(Dialect::MySql.supports(Savepoints));
+        for cap in [
+            Returning,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(!Dialect::MySql.supports(cap), "mysql should lack {cap:?}");
+        }
+    }
+
+    #[test]
+    fn positionalize_rewrites_numbered_placeholders_to_bare_and_reorders_params() {
+        let p = |n: i64| Value::I64(n);
+        // In textual order: straightforward 1:1.
+        let (sql, params) = positionalize("a = ?1 AND b = ?2", &[p(10), p(20)]);
+        assert_eq!(sql, "a = ? AND b = ?");
+        assert_eq!(params, vec![p(10), p(20)]);
+
+        // Out of order — the shape a HAVING-before-WHERE select binds: the text is
+        // `?2 … ?1`, and the output params must come out in textual order.
+        let (sql, params) = positionalize("where c = ?2 having n = ?1", &[p(1), p(2)]);
+        assert_eq!(sql, "where c = ? having n = ?");
+        assert_eq!(params, vec![p(2), p(1)], "reordered to textual order");
+
+        // A repeated placeholder repeats its value.
+        let (sql, params) = positionalize("?1 or ?1", &[p(5)]);
+        assert_eq!(sql, "? or ?");
+        assert_eq!(params, vec![p(5), p(5)]);
+
+        // No placeholders: unchanged, empty params.
+        let (sql, params) = positionalize("SELECT 1", &[p(9)]);
+        assert_eq!(sql, "SELECT 1");
+        assert!(params.is_empty());
+    }
 
     #[test]
     fn like_metacharacters_in_the_value_are_escaped() {

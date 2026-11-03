@@ -5,3 +5,4 @@ Cargo.lock.bak
 
 # mdBook build output
 /docs/book
+.fastembed_cache/

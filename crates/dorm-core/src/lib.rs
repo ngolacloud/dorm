@@ -36,17 +36,22 @@
 #![forbid(unsafe_code)]
 
 pub mod compiler;
+pub mod cqrs;
+pub mod cursor;
 pub mod db;
 pub mod error;
 pub mod expr;
 pub mod field;
+pub mod idempotency;
 pub mod lookup;
 pub mod m2m;
 pub mod meta;
 pub mod model;
+pub mod prefetch;
 pub mod queryset;
 pub mod registry;
 pub mod row;
+pub mod scope;
 pub mod value;
 
 pub use error::{Error, Result};
@@ -72,6 +77,7 @@ pub mod __private {
 /// use dorm_core::prelude::*;
 /// ```
 pub mod prelude {
+    pub use crate::cqrs;
     pub use crate::db::{self, atomic, Tx};
     pub use crate::error::{Error, Result};
     pub use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, F, Q};
@@ -79,6 +85,7 @@ pub mod prelude {
     pub use crate::m2m::{BoundManyToMany, ManyToMany};
     pub use crate::meta::{FieldMeta, ModelMeta, OnDelete, Relation};
     pub use crate::model::{Model, NewRow};
+    pub use crate::prefetch::{prefetch, Prefetched};
     pub use crate::queryset::{Manager, QuerySet, ValueRow};
     pub use crate::value::{ColumnType, FieldType, ToValue, Value};
 }

@@ -80,10 +80,21 @@ pub fn init(name: Option<&str>) -> CliResult {
 }
 
 /// `dorm generate` — compile `dorm.schema` into `src/models.rs`.
+///
+/// Validates the schema first (ADR 0019): a `@@rag` that names a missing or
+/// non-text field is an error here, before any Rust is written — the buildless,
+/// database-less half of `dorm validate`.
 pub fn generate(schema_path: &str, out_path: &str) -> CliResult {
     let src = fs::read_to_string(schema_path)
         .map_err(|e| format!("reading {schema_path}: {e} (run `dorm init` first?)"))?;
     let schema = dorm_schema::parse(&src).map_err(|e| format!("{schema_path}: {e}"))?;
+
+    let issues = dorm_schema::validate(&schema);
+    let errors = print_schema_issues(schema_path, &issues);
+    if errors > 0 {
+        return Err(format!("{schema_path}: {errors} error(s) — not generating").into());
+    }
+
     let rust = dorm_schema::generate_rust(&schema);
     write(out_path, &rust)?;
     println!(
@@ -91,6 +102,45 @@ pub fn generate(schema_path: &str, out_path: &str) -> CliResult {
         schema.models.len()
     );
     Ok(())
+}
+
+/// The schema-level pass of `dorm validate`: parse `dorm.schema` and run
+/// [`dorm_schema::validate`], without building the project or touching a
+/// database. Returns `3` when it finds errors (the "checks found problems" code),
+/// `0` when it is clean, and `0` with no output when there is no `dorm.schema`
+/// (a hand-written-models project — the registry pass still runs).
+pub fn validate_schema(schema_path: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    if !Path::new(schema_path).exists() {
+        return Ok(0);
+    }
+    let src = fs::read_to_string(schema_path).map_err(|e| format!("reading {schema_path}: {e}"))?;
+    let schema = dorm_schema::parse(&src).map_err(|e| format!("{schema_path}: {e}"))?;
+    let issues = dorm_schema::validate(&schema);
+    let errors = print_schema_issues(schema_path, &issues);
+    Ok(if errors > 0 { 3 } else { 0 })
+}
+
+/// Print schema findings in the same shape as the registry's `validate`, and
+/// return how many were errors.
+fn print_schema_issues(schema_path: &str, issues: &[dorm_schema::Issue]) -> usize {
+    use dorm_schema::Severity;
+    let errors = issues
+        .iter()
+        .filter(|i| i.severity == Severity::Error)
+        .count();
+    for i in issues {
+        let who = if i.model.is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", i.model)
+        };
+        eprintln!(
+            "  {:<7} {schema_path}: {who}{}",
+            i.severity.label(),
+            i.message
+        );
+    }
+    errors
 }
 
 /// `dorm format` — rewrite `dorm.schema` in DORM's canonical form, in place.
@@ -156,6 +206,48 @@ pub fn studio_generate(out_path: &str) -> CliResult {
     println!(
         "run `cargo run --bin studio` to open it (add `--write` to edit; needs \
          `dorm-studio` in Cargo.toml — `dorm init` adds it)."
+    );
+    Ok(())
+}
+
+/// `dorm rag generate` — (re)write `src/bin/rag.rs`, the RAG worker/status/reindex
+/// over the project's models (ADR 0019). Like `studio generate`, the binary links
+/// the models so the registry and the RAG inventory are populated.
+pub fn rag_generate(out_path: &str) -> CliResult {
+    let krate = package_name()?;
+    let rust = RAG_RS.replace("__APP_CRATE__", &krate);
+    if let Some(parent) = Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    write(out_path, &rust)?;
+    println!("generated {out_path}.");
+    println!(
+        "add `dorm-rag` to Cargo.toml (with an embedder feature), e.g.:\n  \
+         dorm-rag = {{ version = \"0.1\", features = [\"embed-ollama\"] }}"
+    );
+    println!("then: `dorm rag worker` (drains the outbox), `dorm rag status`, `dorm rag reindex`.");
+    Ok(())
+}
+
+/// `dorm mcp generate` — (re)write `src/bin/mcp.rs`, a native MCP server over the
+/// project's models (ADR 0020). Links the models so the registry is populated.
+pub fn mcp_generate(out_path: &str) -> CliResult {
+    let krate = package_name()?;
+    let rust = MCP_RS.replace("__APP_CRATE__", &krate);
+    if let Some(parent) = Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    write(out_path, &rust)?;
+    println!("generated {out_path}.");
+    println!("add `dorm-mcp` to Cargo.toml:\n  dorm-mcp = \"0.1\"");
+    println!("run: cargo run --bin mcp -- --transport stdio [--tenant <slug>] [--models A,B]");
+    println!(
+        "for `semantic_search`, install an embedder at startup (see the generated file) \
+         and add `dorm-rag` with an embedder feature."
     );
     Ok(())
 }
@@ -517,6 +609,138 @@ async fn main() {
         eprintln!("studio: {e}");
         std::process::exit(1);
     }
+}
+"#;
+
+const MCP_RS: &str = r#"//! `dorm mcp` runs this: a native MCP server over THIS project's models (ADR
+//! 0020). The binary links the models so the registry is populated. Needs
+//! `dorm-mcp` in Cargo.toml; `semantic_search` additionally needs an embedder
+//! installed (uncomment the block below and add `dorm-rag` with an embedder
+//! feature, e.g. `embed-ollama`).
+
+use dorm_mcp::{serve, serve_http, ServerConfig};
+
+#[tokio::main]
+async fn main() {
+    // Link the models into the registry.
+    let _ = __APP_CRATE__::all_models();
+    let args: Vec<String> = std::env::args().collect();
+
+    // For the `semantic_search` tool, install an embedder once at startup:
+    //
+    //   if let Ok(e) = dorm_rag::embedder::OllamaEmbedder::from_env().await {
+    //       dorm_rag::install_embedder(e);
+    //   }
+
+    let cfg = ServerConfig::from_args(&args);
+    let result = match ServerConfig::transport(&args).as_str() {
+        "stdio" => serve(cfg).await,
+        // HTTP: either static bearer tokens in DELONIX_ORM_MCP_TOKENS
+        // (`secret=acme:ro`), or OAuth 2.1 client_credentials via
+        // DELONIX_ORM_MCP_CLIENTS (`id:secret=acme:rw`) + `POST /token`. Loopback
+        // by default; `--bind host:port` to change it.
+        "http" => serve_http(cfg).await,
+        other => {
+            eprintln!("unknown --transport `{other}` (stdio|http)");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("mcp: {e}");
+        std::process::exit(1);
+    }
+}
+"#;
+
+const RAG_RS: &str = r#"//! `dorm rag <sub>` runs this: the RAG worker, status and reindex over THIS
+//! project's models (ADR 0019). The binary links the models so the registry and
+//! the RAG inventory are populated. Needs `dorm-rag` in Cargo.toml with an
+//! embedder feature (e.g. `features = ["embed-ollama"]`).
+
+use dorm_rag::embedder::OllamaEmbedder;
+use dorm_rag::worker::{run, WorkerConfig};
+
+#[tokio::main]
+async fn main() {
+    // Link the models (and their RAG configs) into the registries.
+    let _ = __APP_CRATE__::all_models();
+    let args: Vec<String> = std::env::args().collect();
+    let json = args.iter().any(|a| a == "--json");
+    let sub = args.get(1).map(String::as_str).unwrap_or("status");
+
+    let result = match sub {
+        "worker" => worker().await,
+        "status" => status(json).await,
+        "reindex" => reindex(&args).await,
+        other => {
+            eprintln!("unknown `rag` subcommand `{other}` (worker|status|reindex)");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("rag: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn worker() -> Result<(), Box<dyn std::error::Error>> {
+    let embedder = OllamaEmbedder::from_env().await?;
+    println!(
+        "rag worker: embedder {} (dim {}) — draining the outbox, Ctrl-C to stop.",
+        embedder.model_id(),
+        embedder.dimension()
+    );
+    run(&embedder, &WorkerConfig::default()).await?;
+    Ok(())
+}
+
+async fn status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let status = dorm_rag::status(WorkerConfig::default().max_attempts).await?;
+    if json {
+        let arr: Vec<_> = status
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "model": s.model,
+                    "table": s.table,
+                    "indexed_records": s.indexed_records,
+                    "pending": s.pending,
+                    "dead_letter": s.dead_letter,
+                    "embedder": s.embedder,
+                    "embedder_version": s.embedder_version,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "models": arr }));
+    } else if status.is_empty() {
+        println!("no RAG models registered.");
+    } else {
+        for s in &status {
+            println!(
+                "  {:<24} indexed={} pending={} dead_letter={} embedder={}",
+                s.model,
+                s.indexed_records,
+                s.pending,
+                s.dead_letter,
+                s.embedder.clone().unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn reindex(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let model = flag("--model");
+    let tenant = flag("--tenant");
+    let n = dorm_rag::reindex(model.as_deref(), tenant.as_deref()).await?;
+    println!("enqueued {n} record(s) for re-indexing — run `dorm rag worker` to process them.");
+    Ok(())
 }
 "#;
 

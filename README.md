@@ -63,7 +63,38 @@ let newest = Author::objects()
 | [`dorm-migrations`](crates/dorm-migrations) | DDL generation, the schema autodetector, and the versioned migrator |
 | [`dorm-models`](crates/dorm-models) | The ORM's **own** example models, used to pin the generated SQL in snapshot tests |
 | [`dorm-example`](crates/dorm-example) | A standalone ~40-line blog using only `dorm-*` — the independence proof |
-| [`dorm-shell`](crates/dorm-shell) | The `dorm` REPL — enumerates the linked models and runs string-typed queries live |
+| [`dorm-shell`](crates/dorm-shell) | The `dorm-shell` REPL — enumerates the linked models and runs string-typed queries live |
+
+## DORM with frameworks
+
+DORM is the **data-source layer** — one database, one transaction, one process.
+A backend framework can build its service, distribution and domain layers on top,
+driving DORM through its library API rather than its CLI. The boundary — what
+belongs to the ORM and what belongs to the framework — is fixed in
+[ADR 0054](docs/adr/0054-orm-boundary.md). A framework consumes DORM like this:
+
+- **Programmatic configuration.** A framework hands DORM its DSN, replicas, TLS,
+  pool and cursor key by API; the library reads no environment variables (only
+  the CLI reads `DELONIX_ORM_DSN`).
+- **Explicit sessions, no global default.** Open a session per module and per
+  request with `with_session`/`connect_schema`; the framework never relies on the
+  process-global handle.
+- **Typed results, not printed text.** Everything the `dorm` CLI does is a public
+  library function returning a typed result: migrations (`plan`/`apply`/`status`/
+  `lint`), schema (`parse`/`validate`/`generate` + a schema-metadata API), the
+  embeddable shell and the Studio `Router` the framework mounts behind its own
+  auth.
+- **One-shot, framework-owned loops.** DORM gives one-pass operations (`relay` a
+  batch, `run_once`); the framework owns the loop, scheduling, shutdown and
+  metrics around them.
+- **Optional transactional support as ports.** `dorm-outbox`, `dorm-jobs` and
+  `dorm-eventstore` implement the ports the framework defines; `dorm-core` never
+  depends on them.
+
+The dependency is one-way: a framework depends on DORM, never the reverse.
+
+**Projects using DORM:** [`dorm-example`](crates/dorm-example) (the in-repo
+independence proof). Frameworks built on DORM are listed here as they adopt it.
 
 ## Install
 

@@ -328,14 +328,28 @@ async fn export_csv(
 fn value_to_cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
+        Value::Inet(ip) => ip.to_string(),
+        Value::Cidr(c) => c.to_string(),
+        Value::MacAddr(m) => m.to_hex_string(),
+        Value::TextArray(v) => format!("{{{}}}", v.join(",")),
+        Value::IntArray(v) => format!(
+            "{{{}}}",
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         Value::Bool(b) => b.to_string(),
         Value::I32(n) => n.to_string(),
         Value::I64(n) => n.to_string(),
+        Value::F64(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Decimal(d) => d.to_string(),
         Value::Timestamp(t) => t.to_rfc3339(),
         Value::Uuid(u) => u.to_string(),
         Value::Json(j) => j.to_string(),
+        // `\x`-prefixed hex, as the REPL and PostgreSQL render a blob.
+        Value::Bytes(_) => v.to_string(),
     }
 }
 
@@ -550,14 +564,22 @@ fn value_row_to_json(row: &ValueRow, meta: &ModelMeta) -> JsonValue {
 fn value_to_json(v: &Value) -> JsonValue {
     match v {
         Value::Null => JsonValue::Null,
+        Value::Inet(ip) => JsonValue::from(ip.to_string()),
+        Value::Cidr(c) => JsonValue::from(c.to_string()),
+        Value::MacAddr(m) => JsonValue::from(m.to_hex_string()),
+        Value::TextArray(v) => JsonValue::from(v.clone()),
+        Value::IntArray(v) => JsonValue::from(v.clone()),
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::I32(n) => JsonValue::from(*n),
         Value::I64(n) => JsonValue::from(*n),
+        Value::F64(x) => JsonValue::from(*x),
         Value::Text(s) => JsonValue::String(s.clone()),
         Value::Decimal(d) => JsonValue::String(d.to_string()),
         Value::Timestamp(t) => JsonValue::String(t.to_rfc3339()),
         Value::Uuid(u) => JsonValue::String(u.to_string()),
         Value::Json(j) => j.clone(),
+        // Bytes as `\x`-prefixed hex — a JSON string the grid shows and round-trips.
+        Value::Bytes(_) => JsonValue::String(v.to_string()),
     }
 }
 

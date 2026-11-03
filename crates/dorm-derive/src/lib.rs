@@ -43,8 +43,12 @@ struct ModelOpts {
     table: Option<String>,
     ordering: Vec<String>,
     tenant_scoped: bool,
+    soft_delete: bool,
     /// Each entry is a composite-unique group of column names.
     unique_together: Vec<Vec<String>>,
+    /// Each entry is a composite index — a group of column names to index
+    /// together (ADR 0044).
+    index_together: Vec<Vec<String>>,
     /// Table-level `CHECK` predicates (raw SQL, no `CHECK (...)` wrapper).
     checks: Vec<String>,
 }
@@ -80,9 +84,19 @@ struct FieldSpec {
     default: Option<String>,
     auto_now_add: bool,
     auto_now: bool,
+    /// Marks this column as the model's optimistic-locking version counter
+    /// (`#[field(version)]`). Emitted into the `VersionMeta` slice, not onto
+    /// `FieldMeta` — the version is read by the write seam, not the compiler.
+    version: bool,
     foreign_key: Option<String>,
     on_delete: String,
     related_name: Option<String>,
+    /// A native enum type on this field (`#[field(enum_type = "…")]`, ADR 0046):
+    /// the SQL type name and its variants. When set, the field's `FieldType` is
+    /// `Enum(type_name)` and an `EnumMeta` is submitted. The value stays a
+    /// `String`.
+    enum_type: Option<String>,
+    enum_variants: Vec<String>,
 }
 
 impl FieldSpec {
@@ -149,11 +163,22 @@ fn expand(ast: &DeriveInput) -> Result<TokenStream2> {
         specs.push(parse_field(f)?);
     }
 
-    if specs.iter().filter(|s| s.primary_key).count() > 1 {
-        return Err(Error::new_spanned(
-            name,
-            "a model can declare only one `primary_key`",
-        ));
+    // Zero or one `primary_key` is the common case; more than one is a *composite*
+    // primary key (ADR 0042), emitted as a table-level `PRIMARY KEY (a, b)`. Its
+    // columns are caller-supplied (never the serial shortcut), so they must not be
+    // bare `i32`/`i64` — those would be read as auto-increment keys and dropped
+    // from the insert. A composite key is on natural columns (TEXT, etc.).
+    let pk_count = specs.iter().filter(|s| s.primary_key).count();
+    if pk_count > 1 {
+        for s in specs.iter().filter(|s| s.primary_key) {
+            if matches!(s.field_type.to_string().as_str(), "I32" | "I64") {
+                return Err(Error::new_spanned(
+                    name,
+                    "a composite primary key must be on non-serial columns (e.g. String); a bare \
+                     i32/i64 key is treated as auto-increment and cannot be part of a composite key",
+                ));
+            }
+        }
     }
 
     let m2m = parse_m2m_specs(ast)?;
@@ -178,7 +203,9 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
         table: None,
         ordering: Vec::new(),
         tenant_scoped: false,
+        soft_delete: false,
         unique_together: Vec::new(),
+        index_together: Vec::new(),
         checks: Vec::new(),
     };
     for attr in &ast.attrs {
@@ -208,6 +235,7 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
                         .collect();
                 }
                 "tenant_scoped" => opts.tenant_scoped = true,
+                "soft_delete" => opts.soft_delete = true,
                 "unique_together" => {
                     // One group per attribute, columns comma-separated:
                     // `unique_together = "tenant, name"`. Repeat the attribute
@@ -223,6 +251,21 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
                         opts.unique_together.push(group);
                     }
                 }
+                "index_together" => {
+                    // One composite index per attribute, columns comma-separated:
+                    // `index_together = "tenant, created_at"`. Repeat for several
+                    // (ADR 0044).
+                    let s: LitStr = meta.value()?.parse()?;
+                    let group: Vec<String> = s
+                        .value()
+                        .split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                    if !group.is_empty() {
+                        opts.index_together.push(group);
+                    }
+                }
                 "check" => {
                     // Raw table-level CHECK predicate, from the model definition
                     // (compile time), never a caller. Repeat for several.
@@ -232,7 +275,7 @@ fn parse_model_opts(ast: &DeriveInput) -> Result<ModelOpts> {
                 other => {
                     return Err(meta.error(format!(
                         "unknown `model` option `{other}`; known: table, ordering, \
-                         tenant_scoped, unique_together, check"
+                         tenant_scoped, soft_delete, unique_together, index_together, check"
                     )))
                 }
             }
@@ -313,9 +356,12 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
         default: None,
         auto_now_add: false,
         auto_now: false,
+        version: false,
         foreign_key: None,
         on_delete: "restrict".to_string(),
         related_name: None,
+        enum_type: None,
+        enum_variants: Vec::new(),
     };
 
     let mut stated_type: Option<Ident> = None;
@@ -335,6 +381,7 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
                 "index" => spec.index = true,
                 "auto_now_add" => spec.auto_now_add = true,
                 "auto_now" => spec.auto_now = true,
+                "version" => spec.version = true,
                 "column" => {
                     let s: LitStr = meta.value()?.parse()?;
                     spec.column = s.value();
@@ -373,16 +420,62 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
                     let s: LitStr = meta.value()?.parse()?;
                     stated_type = Some(column_type_ident(&s)?);
                 }
+                "enum_type" => {
+                    // The SQL enum type name (ADR 0046). Validated as a plain SQL
+                    // identifier so it can be quoted into DDL without escaping.
+                    let s: LitStr = meta.value()?.parse()?;
+                    let name = s.value();
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                        || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    {
+                        return Err(syn::Error::new(
+                            s.span(),
+                            "enum_type must be a lower_snake_case SQL identifier, e.g. \
+                             \"order_status\"",
+                        ));
+                    }
+                    spec.enum_type = Some(name);
+                }
+                "enum_variants" => {
+                    // Comma-separated labels, in declaration order (ADR 0046).
+                    let s: LitStr = meta.value()?.parse()?;
+                    spec.enum_variants = s
+                        .value()
+                        .split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                }
                 other => {
                     return Err(meta.error(format!(
                         "unknown `field` option `{other}`; known: primary_key, unique, index, \
-                         column, default, max_length, auto_now_add, auto_now, foreign_key, \
-                         on_delete, related_name, column_type"
+                         column, default, max_length, auto_now_add, auto_now, version, \
+                         foreign_key, on_delete, related_name, column_type, enum_type, \
+                         enum_variants"
                     )))
                 }
             }
             Ok(())
         })?;
+    }
+
+    // An enum field needs both halves: the type name and its variants. A type
+    // with no variants would compile to `CREATE TYPE … AS ENUM ()`, which is
+    // never what was meant (ADR 0046).
+    if spec.enum_type.is_some() && spec.enum_variants.is_empty() {
+        return Err(Error::new_spanned(
+            f,
+            "a field with `enum_type` needs `enum_variants = \"a, b, …\"`",
+        ));
+    }
+    if spec.enum_type.is_none() && !spec.enum_variants.is_empty() {
+        return Err(Error::new_spanned(
+            f,
+            "`enum_variants` needs `enum_type = \"…\"` to name the SQL type",
+        ));
     }
 
     // A `ForeignKey<T>` in the type position says the same thing as
@@ -450,12 +543,17 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
         "timestamp" | "timestamptz" => "Timestamp",
         "uuid" => "Uuid",
         "json" | "jsonb" => "Json",
+        "inet" => "Inet",
+        "cidr" => "Cidr",
+        "macaddr" => "MacAddr",
+        "text[]" => "TextArray",
+        "bigint[]" => "IntArray",
         other => {
             return Err(Error::new(
                 s.span(),
                 format!(
                     "unknown column_type `{other}`; known: int, bigint, text, bool, decimal, \
-                     timestamp, uuid, json"
+                     timestamp, uuid, json, inet, cidr, macaddr, text[], bigint[]"
                 ),
             ))
         }
@@ -481,6 +579,33 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
         .last()
         .ok_or_else(|| Error::new_spanned(ty, "a model field must be a plain named type"))?;
     let name = seg.ident.to_string();
+    // `Vec<T>` → an array column (ADR 0041), or `BYTEA` for `Vec<u8>`. The inner
+    // type decides; a `Vec` of anything else needs an explicit `column_type`.
+    if name == "Vec" {
+        let inner = if let PathArguments::AngleBracketed(a) = &seg.arguments {
+            a.args.iter().find_map(|g| match g {
+                GenericArgument::Type(Type::Path(ip)) => {
+                    ip.path.segments.last().map(|s| s.ident.to_string())
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let mapped = match inner.as_deref() {
+            Some("String") => "TextArray",
+            Some("i64") => "IntArray",
+            Some("u8") => "Bytes",
+            _ => {
+                return Err(Error::new_spanned(
+                    ty,
+                    "a `Vec` column must be `Vec<String>` (TEXT[]), `Vec<i64>` (BIGINT[]) \
+                     or `Vec<u8>` (BYTEA); state anything else with `#[field(column_type = \"...\")]`",
+                ))
+            }
+        };
+        return Ok(format_ident!("{}", mapped));
+    }
     let mapped = match name.as_str() {
         "i32" => "I32",
         "i64" => "I64",
@@ -491,6 +616,11 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
         "Uuid" => "Uuid",
         // `serde_json::Value`, however it was imported.
         "Value" | "JsonValue" => "Json",
+        // `std::net::IpAddr` → INET (ADR 0040).
+        "IpAddr" => "Inet",
+        // `cidr::IpCidr` → CIDR, `eui48::MacAddress` → MACADDR (ADR 0048).
+        "IpCidr" => "Cidr",
+        "MacAddress" => "MacAddr",
         other => {
             return Err(Error::new_spanned(
                 ty,
@@ -554,7 +684,15 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
     let field_entries = specs.iter().map(|s| {
         let fname = s.ident.to_string();
         let column = &s.column;
-        let ft = &s.field_type;
+        // An enum field's type carries the type name; everything else is a bare
+        // `FieldType` variant inferred or stated (ADR 0046).
+        let ty_tok = match &s.enum_type {
+            Some(name) => quote!(::dorm_core::value::FieldType::Enum(#name)),
+            None => {
+                let ft = &s.field_type;
+                quote!(::dorm_core::value::FieldType::#ft)
+            }
+        };
         let nullable = s.nullable;
         let pk = s.primary_key;
         let unique = s.unique;
@@ -594,7 +732,7 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
             ::dorm_core::meta::FieldMeta {
                 name: #fname,
                 column: #column,
-                ty: ::dorm_core::value::FieldType::#ft,
+                ty: #ty_tok,
                 nullable: #nullable,
                 primary_key: #pk,
                 unique: #unique,
@@ -616,6 +754,62 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         quote!(&[#(#cols),*] as &[&'static str])
     });
     let checks = opts.checks.iter().map(|c| quote!(#c));
+
+    // One `VersionMeta` submission per `#[field(version)]` column (normally zero
+    // or one). Kept out of `FieldMeta` so the compiler never sees it; the write
+    // seam reads it through `ModelMeta::version_field`.
+    let version_submits = specs.iter().filter(|s| s.version).map(|s| {
+        let field_name = s.ident.to_string();
+        quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::VersionMeta { model: #model_name, field: #field_name }
+            }
+        }
+    });
+
+    // `#[model(soft_delete)]` registers the model's `deleted_at` column (by
+    // convention) in the `SoftDeleteMeta` slice. The scope seam hides deleted rows
+    // by default (ADR 0033).
+    let soft_delete_submit = if opts.soft_delete {
+        quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::SoftDeleteMeta { model: #model_name, field: "deleted_at" }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // One `IndexMeta` submission per `index_together` group (ADR 0044). Kept out
+    // of `ModelMeta` so the compiler never sees it and no literal constructor
+    // changes; the migrator reads it through `ModelMeta::composite_indexes`.
+    let index_submits = opts.index_together.iter().map(|group| {
+        let cols = group.iter().map(|c| quote!(#c));
+        quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::IndexMeta {
+                    model: #model_name,
+                    columns: &[#(#cols),*],
+                }
+            }
+        }
+    });
+
+    // One `EnumMeta` submission per enum field (ADR 0046): the SQL type name and
+    // its variants, for the migrator's `CREATE TYPE`. The type carried on
+    // `FieldType::Enum` is only the name.
+    let enum_submits = specs.iter().filter_map(|s| {
+        let type_name = s.enum_type.as_ref()?;
+        let variants = s.enum_variants.iter().map(|v| quote!(#v));
+        Some(quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::EnumMeta {
+                    type_name: #type_name,
+                    variants: &[#(#variants),*],
+                }
+            }
+        })
+    });
 
     quote! {
         #[doc(hidden)]
@@ -642,6 +836,11 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         // This is the line that makes the model visible to the REPL. The linker
         // gathers every submission; nothing enumerates models by hand.
         ::dorm_core::inventory::submit! { #meta_const }
+
+        #(#version_submits)*
+        #soft_delete_submit
+        #(#index_submits)*
+        #(#enum_submits)*
     }
 }
 
@@ -720,16 +919,23 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec], m2m: &[M2mSpec]) -> Resul
         None => quote!(::dorm_core::value::Value::Null),
     };
 
-    let column_values = specs.iter().filter(|s| s.caller_supplied()).map(|s| {
-        let ident = &s.ident;
-        let fname = s.ident.to_string();
-        quote! {
-            (
-                #fname.to_string(),
-                ::dorm_core::value::ToValue::to_value(&self.#ident),
-            )
-        }
-    });
+    // The version column is kept here even when it has a database default, so the
+    // write seam can read the loaded row's current version for its optimistic
+    // guard — but it stays out of `NewRow` below, so an insert still lets the
+    // database initialise it (ADR 0023).
+    let column_values = specs
+        .iter()
+        .filter(|s| s.caller_supplied() || s.version)
+        .map(|s| {
+            let ident = &s.ident;
+            let fname = s.ident.to_string();
+            quote! {
+                (
+                    #fname.to_string(),
+                    ::dorm_core::value::ToValue::to_value(&self.#ident),
+                )
+            }
+        });
 
     let attach_arms = specs
         .iter()
@@ -1039,6 +1245,241 @@ fn build_new_row(name: &Ident, specs: &[FieldSpec]) -> TokenStream2 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `#[derive(Rag)]` — the optional RAG declaration (ADR 0019), behind the `rag`
+// feature and re-exported as `dorm_rag::Rag`. It is a SEPARATE derive from
+// `Model`, on purpose: a RAG model is a model that *also* carries an independent
+// `&'static RagMeta`, so `#[derive(Model)]` and `ModelMeta` are untouched. The
+// emitted code names `::dorm_rag::…` token paths — this crate takes no Cargo
+// dependency on dorm-rag, so there is no cycle; the user's crate compiles it.
+// ---------------------------------------------------------------------------
+
+/// Derive RAG indexing for a model. Pairs with `#[derive(Model)]` and reads a
+/// `#[rag(..)]` attribute:
+///
+/// ```ignore
+/// #[derive(Model, Rag)]
+/// #[rag(fields = ["title", "body"], template = "{title}\n\n{body}",
+///       embedder = "default", chunk_size = 800, chunk_overlap = 100,
+///       metadata = ["status"], distance = "cosine")]
+/// pub struct Ticket { /* … */ }
+/// ```
+///
+/// Emits one `&'static dorm_rag::meta::RagMeta` and submits it into dorm-rag's
+/// `inventory` slice, tied to the model by its name. `fields` is required; the
+/// rest default (`template` to the fields joined by blank lines, `embedder` to
+/// `"default"`, `chunk_size`/`chunk_overlap` to `800`/`100`, `metadata` to empty,
+/// `distance` to `cosine`).
+#[cfg(feature = "rag")]
+#[proc_macro_derive(Rag, attributes(rag))]
+pub fn derive_rag(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    expand_rag(&ast)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+#[cfg(feature = "rag")]
+struct RagOpts {
+    fields: Vec<String>,
+    template: Option<String>,
+    embedder: String,
+    chunk_size: u32,
+    chunk_overlap: u32,
+    metadata: Vec<String>,
+    /// The `DistanceMetric` variant identifier, already validated.
+    distance: Ident,
+}
+
+#[cfg(feature = "rag")]
+fn expand_rag(ast: &DeriveInput) -> Result<TokenStream2> {
+    let name = &ast.ident;
+    if !ast.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &ast.generics,
+            "a RAG model cannot be generic: its RagMeta is one `static`",
+        ));
+    }
+
+    let opts = parse_rag_opts(ast)?;
+    if opts.fields.is_empty() {
+        return Err(Error::new_spanned(
+            name,
+            "`#[rag(..)]` needs at least one text field: `fields = [\"...\"]`",
+        ));
+    }
+
+    // Default template: each field on its own, separated by blank lines — the
+    // obvious document when the author does not spell one out.
+    let template = opts.template.unwrap_or_else(|| {
+        opts.fields
+            .iter()
+            .map(|f| format!("{{{f}}}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    });
+
+    let model_name = name.to_string();
+    let fields = opts.fields.iter().map(|f| quote!(#f));
+    let metadata = opts.metadata.iter().map(|m| quote!(#m));
+    let embedder = &opts.embedder;
+    let chunk_size = opts.chunk_size;
+    let chunk_overlap = opts.chunk_overlap;
+    let distance = &opts.distance;
+
+    let rag_const = format_ident!("__{}_RAG", name.to_string().to_uppercase());
+
+    Ok(quote! {
+        #[doc(hidden)]
+        const #rag_const: ::dorm_rag::meta::RagMeta = ::dorm_rag::meta::RagMeta {
+            model: #model_name,
+            fields: &[#(#fields),*],
+            template: #template,
+            embedder: #embedder,
+            chunk_size: #chunk_size,
+            chunk_overlap: #chunk_overlap,
+            metadata: &[#(#metadata),*],
+            distance: ::dorm_rag::meta::DistanceMetric::#distance,
+        };
+
+        // The line that makes the model visible to the RAG worker and search.
+        ::dorm_rag::inventory::submit! { #rag_const }
+    })
+}
+
+#[cfg(feature = "rag")]
+fn parse_rag_opts(ast: &DeriveInput) -> Result<RagOpts> {
+    let mut fields = Vec::new();
+    let mut template = None;
+    let mut embedder = "default".to_string();
+    let mut chunk_size: u32 = 800;
+    let mut chunk_overlap: u32 = 100;
+    let mut metadata = Vec::new();
+    let mut distance = format_ident!("Cosine");
+    let mut seen_rag = false;
+
+    for attr in &ast.attrs {
+        if !attr.path().is_ident("rag") {
+            continue;
+        }
+        seen_rag = true;
+        attr.parse_nested_meta(|meta| {
+            let key = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            match key.as_str() {
+                "fields" => fields = parse_str_list(&meta)?,
+                "metadata" => metadata = parse_str_list(&meta)?,
+                "template" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    template = Some(s.value());
+                }
+                "embedder" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    embedder = s.value();
+                }
+                "chunk_size" => {
+                    let n: LitInt = meta.value()?.parse()?;
+                    chunk_size = n.base10_parse()?;
+                }
+                "chunk_overlap" => {
+                    let n: LitInt = meta.value()?.parse()?;
+                    chunk_overlap = n.base10_parse()?;
+                }
+                "distance" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    distance = distance_ident(&s)?;
+                }
+                other => {
+                    return Err(meta.error(format!(
+                        "unknown `rag` option `{other}`; known: fields, template, embedder, \
+                         chunk_size, chunk_overlap, metadata, distance"
+                    )))
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    if !seen_rag {
+        return Err(Error::new_spanned(
+            &ast.ident,
+            "`#[derive(Rag)]` needs a `#[rag(fields = [\"...\"], ...)]` attribute",
+        ));
+    }
+
+    if chunk_overlap >= chunk_size {
+        return Err(Error::new_spanned(
+            &ast.ident,
+            "`chunk_overlap` must be smaller than `chunk_size`, or chunking never advances",
+        ));
+    }
+
+    Ok(RagOpts {
+        fields,
+        template,
+        embedder,
+        chunk_size,
+        chunk_overlap,
+        metadata,
+        distance,
+    })
+}
+
+/// Parse `= ["a", "b"]` into `["a", "b"]`. Accepts string literals (what
+/// `dorm generate` emits) and bare identifiers (convenient when hand-written),
+/// so `fields = ["title", body]` both work.
+#[cfg(feature = "rag")]
+fn parse_str_list(meta: &syn::meta::ParseNestedMeta) -> Result<Vec<String>> {
+    let arr: syn::ExprArray = meta.value()?.parse()?;
+    let mut out = Vec::new();
+    for elem in &arr.elems {
+        match elem {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => out.push(s.value()),
+            syn::Expr::Path(p) => {
+                let ident = p.path.get_ident().ok_or_else(|| {
+                    Error::new_spanned(elem, "expected a field name or a string literal")
+                })?;
+                out.push(ident.to_string());
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    elem,
+                    "expected a string literal or a field name",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map the `distance = "…"` string to the `DistanceMetric` variant identifier,
+/// failing with a named message on an unknown spelling — the compile-time half
+/// of `DistanceMetric::parse`.
+#[cfg(feature = "rag")]
+fn distance_ident(s: &LitStr) -> Result<Ident> {
+    let variant = match s.value().as_str() {
+        "cosine" => "Cosine",
+        "l2" | "euclidean" => "L2",
+        "inner_product" | "ip" | "dot" => "InnerProduct",
+        other => {
+            return Err(Error::new(
+                s.span(),
+                format!(
+                    "unknown distance `{other}`; known: cosine, l2 (euclidean), \
+                     inner_product (ip, dot)"
+                ),
+            ))
+        }
+    };
+    Ok(format_ident!("{}", variant))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1524,19 @@ mod tests {
         assert_eq!(parse("jsonb").as_deref(), Some("Json"));
         assert_eq!(parse("timestamptz").as_deref(), Some("Timestamp"));
         assert_eq!(parse("blob"), None);
+    }
+
+    #[cfg(feature = "rag")]
+    #[test]
+    fn distance_accepts_the_known_spellings_and_rejects_the_rest() {
+        let parse = |s: &str| {
+            distance_ident(&LitStr::new(s, Span::call_site()))
+                .map(|i| i.to_string())
+                .ok()
+        };
+        assert_eq!(parse("cosine").as_deref(), Some("Cosine"));
+        assert_eq!(parse("euclidean").as_deref(), Some("L2"));
+        assert_eq!(parse("dot").as_deref(), Some("InnerProduct"));
+        assert_eq!(parse("cosone"), None);
     }
 }

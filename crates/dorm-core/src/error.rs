@@ -76,6 +76,36 @@ pub enum Error {
     #[error("this session is read-only; `{0}` would write")]
     ReadOnly(&'static str),
 
+    /// An optimistic-concurrency check failed: the row's version moved under the
+    /// writer's feet between read and write, so the update touched no row. The
+    /// caller re-reads and retries. `actual` is the version now in the database,
+    /// or `None` when the row is gone entirely (ADR 0023).
+    #[error("version conflict on {model}: expected version {expected}, found {actual:?}")]
+    Conflict {
+        model: String,
+        expected: i64,
+        actual: Option<i64>,
+    },
+
+    /// A `tenant_scoped` model was queried with no tenant context in scope, and
+    /// not under an explicit `with_system_scope`. Fail-closed: refusing beats
+    /// silently reading or writing across tenants (ADR 0021).
+    #[error("model `{0}` is tenant-scoped but no tenant is in scope (use with_tenant or with_system_scope)")]
+    TenantScopeMissing(&'static str),
+
+    /// A statement ran with no database session in scope while strict sessions
+    /// are enabled. A framework turns strict sessions on so a statement is never
+    /// run against the process-global default by accident; open a session for
+    /// the unit of work with `with_session` (DORM-B1).
+    #[error("{0}")]
+    SessionMissing(&'static str),
+
+    /// An idempotency key was reused with a **different** request — the same key
+    /// must mean the same operation, so this is refused rather than replaying a
+    /// response that does not belong to this request (ADR 0032).
+    #[error("idempotency key `{key}` was already used for a different request")]
+    IdempotencyMismatch { key: String },
+
     /// The server cancelled a statement that ran past
     /// `DELONIX_ORM_STATEMENT_TIMEOUT_MS` (SQLSTATE `57014`). Named separately
     /// from [`Error::Db`] so a caller can retry or report it as a timeout rather
@@ -138,6 +168,28 @@ pub fn classify_db(code: &str, msg: String) -> Error {
         // `statement_timeout` (ADR 0004). Surface it as a timeout, not a
         // generic database error, so a caller can react to it as one.
         QUERY_CANCELED => Error::Timeout(msg),
+        // `invalid_sql_statement_name` from a *prepared* statement is the
+        // signature of a transaction-mode pooler (PgBouncer) that is not forwarding
+        // protocol-level prepared statements: the server prepared `sN` on one
+        // backend and the next statement landed on another. Surface it with the
+        // actionable fix instead of the bare driver string (ADR 0034).
+        // Both faces of a transaction-mode pooler that is not forwarding
+        // protocol-level prepared statements: `26000` (the server prepared `sN` on
+        // one backend and the next statement landed on another, so it is *missing*)
+        // and `42P05` (two client connections multiplexed onto one backend both
+        // tried to prepare `sN`, so it *already exists*). Both get the actionable
+        // fix instead of the bare driver string (ADR 0034/0049).
+        INVALID_STATEMENT_NAME | DUPLICATE_PREPARED_STATEMENT
+            if msg.contains("prepared statement") =>
+        {
+            Error::Config(format!(
+                "{msg} — this is the signature of a transaction-mode connection pooler \
+                 (e.g. PgBouncer): either enable protocol-level prepared statements on the \
+                 pooler (PgBouncer ≥1.21 `max_prepared_statements`) or set \
+                 `DELONIX_ORM_NO_PREPARE=1` so DORM sends statements unprepared \
+                 (ADR 0007/0034/0049)"
+            ))
+        }
         _ => Error::Db(msg),
     }
 }
@@ -146,14 +198,34 @@ pub fn classify_db(code: &str, msg: String) -> Error {
 /// from a genuine failure when it loses a race.
 pub const UNIQUE_VIOLATION: &str = "23505";
 
+/// MySQL/MariaDB's `ER_DUP_ENTRY` error code. Unlike PostgreSQL there is no
+/// dedicated SQLSTATE for a duplicate key (it is the generic `23000`), so
+/// `get_or_create` keys off the error code, which the MySQL driver records in
+/// brackets just as [`from_pg`] records the PostgreSQL SQLSTATE (ADR 0018).
+pub const MYSQL_DUPLICATE_ENTRY: &str = "1062";
+
 /// The SQLSTATE for `query_canceled` — what `statement_timeout` raises when it
 /// fires. [`classify_db`] turns it into [`Error::Timeout`].
 pub const QUERY_CANCELED: &str = "57014";
 
-/// Whether this error is a unique-constraint violation.
+/// The SQLSTATE for `invalid_sql_statement_name` — raised as
+/// `prepared statement "sN" does not exist` when a transaction-mode pooler
+/// drops the prepare. [`classify_db`] turns it into an actionable error (ADR 0034).
+pub const INVALID_STATEMENT_NAME: &str = "26000";
+
+/// The SQLSTATE for `duplicate_prepared_statement` — raised as
+/// `prepared statement "sN" already exists` when a transaction-mode pooler
+/// multiplexes two client connections onto one backend and both prepare the same
+/// name. The collision twin of [`INVALID_STATEMENT_NAME`] (ADR 0049).
+pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
+
+/// Whether this error is a unique-constraint violation, on any backend.
 pub fn is_unique_violation(e: &Error) -> bool {
     match e {
-        Error::Db(msg) => msg.contains(UNIQUE_VIOLATION),
+        Error::Db(msg) => {
+            msg.contains(&format!("[{UNIQUE_VIOLATION}]"))
+                || msg.contains(&format!("[{MYSQL_DUPLICATE_ENTRY}]"))
+        }
         _ => false,
     }
 }
@@ -171,9 +243,23 @@ mod tests {
     }
 
     #[test]
+    fn a_mysql_duplicate_key_is_a_unique_violation() {
+        // The MySQL driver's `db_err` records the error code in brackets (code
+        // 1062, SQLSTATE 23000), which is what `get_or_create` keys off on MySQL.
+        let e = Error::Db(format!(
+            "ERROR [{MYSQL_DUPLICATE_ENTRY}] (23000): Duplicate entry 'x' for key 'name'"
+        ));
+        assert!(is_unique_violation(&e));
+    }
+
+    #[test]
     fn other_database_errors_are_not_unique_violations() {
         assert!(!is_unique_violation(&Error::Db(
             "ERROR [42P01]: relation does not exist".into()
+        )));
+        // A MySQL error that is not a duplicate key (e.g. a lock-wait timeout).
+        assert!(!is_unique_violation(&Error::Db(
+            "ERROR [1205] (HY000): Lock wait timeout exceeded".into()
         )));
         assert!(!is_unique_violation(&Error::Pool("timed out".into())));
     }
@@ -192,6 +278,44 @@ mod tests {
     #[test]
     fn an_ordinary_server_error_stays_a_db_error() {
         match classify_db("42P01", "ERROR [42P01]: relation does not exist".into()) {
+            Error::Db(_) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_prepared_statement_points_at_the_pooler_fix() {
+        // The PgBouncer-in-transaction-mode signature gets an actionable error
+        // naming the env flag, not the bare 26000 string (ADR 0034).
+        let msg = "ERROR [26000]: prepared statement \"s3\" does not exist".to_string();
+        match classify_db(INVALID_STATEMENT_NAME, msg) {
+            Error::Config(m) => assert!(m.contains("DELONIX_ORM_NO_PREPARE"), "{m}"),
+            other => panic!("expected an actionable Config error, got {other:?}"),
+        }
+        // A 26000 that is *not* about a prepared statement stays a plain Db error.
+        match classify_db(
+            INVALID_STATEMENT_NAME,
+            "ERROR [26000]: something else".into(),
+        ) {
+            Error::Db(_) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_colliding_prepared_statement_also_points_at_the_pooler_fix() {
+        // The collision twin (42P05) is the same transaction-pooling signature and
+        // gets the same actionable error (ADR 0049).
+        let msg = "ERROR [42P05]: prepared statement \"s3\" already exists".to_string();
+        match classify_db(DUPLICATE_PREPARED_STATEMENT, msg) {
+            Error::Config(m) => {
+                assert!(m.contains("max_prepared_statements"), "{m}");
+                assert!(m.contains("DELONIX_ORM_NO_PREPARE"), "{m}");
+            }
+            other => panic!("expected an actionable Config error, got {other:?}"),
+        }
+        // A 42P05 unrelated to a prepared statement stays a plain Db error.
+        match classify_db(DUPLICATE_PREPARED_STATEMENT, "ERROR [42P05]: other".into()) {
             Error::Db(_) => {}
             other => panic!("expected Db, got {other:?}"),
         }

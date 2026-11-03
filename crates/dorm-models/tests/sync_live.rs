@@ -113,5 +113,43 @@ fn sync_creates_is_idempotent_adds_columns_and_recreates_tables() {
         );
         assert!(table_exists("deployments").await, "deployments recreated");
         eprintln!("ok: sync recreated a missing table");
+
+        // 5. B-22: sync builds its indexes CONCURRENTLY, outside the transaction.
+        //    `tenants.slug` is an indexed column, so after sync the index exists
+        //    and is valid. If sync still built indexes inside the transaction
+        //    (the old behaviour), `CREATE INDEX CONCURRENTLY` would have failed
+        //    with 25001 and sync would have errored above.
+        let valid: bool = db::query(
+            "SELECT i.indisvalid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'tenants_slug_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_index query")
+        .first()
+        .map(|r| r.get::<_, bool>(0))
+        .expect("the concurrent index exists");
+        assert!(valid, "the concurrently-built index is valid");
+        eprintln!("ok: sync built the index concurrently and it is valid");
+
+        // Mechanism: the same CONCURRENTLY statement is rejected inside a
+        // transaction (25001) — which is exactly why sync runs indexes outside
+        // one. This proves the regression the brick closes.
+        let in_tx = db::atomic(|_tx| async {
+            db::execute(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS zz_b22_tmp_idx ON tenants (slug)",
+                &[],
+            )
+            .await
+        })
+        .await;
+        let err = in_tx.expect_err("CONCURRENTLY inside a transaction must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("25001") || msg.to_lowercase().contains("cannot run inside"),
+            "expected a 25001 'cannot run inside a transaction' error, got: {msg}"
+        );
+        eprintln!("ok: CONCURRENTLY inside a transaction is rejected (25001) — must run outside");
     });
 }
