@@ -1,6 +1,13 @@
-# ADR 0011 — Catálogo de modelos em runtime (`SchemaDescriptor`)
+# ADR 0056 — Catálogo de modelos em runtime (`SchemaDescriptor`)
 
-Status: Proposed · 2026-10-31
+Status: **Proposed (pending)** · reframed per [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0011 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0011](0011-multi-backend-and-production-roadmap.md).
+> **Reframed:** exporting the model catalogue (fields, keys, indexes, version) as
+> a programmatic **library metadata API** is legitimate for any tool built on
+> DORM, so this stays on the roadmap. The polyglot/data-plane framing is dropped
+> (ADR 0054); the descriptor is a Rust API, not a wire catalogue for remote clients.
 
 ## Context
 
@@ -73,6 +80,6 @@ descritor.
   *slice* compilada — um irmão de `schema_parity.rs`); um `resolve` sobre um
   registo construído do descritor produz o mesmo `FieldMeta`/joins que sobre a
   *slice*; um modelo ausente do descritor é recusado.
-- **Dependências:** consumido pelo ADR 0010 (o IR nomeia o que o descritor
-  declara) e pelo ADR 0012 (o Data Plane carrega o descritor); o registo de
-  objectos de BD do ADR 0013 estende o descritor.
+- **Dependências:** consumido pelo ADR 0055 (o IR nomeia o que o descritor
+  declara) e pelo ADR 0057 (o Data Plane carrega o descritor); o registo de
+  objectos de BD do ADR 0058 estende o descritor.
