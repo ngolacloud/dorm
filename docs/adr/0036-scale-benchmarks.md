@@ -37,11 +37,14 @@ regressão fino.
   apanham uma regressão que fizesse o keyset varrer ou o índice deixar de ser
   usado; as linhas `BENCH` dão a um gate de CI números para diferenciar contra uma
   baseline.
-- **Por fazer (declarado, honesto):** a corrida a **10M linhas / 100 inquilinos**
-  e o **job de CI** (baseline comprometida + tolerância + host dedicado) correm
-  fora da instância de teste única; mais cenários (update com versão sob
-  contenção, consumo de outbox a escala) são aditivos ao mesmo arnês. Os números
-  abaixo são a 1M, não a 10M.
+- **Gate de CI concreto:** `scripts/bench_gate.sh` (`make bench`) corre o bench e
+  impõe um **piso de speedup** (`BENCH_MIN_SPEEDUP`, por omissão 5x) em vez de
+  comparar microssegundos absolutos — host-independente, logo não-flaky entre
+  runners; sai ≠0 numa regressão (provado com um piso forçado). A baseline de
+  referência (1M e **10M**) está em `docs/review/bench-baseline.md`.
+- **Por fazer (declarado, honesto):** cenários adicionais (update com versão sob
+  contenção, consumo de outbox a escala) são aditivos ao mesmo arnês; o job de CI
+  a 10M corre num host dedicado (o gate e os números existem, falta só agendá-lo).
 
 ## Proof
 
