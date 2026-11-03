@@ -38,6 +38,7 @@ pub mod ddl;
 pub mod history;
 pub mod lint;
 pub mod migrator;
+pub mod partition;
 
 /// What can go wrong building or applying a migration.
 #[derive(Debug, thiserror::Error)]
