@@ -23,12 +23,12 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 
-use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::Argon2;
 use dorm_core::db;
 use dorm_core::row::Row;
 use dorm_core::value::Value;
+use rand_core::OsRng;
 use serde_json::json;
 
 use crate::CliResult;
