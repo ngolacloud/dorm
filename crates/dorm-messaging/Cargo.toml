@@ -22,6 +22,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # The NATS backend's client, pulled only when the `nats` feature is on (ADR 0031).
 async-nats = { version = "0.45", optional = true }
+# The AMQP backend's client (RabbitMQ and any AMQP 0-9-1 broker), pulled only when
+# the `amqp` feature is on (ADR 0052).
+lapin = { version = "2.5", optional = true }
 
 [features]
 default = []
@@ -31,7 +34,7 @@ default = []
 # and AMQP are the same shape, behind their own features, not yet wired.
 nats = ["dep:async-nats"]
 kafka = []
-amqp = []
+amqp = ["dep:lapin"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

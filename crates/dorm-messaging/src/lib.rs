@@ -11,9 +11,9 @@
 //!
 //! Broker backends implement the same [`Publisher`] trait behind Cargo features,
 //! and [`OutboxBus::forward`] bridges the outbox to any of them, at-least-once.
-//! **NATS** is implemented ([`nats`], feature `nats`) and proven against a live
-//! server (ADR 0051); Kafka and AMQP are the same shape, behind their features,
-//! not yet wired.
+//! **NATS** ([`nats`], feature `nats`, ADR 0051) and **AMQP/RabbitMQ** ([`amqp`],
+//! feature `amqp`, ADR 0052) are implemented and proven against live brokers;
+//! Kafka is the same shape, behind its feature, not yet wired.
 
 use std::future::Future;
 
@@ -239,6 +239,79 @@ pub mod nats {
                 .flush()
                 .await
                 .map_err(|e| Error::Db(format!("NATS flush failed: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+/// The AMQP broker backend (ADR 0052), behind the `amqp` feature.
+///
+/// An [`AmqpPublisher`] carries [`CloudEvent`]s to an AMQP 0-9-1 broker (RabbitMQ)
+/// as CloudEvents **structured** JSON, on the default exchange with the topic as
+/// the routing key (so a queue of the topic's name receives it). Publisher
+/// **confirms** are on, so [`Publisher::publish`] returns only once the broker has
+/// acked — the relay must not advance its cursor on an unconfirmed publish. Pair
+/// it with [`OutboxBus::forward`] for the durable, at-least-once path.
+#[cfg(feature = "amqp")]
+pub mod amqp {
+    use super::{CloudEvent, Error, Publisher, Result};
+    use lapin::options::BasicPublishOptions;
+    use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
+
+    /// A [`Publisher`] that publishes to an AMQP 0-9-1 broker. Holds the connection
+    /// so the channel stays open for the publisher's lifetime.
+    pub struct AmqpPublisher {
+        _connection: Connection,
+        channel: Channel,
+    }
+
+    impl AmqpPublisher {
+        /// Connect to an AMQP broker (`amqp://user:pass@host:port/vhost`) and put
+        /// the channel into publisher-confirm mode.
+        pub async fn connect(uri: &str) -> Result<Self> {
+            let connection = Connection::connect(uri, ConnectionProperties::default())
+                .await
+                .map_err(|e| Error::Db(format!("AMQP connect failed: {e}")))?;
+            let channel = connection
+                .create_channel()
+                .await
+                .map_err(|e| Error::Db(format!("AMQP channel failed: {e}")))?;
+            channel
+                .confirm_select(lapin::options::ConfirmSelectOptions::default())
+                .await
+                .map_err(|e| Error::Db(format!("AMQP confirm_select failed: {e}")))?;
+            Ok(AmqpPublisher {
+                _connection: connection,
+                channel,
+            })
+        }
+
+        /// The underlying channel, for a caller that wants to declare a queue, set
+        /// up a consumer, or publish to a named exchange directly.
+        pub fn channel(&self) -> &Channel {
+            &self.channel
+        }
+    }
+
+    impl Publisher for AmqpPublisher {
+        /// Publish the CloudEvents-JSON envelope with `topic` as the routing key on
+        /// the default exchange, and **await the broker's confirm**, so a failure
+        /// surfaces here rather than being buffered.
+        async fn publish(&self, topic: &str, event: &CloudEvent) -> Result<()> {
+            let bytes = serde_json::to_vec(&event.to_json())
+                .map_err(|e| Error::Db(format!("CloudEvent serialize failed: {e}")))?;
+            self.channel
+                .basic_publish(
+                    "",
+                    topic,
+                    BasicPublishOptions::default(),
+                    &bytes,
+                    BasicProperties::default(),
+                )
+                .await
+                .map_err(|e| Error::Db(format!("AMQP publish failed: {e}")))?
+                .await
+                .map_err(|e| Error::Db(format!("AMQP publish not confirmed: {e}")))?;
             Ok(())
         }
     }
