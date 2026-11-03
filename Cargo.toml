@@ -76,7 +76,7 @@ deadpool-postgres = { version = "0.14", default-features = false, features = ["r
 # TLS backends for the PostgreSQL connection (ADR 0004), both optional and
 # selected by a dorm-core feature. rustls is pure Rust (ring provider → no C,
 # builds offline/static); openssl uses the system libssl for DBAs who prefer it.
-tokio-postgres-rustls = { version = "0.13" }
+tokio-postgres-rustls = { version = "0.14" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
 webpki-roots = { version = "0.26" }
