@@ -227,7 +227,23 @@ fn tool(name: &str, description: &str, input_schema: Json, read_only: bool) -> J
 }
 
 /// Execute a tool call, returning the text payload for the MCP `content`.
+///
+/// When the server is bound to a tenant, the whole call runs inside
+/// [`db::with_tenant`], so the core scope seam injects
+/// and enforces the tenant for every `tenant_scoped` model (ADR 0021) — the
+/// server's own tenant, never a tool argument. The handlers below still push the
+/// tenant for the backends the seam does not cover (e.g. RAG's direct compile),
+/// which is harmless when the seam also adds it.
 pub async fn execute(cfg: &ServerConfig, name: &str, args: &Json) -> Result<String> {
+    match &cfg.tenant {
+        Some(tenant) => {
+            db::with_tenant(Value::Text(tenant.clone()), execute_inner(cfg, name, args)).await
+        }
+        None => execute_inner(cfg, name, args).await,
+    }
+}
+
+async fn execute_inner(cfg: &ServerConfig, name: &str, args: &Json) -> Result<String> {
     match name {
         "list_models" => list_models(cfg),
         "describe_model" => describe_model(cfg, args),

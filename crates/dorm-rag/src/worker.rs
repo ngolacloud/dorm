@@ -266,12 +266,21 @@ async fn process_record<E: Embedder>(
 
     // Load the record through the dynamic API; the pk arrives as text (uniform in
     // the outbox) and is converted to the model's key type before binding.
+    //
+    // The worker is a background indexer that must see every tenant's rows, so it
+    // reads under `with_system_scope` — the audited cross-tenant escape (ADR 0021).
+    // Tenant isolation for RAG *search* is unaffected: that still filters by the
+    // caller's tenant at query time.
     let pk_val = pk_value_from_text(pk_str, pk.ty, pk.column)?;
     let mut plan = Plan::new(meta);
     plan.filters
         .push(Q::new(pk.name.to_string(), pk_val.clone()));
     plan.limit = Some(1);
-    let Some(row) = fetch_value_rows(&plan).await?.into_iter().next() else {
+    let Some(row) = db::with_system_scope(fetch_value_rows(&plan))
+        .await?
+        .into_iter()
+        .next()
+    else {
         // The row was deleted between enqueue and now: remove its chunks.
         delete_chunks(&shadow, pk_str).await?;
         return Ok(Handled::Delete);

@@ -373,6 +373,11 @@ enum MigrateAction {
     /// Show the additive changes `push` would apply, without touching the
     /// database. Read-only. (`cargo run --bin diff`.)
     Diff,
+    /// Scan the migrations in `migrations/` for operations that are unsafe under a
+    /// rolling upgrade (data loss, long exclusive locks, non-concurrent indexes,
+    /// renames) and exit non-zero on a dangerous one — a CI gate (ADR 0022). A
+    /// pure files operation: no database, no compiled models.
+    Lint,
 }
 
 #[derive(Subcommand)]
@@ -490,6 +495,7 @@ fn main() -> ExitCode {
             MigrateAction::Down { to } => on_runtime(migrate_down(to, json)),
             MigrateAction::Status => on_runtime(migrate_status(json)),
             MigrateAction::Diff => cargo_run("diff", json),
+            MigrateAction::Lint => migrate_lint(json),
         },
         CliCommand::Push => cargo_run("sync", false),
         CliCommand::Shell => cargo_run("shell", false),
@@ -887,6 +893,50 @@ async fn migrate_down(to: i64, json: bool) -> CliResult {
         }
     }
     Ok(0)
+}
+
+/// `dorm migrate lint`: scan `migrations/` for rolling-upgrade hazards (ADR 0022).
+///
+/// Pure files, no database and no compiled models — the same on-disk history
+/// `migrate down` reads. Exits `1` when a `Dangerous` finding is present, so CI
+/// stops a data-losing or table-rewriting migration before it ships.
+fn migrate_lint(json: bool) -> CliResult {
+    let recorded = dorm_migrations::History::open("migrations")
+        .load()
+        .map_err(|e| format!("reading the migrations/ history: {e}"))?;
+    let migrations: Vec<dorm_migrations::Migration> =
+        recorded.iter().map(|m| m.to_migration()).collect();
+    let findings = dorm_migrations::lint::lint(&migrations);
+    let blocking = dorm_migrations::lint::has_blocking(&findings);
+
+    if json {
+        let arr: Vec<_> = findings
+            .iter()
+            .map(|f| {
+                json!({
+                    "version": f.version,
+                    "severity": f.severity.label(),
+                    "message": f.message,
+                    "statement": f.statement,
+                })
+            })
+            .collect();
+        println!("{}", json!({ "findings": arr, "blocking": blocking }));
+    } else if findings.is_empty() {
+        println!(
+            "migrate lint: no issues across {} migration(s).",
+            migrations.len()
+        );
+    } else {
+        for f in &findings {
+            println!("[{}] v{}: {}", f.severity.label(), f.version, f.message);
+            println!("    {}", f.statement);
+        }
+        if blocking {
+            eprintln!("migrate lint: dangerous operation(s) found — see above.");
+        }
+    }
+    Ok(if blocking { 1 } else { 0 })
 }
 
 /// The migrations ledger, matching `dorm_migrations::migrator` (kept out of its

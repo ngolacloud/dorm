@@ -28,6 +28,17 @@ pub enum Lookup {
     IRegex,
     IsNull,
     Range,
+    /// Network containment on an `INET` column (ADR 0040): `>>` (this column's
+    /// network contains the value), `<<` (is contained by), `&&` (overlaps). The
+    /// value is given as text (an IP or CIDR) and cast to `inet`.
+    NetContains,
+    NetContainedBy,
+    NetOverlaps,
+    /// Array set operators on a `TEXT[]`/`BIGINT[]` column (ADR 0041): `@>`
+    /// contains, `<@` contained-by, `&&` overlaps. The value is an array.
+    ArrayContains,
+    ArrayContainedBy,
+    ArrayOverlap,
 }
 
 /// How many values a lookup binds.
@@ -64,6 +75,12 @@ impl Lookup {
             "iregex" => Lookup::IRegex,
             "isnull" => Lookup::IsNull,
             "range" => Lookup::Range,
+            "net_contains" => Lookup::NetContains,
+            "net_contained_by" => Lookup::NetContainedBy,
+            "net_overlaps" => Lookup::NetOverlaps,
+            "array_contains" => Lookup::ArrayContains,
+            "array_contained_by" => Lookup::ArrayContainedBy,
+            "array_overlap" => Lookup::ArrayOverlap,
             _ => return None,
         })
     }
@@ -87,6 +104,12 @@ impl Lookup {
             Lookup::IRegex => "iregex",
             Lookup::IsNull => "isnull",
             Lookup::Range => "range",
+            Lookup::NetContains => "net_contains",
+            Lookup::NetContainedBy => "net_contained_by",
+            Lookup::NetOverlaps => "net_overlaps",
+            Lookup::ArrayContains => "array_contains",
+            Lookup::ArrayContainedBy => "array_contained_by",
+            Lookup::ArrayOverlap => "array_overlap",
         }
     }
 
@@ -113,6 +136,24 @@ impl Lookup {
                 | Lookup::Regex
                 | Lookup::IRegex
                 | Lookup::IExact
+        )
+    }
+
+    /// Whether this is a network-set operator (`>>`/`<<`/`&&`), meaningful only
+    /// on an `INET` column (ADR 0040).
+    pub fn is_network(self) -> bool {
+        matches!(
+            self,
+            Lookup::NetContains | Lookup::NetContainedBy | Lookup::NetOverlaps
+        )
+    }
+
+    /// Whether this is an array-set operator (`@>`/`<@`/`&&`), meaningful only on
+    /// an array column (ADR 0041).
+    pub fn is_array(self) -> bool {
+        matches!(
+            self,
+            Lookup::ArrayContains | Lookup::ArrayContainedBy | Lookup::ArrayOverlap
         )
     }
 
@@ -151,6 +192,20 @@ impl Lookup {
                 want: "boolean, for isnull",
             });
         }
+
+        if self.is_network() && !matches!(ty, FieldType::Inet | FieldType::Cidr) {
+            return Err(Error::UnexpectedColumnType {
+                column: path.to_string(),
+                want: "inet or cidr column, for a network lookup",
+            });
+        }
+
+        if self.is_array() && !matches!(ty, FieldType::TextArray | FieldType::IntArray) {
+            return Err(Error::UnexpectedColumnType {
+                column: path.to_string(),
+                want: "array column, for an array lookup",
+            });
+        }
         Ok(())
     }
 }
@@ -186,6 +241,12 @@ mod tests {
             Lookup::IRegex,
             Lookup::IsNull,
             Lookup::Range,
+            Lookup::NetContains,
+            Lookup::NetContainedBy,
+            Lookup::NetOverlaps,
+            Lookup::ArrayContains,
+            Lookup::ArrayContainedBy,
+            Lookup::ArrayOverlap,
         ] {
             assert_eq!(Lookup::parse(l.name()), Some(l), "{}", l.name());
         }

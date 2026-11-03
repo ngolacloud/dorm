@@ -47,6 +47,12 @@ pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
 /// `CREATE TABLE` followed by its `CREATE INDEX`es, terminated by `;\n`.
 pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<String> {
     let mut out = String::new();
+    // Native enum types come first — a column cannot reference a type that does
+    // not exist yet (ADR 0046).
+    for stmt in create_enum_types(models, backend) {
+        out.push_str(&stmt);
+        out.push_str(";\n");
+    }
     for (i, m) in models.iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -59,6 +65,62 @@ pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<
         }
     }
     Ok(out)
+}
+
+/// `CREATE TYPE … AS ENUM (…)` for every distinct native enum type the models
+/// declare, idempotent, in dependency order (types before the tables that use
+/// them) — ADR 0046.
+///
+/// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, so each is wrapped in a `DO`
+/// block that checks `pg_type` first; re-running is a no-op. On SQLite/MySQL the
+/// enum column is a plain `TEXT` (`sql_type`), so there is no type to create and
+/// this is empty. The variants are model-definition constants (compile time,
+/// never a caller), so they are quoted straight in — the same rule as a field
+/// default or a `CHECK`.
+pub fn create_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    dorm_core::meta::enum_types_of(models)
+        .into_iter()
+        .map(|(name, variants)| {
+            let labels = variants
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "DO $$ BEGIN \
+                 IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{name}') THEN \
+                 CREATE TYPE {name} AS ENUM ({labels}); \
+                 END IF; END $$"
+            )
+        })
+        .collect()
+}
+
+/// `ALTER TYPE … ADD VALUE IF NOT EXISTS` for every declared enum variant, so an
+/// enum that pre-exists with fewer labels gains the ones a model added (ADR 0046
+/// follow-up). Idempotent — a label already present is a no-op — and best run
+/// **outside a transaction**, which `sync` does. Postgres-only (SQLite/MySQL store
+/// the column as `TEXT`, so there is no type to alter); returns empty otherwise.
+///
+/// `ADD VALUE` only appends a label; reordering or removing a variant is not
+/// expressible in PostgreSQL and stays out of scope.
+pub fn alter_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (name, variants) in dorm_core::meta::enum_types_of(models) {
+        for v in variants {
+            let label = v.replace('\'', "''");
+            out.push(format!(
+                "ALTER TYPE {name} ADD VALUE IF NOT EXISTS '{label}'"
+            ));
+        }
+    }
+    out
 }
 
 /// `CREATE TABLE …` for PostgreSQL. See [`create_table_on`] for another backend.
@@ -83,8 +145,26 @@ pub fn create_table_on(meta: &ModelMeta, backend: Backend) -> Result<String> {
 pub fn create_table_named_on(meta: &ModelMeta, name: &str, backend: Backend) -> Result<String> {
     let mut parts =
         Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
+    // A composite primary key (>1 `primary_key` field) is a table-level
+    // `PRIMARY KEY (a, b)` (ADR 0042); its columns are emitted plain (no inline
+    // `PRIMARY KEY`). A single key stays inline, serial shortcut included.
+    let pk_cols: Vec<&str> = meta
+        .fields
+        .iter()
+        .filter(|f| f.primary_key)
+        .map(|f| f.column)
+        .collect();
+    let composite = pk_cols.len() > 1;
     for f in meta.fields {
-        parts.push(column_def(f, backend)?);
+        if composite && f.primary_key {
+            // A plain column — the key-ness is the table-level constraint below.
+            parts.push(format!("{} {}", f.column, column_modifiers(f, backend)?));
+        } else {
+            parts.push(column_def(f, backend)?);
+        }
+    }
+    if composite {
+        parts.push(format!("PRIMARY KEY ({})", pk_cols.join(", ")));
     }
     for group in meta.unique_together {
         parts.push(format!("UNIQUE ({})", group.join(", ")));
@@ -217,11 +297,126 @@ pub fn rename_column(table: &str, from: &str, to: &str) -> String {
     format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")
 }
 
+/// Reject anything that is not a plain SQL identifier before it is spliced into
+/// DDL. The expand/contract builders below take table/column/constraint names as
+/// *configuration*, never bound parameters, so each one passes through here — the
+/// same gate `partition.rs` keeps (ADR 0022: identifiers come from the schema,
+/// not from a caller; **I1**).
+fn ident(name: &str) -> Result<&str> {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(name)
+    } else {
+        Err(Error::Orm(dorm_core::Error::Config(format!(
+            "`{name}` is not a usable SQL identifier"
+        ))))
+    }
+}
+
+/// The conventional name of the `NOT NULL` guard constraint for a column:
+/// `<table>_<column>_not_null`. The one place it is spelled, so the `ADD` of
+/// [`add_not_null_check_not_valid`] and the `VALIDATE`/`DROP` of
+/// [`validate_not_null`]/[`drop_constraint`] always agree on the name.
+pub fn not_null_constraint(table: &str, column: &str) -> String {
+    format!("{table}_{column}_not_null")
+}
+
+/// `ALTER TABLE <t> ADD CONSTRAINT <t>_<c>_not_null CHECK (<c> IS NOT NULL) NOT VALID`
+/// — the first step of enforcing `NOT NULL` online (ADR 0038 / expand/contract).
+///
+/// `NOT VALID` means PostgreSQL adds the constraint **without scanning the table**,
+/// taking only a brief lock: new and updated rows are checked immediately, but the
+/// existing rows are left for a later [`validate_not_null`]. That split is what
+/// lets a populated table gain a `NOT NULL` guard without a long `ACCESS EXCLUSIVE`
+/// lock or a table rewrite — unlike `ALTER COLUMN … SET NOT NULL`, which scans the
+/// whole table under an exclusive lock.
+pub fn add_not_null_check_not_valid(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    let name = not_null_constraint(table, column);
+    Ok(format!(
+        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({column} IS NOT NULL) NOT VALID"
+    ))
+}
+
+/// `ALTER TABLE <t> VALIDATE CONSTRAINT <t>_<c>_not_null` — the second step.
+///
+/// Validation scans the table to prove every existing row satisfies the check, but
+/// under a `SHARE UPDATE EXCLUSIVE` lock that lets reads and writes keep flowing —
+/// the lock a non-blocking operation can afford. Run it after the backfill has
+/// filled the column, so the scan finds no violations.
+pub fn validate_not_null(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    let name = not_null_constraint(table, column);
+    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+}
+
+/// `ALTER TABLE <t> ADD CONSTRAINT <name> CHECK (<expr>) NOT VALID` for an
+/// arbitrary author-written `check_expr` — the general form of
+/// [`add_not_null_check_not_valid`]. The check expression is the author's SQL (the
+/// same trust `ModelMeta::checks` and ADR 0005 raw SQL already carry); `table` and
+/// `name` are validated identifiers.
+pub fn add_check_not_valid(table: &str, name: &str, check_expr: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!(
+        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({check_expr}) NOT VALID"
+    ))
+}
+
+/// `ALTER TABLE <t> VALIDATE CONSTRAINT <name>` for an arbitrary constraint name.
+pub fn validate_constraint(table: &str, name: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+}
+
+/// `ALTER TABLE <t> DROP CONSTRAINT IF EXISTS <name>` — the `contract`-step inverse
+/// of an added constraint, or the cleanup once the column is a real `NOT NULL`.
+pub fn drop_constraint(table: &str, name: &str) -> Result<String> {
+    let table = ident(table)?;
+    let name = ident(name)?;
+    Ok(format!(
+        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}"
+    ))
+}
+
+/// `ALTER TABLE <t> ALTER COLUMN <c> SET NOT NULL` — the optional final step.
+///
+/// On PostgreSQL 12+ a *validated* `CHECK (<c> IS NOT NULL)` lets this `SET NOT NULL`
+/// be proven from the constraint and **skip the full-table scan**, so the column
+/// becomes a genuine `NOT NULL` cheaply; the guard check can then be dropped with
+/// [`drop_constraint`]. Run it only after [`validate_not_null`] has succeeded.
+pub fn set_not_null(table: &str, column: &str) -> Result<String> {
+    let table = ident(table)?;
+    let column = ident(column)?;
+    Ok(format!(
+        "ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"
+    ))
+}
+
 /// `CREATE INDEX IF NOT EXISTS <table>_<column>_idx ON <table> (<column>)` — the
 /// one place the index name is spelled, shared by [`indexes`] and the
 /// autodetector so a dropped index names exactly what a created one made.
 pub fn index_on(table: &str, column: &str) -> String {
-    format!("CREATE INDEX IF NOT EXISTS {table}_{column}_idx ON {table} ({column})")
+    index_on_cols(table, &[column])
+}
+
+/// The composite form: `CREATE INDEX IF NOT EXISTS <table>_<c1>_<c2>_idx ON <table> (<c1>, <c2>)` (ADR 0044). The single-column [`index_on`] is this with
+/// one column, so one naming rule serves both and a dropped index names exactly
+/// what a created one made.
+pub fn index_on_cols(table: &str, columns: &[&str]) -> String {
+    let name = index_name(table, columns);
+    format!(
+        "CREATE INDEX IF NOT EXISTS {name} ON {table} ({})",
+        columns.join(", ")
+    )
+}
+
+/// The one place a (possibly composite) index name is spelled:
+/// `<table>_<c1>_<c2>_idx`.
+pub fn index_name(table: &str, columns: &[&str]) -> String {
+    format!("{table}_{}_idx", columns.join("_"))
 }
 
 /// Like [`index_on`] but non-blocking on PostgreSQL (B-22).
@@ -235,13 +430,20 @@ pub fn index_on(table: &str, column: &str) -> String {
 /// transactional table changes. SQLite has no `CONCURRENTLY`, so it falls back
 /// to the plain form.
 pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> String {
+    index_on_cols_concurrent(table, &[column], backend)
+}
+
+/// The composite form of [`index_on_concurrent`] (ADR 0044).
+pub fn index_on_cols_concurrent(table: &str, columns: &[&str], backend: Backend) -> String {
+    let name = index_name(table, columns);
+    let cols = columns.join(", ");
     match backend {
         // MySQL has no `CREATE INDEX CONCURRENTLY`.
-        Backend::MySql => index_on(table, column),
-        Backend::Postgres => format!(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_{column}_idx ON {table} ({column})"
-        ),
-        Backend::Sqlite => index_on(table, column),
+        Backend::MySql => index_on_cols(table, columns),
+        Backend::Postgres => {
+            format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({cols})")
+        }
+        Backend::Sqlite => index_on_cols(table, columns),
     }
 }
 
@@ -292,6 +494,13 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Decimal => "NUMERIC",
             FieldType::F64 => "REAL",
             FieldType::Bytes => "BLOB",
+            // SQLite has no INET; the text form is stored, and a read is refused
+            // (ADR 0040) — network operators are PostgreSQL-only.
+            FieldType::Inet => "TEXT",
+            FieldType::Cidr | FieldType::MacAddr => "TEXT",
+            FieldType::TextArray | FieldType::IntArray => "TEXT",
+            // No native enum portably; the label is stored as TEXT (ADR 0046).
+            FieldType::Enum(_) => "TEXT",
         }
         .to_string(),
         Backend::MySql => match ty {
@@ -312,6 +521,10 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Uuid => "CHAR(36)",
             FieldType::Json => "JSON",
             FieldType::Bytes => "LONGBLOB",
+            FieldType::Inet => "TEXT",
+            FieldType::Cidr | FieldType::MacAddr => "TEXT",
+            FieldType::TextArray | FieldType::IntArray => "TEXT",
+            FieldType::Enum(_) => "TEXT",
         }
         .to_string(),
     }
@@ -328,11 +541,18 @@ fn relation_target(model: &'static str) -> Result<(&'static str, &'static str)> 
 /// A `unique` column already has an index; this mirrors the hand-written schema,
 /// which declares the explicit index anyway when the field asks for one.
 pub fn indexes(meta: &ModelMeta) -> Vec<String> {
-    meta.fields
+    let mut out: Vec<String> = meta
+        .fields
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on(meta.table, f.column))
-        .collect()
+        .collect();
+    // Composite indexes (`@@index([a, b])`, ADR 0044) come from the `IndexMeta`
+    // slice, not a `ModelMeta` field.
+    for group in meta.composite_indexes() {
+        out.push(index_on_cols(meta.table, group));
+    }
+    out
 }
 
 /// Like [`indexes`] but each index builds `CONCURRENTLY` on PostgreSQL (B-22), so
@@ -340,11 +560,16 @@ pub fn indexes(meta: &ModelMeta) -> Vec<String> {
 /// indexes to a possibly-populated table where a blocking build would stop
 /// writes.
 pub fn indexes_concurrent(meta: &ModelMeta, backend: Backend) -> Vec<String> {
-    meta.fields
+    let mut out: Vec<String> = meta
+        .fields
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on_concurrent(meta.table, f.column, backend))
-        .collect()
+        .collect();
+    for group in meta.composite_indexes() {
+        out.push(index_on_cols_concurrent(meta.table, group, backend));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -471,6 +696,51 @@ mod tests {
             indexes(&M),
             vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
         );
+    }
+
+    // ADR 0038: the expand/contract vocabulary — `CHECK … NOT VALID` then
+    // `VALIDATE` — turns a nullable column into a `NOT NULL` one without a long
+    // exclusive lock, and names the guard constraint the same way every time.
+    #[test]
+    fn a_not_null_check_is_added_not_valid_then_validated_under_a_stable_name() {
+        assert_eq!(
+            add_not_null_check_not_valid("accounts", "email").unwrap(),
+            "ALTER TABLE accounts ADD CONSTRAINT accounts_email_not_null \
+             CHECK (email IS NOT NULL) NOT VALID"
+        );
+        assert_eq!(
+            validate_not_null("accounts", "email").unwrap(),
+            "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_email_not_null"
+        );
+        assert_eq!(
+            set_not_null("accounts", "email").unwrap(),
+            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL"
+        );
+        assert_eq!(
+            drop_constraint("accounts", "accounts_email_not_null").unwrap(),
+            "ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_email_not_null"
+        );
+    }
+
+    #[test]
+    fn a_general_check_carries_the_author_expression_and_validates_by_name() {
+        assert_eq!(
+            add_check_not_valid("orders", "orders_total_positive", "total >= 0").unwrap(),
+            "ALTER TABLE orders ADD CONSTRAINT orders_total_positive CHECK (total >= 0) NOT VALID"
+        );
+        assert_eq!(
+            validate_constraint("orders", "orders_total_positive").unwrap(),
+            "ALTER TABLE orders VALIDATE CONSTRAINT orders_total_positive"
+        );
+    }
+
+    #[test]
+    fn an_injection_in_a_constraint_table_or_column_name_is_refused() {
+        assert!(add_not_null_check_not_valid("evil; DROP TABLE x", "c").is_err());
+        assert!(add_not_null_check_not_valid("t", "c; DROP").is_err());
+        assert!(add_check_not_valid("t", "name; DROP", "c IS NOT NULL").is_err());
+        assert!(validate_constraint("t", "bad name").is_err());
+        assert!(set_not_null("", "c").is_err());
     }
 
     // B-22: the concurrent variant builds without blocking writes on PostgreSQL
@@ -689,6 +959,74 @@ mod tests {
         assert_eq!(
             with_ts, 1,
             "the CURRENT_TIMESTAMP default filled created_at"
+        );
+    }
+
+    #[test]
+    fn a_composite_index_names_and_spans_all_its_columns() {
+        // Pure: no database, no registered model — the name is one rule, shared
+        // with the single-column form, and spans every column (ADR 0044).
+        assert_eq!(
+            index_on_cols("events", &["tenant", "created_at"]),
+            "CREATE INDEX IF NOT EXISTS events_tenant_created_at_idx ON events (tenant, created_at)"
+        );
+        // A single column goes through the same path as `index_on`.
+        assert_eq!(
+            index_on("events", "tenant"),
+            index_on_cols("events", &["tenant"])
+        );
+        // Concurrent on PostgreSQL; the fallback on SQLite is the plain form.
+        assert_eq!(
+            index_on_cols_concurrent("events", &["tenant", "created_at"], Backend::Postgres),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS events_tenant_created_at_idx \
+             ON events (tenant, created_at)"
+        );
+        assert_eq!(
+            index_on_cols_concurrent("events", &["a", "b"], Backend::Sqlite),
+            index_on_cols("events", &["a", "b"])
+        );
+    }
+
+    // A model with a composite index, registered the way the derive does it: an
+    // `IndexMeta` in the slice. `indexes()` appends its `CREATE INDEX` after the
+    // per-field ones (ADR 0044).
+    dorm_core::inventory::submit! {
+        dorm_core::meta::IndexMeta { model: "IdxModel", columns: &["tenant", "created_at"] }
+    }
+
+    #[test]
+    fn indexes_include_the_composite_groups_after_the_per_field_ones() {
+        const FS: &[FieldMeta] = &[FieldMeta {
+            name: "slug",
+            column: "slug",
+            ty: FieldType::Text,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: true,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        }];
+        const M: ModelMeta = ModelMeta {
+            name: "IdxModel",
+            table: "idx_models",
+            fields: FS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        assert_eq!(
+            indexes(&M),
+            vec![
+                "CREATE INDEX IF NOT EXISTS idx_models_slug_idx ON idx_models (slug)".to_string(),
+                "CREATE INDEX IF NOT EXISTS idx_models_tenant_created_at_idx \
+                 ON idx_models (tenant, created_at)"
+                    .to_string(),
+            ]
         );
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::lexer::{lex, Tok};
 use crate::{
-    snake, Auto, Datasource, Field, Model, OnDelete, RagBlock, Relation, Scalar, ScalarField,
-    Schema, Url,
+    snake, Auto, Datasource, EnumDecl, EnumField, Field, Model, OnDelete, RagBlock, Relation,
+    Scalar, ScalarField, Schema, Url,
 };
 
 /// A parse failure, with the 1-based line when known.
@@ -86,6 +86,7 @@ impl Parser {
     fn schema(&mut self) -> R<Schema> {
         let mut datasource = None;
         let mut models = Vec::new();
+        let mut enums = Vec::new();
         while let Some(tok) = self.peek() {
             match tok {
                 Tok::Ident(kw) if kw == "datasource" => {
@@ -96,6 +97,10 @@ impl Parser {
                     self.pos += 1;
                     models.push(self.model()?);
                 }
+                Tok::Ident(kw) if kw == "enum" => {
+                    self.pos += 1;
+                    enums.push(self.enum_decl()?);
+                }
                 Tok::Ident(kw) if kw == "generator" => {
                     // Accepted and ignored: DORM generates via `dorm generate`,
                     // not a `generator` block, but tolerating it eases paste-in
@@ -104,10 +109,52 @@ impl Parser {
                     let _ = self.ident();
                     self.skip_block()?;
                 }
-                _ => return self.err("expected `datasource` or `model`"),
+                _ => return self.err("expected `datasource`, `model` or `enum`"),
             }
         }
-        Ok(Schema { datasource, models })
+        // Resolution pass: an enum may be declared after the model that uses it,
+        // so `field()` cannot tell `status OrderStatus` from a relation. Now that
+        // every `enum` is known, rewrite each to-one "relation" whose target is a
+        // declared enum into a `Field::Enum`, preserving its column and nullability.
+        for m in &mut models {
+            for f in &mut m.fields {
+                if let Field::ToOne(r) = f {
+                    if enums.iter().any(|e| e.name == r.target) {
+                        *f = Field::Enum(EnumField {
+                            name: r.name.clone(),
+                            column: r.column.clone(),
+                            enum_name: r.target.clone(),
+                            nullable: r.nullable,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Schema {
+            datasource,
+            models,
+            enums,
+        })
+    }
+
+    /// Parse an `enum Name { v1 v2 … }` block (ADR 0047). The variants are bare
+    /// idents separated by whitespace or newlines (Prisma style), up to `}`.
+    fn enum_decl(&mut self) -> R<EnumDecl> {
+        let name = self.ident()?;
+        self.punct('{')?;
+        let mut variants = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Tok::Punct('}')) => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(Tok::Ident(_)) => variants.push(self.ident()?),
+                Some(_) => return self.err("expected an enum variant name or `}`"),
+                None => return self.err("unterminated enum"),
+            }
+        }
+        Ok(EnumDecl { name, variants })
     }
 
     fn skip_block(&mut self) -> R<()> {
@@ -195,6 +242,9 @@ impl Parser {
         let name = self.ident()?;
         let mut table = pluralized_table(&name);
         let mut rag = None;
+        let mut unique_together: Vec<Vec<String>> = Vec::new();
+        let mut composite_id: Vec<String> = Vec::new();
+        let mut indexes: Vec<Vec<String>> = Vec::new();
         self.punct('{')?;
         let mut fields = Vec::new();
         loop {
@@ -208,6 +258,9 @@ impl Parser {
                     match self.block_attr()? {
                         BlockAttr::Map(t) => table = t,
                         BlockAttr::Rag(r) => rag = Some(r),
+                        BlockAttr::Unique(cols) => unique_together.push(cols),
+                        BlockAttr::Id(cols) => composite_id = cols,
+                        BlockAttr::Index(cols) => indexes.push(cols),
                         BlockAttr::Ignored => {}
                     }
                 }
@@ -220,6 +273,9 @@ impl Parser {
             table,
             fields,
             rag,
+            unique_together,
+            composite_id,
+            indexes,
         })
     }
 
@@ -230,6 +286,21 @@ impl Parser {
         let name = self.ident()?;
         if name == "rag" {
             return Ok(BlockAttr::Rag(self.rag_block()?));
+        }
+        // `@@unique([a, b])`, `@@id([a, b])` and `@@index([a, b])` carry a column
+        // list the AST models (ADR 0043/0044); anything else is still parsed and
+        // dropped.
+        if matches!(name.as_str(), "unique" | "id" | "index")
+            && self.peek() == Some(&Tok::Punct('('))
+        {
+            self.punct('(')?;
+            let cols = self.ident_list()?;
+            self.punct(')')?;
+            return Ok(match name.as_str() {
+                "unique" => BlockAttr::Unique(cols),
+                "id" => BlockAttr::Id(cols),
+                _ => BlockAttr::Index(cols),
+            });
         }
         let mut result = BlockAttr::Ignored;
         if self.eat_punct('(') {
@@ -248,6 +319,24 @@ impl Parser {
             }
         }
         Ok(result)
+    }
+
+    /// A bracketed list of identifiers: `[a, b, c]` — the shape `@@unique`/`@@id`
+    /// take.
+    fn ident_list(&mut self) -> R<Vec<String>> {
+        self.punct('[')?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_punct(']') {
+                break;
+            }
+            out.push(self.ident()?);
+            if !self.eat_punct(',') {
+                self.punct(']')?;
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Parse the args of `@@rag(fields: [title, body], embedder: "default", …)`.
@@ -498,7 +587,13 @@ enum BlockAttr {
     Map(String),
     /// `@@rag(..)` — the RAG declaration (ADR 0019).
     Rag(RagBlock),
-    /// Anything else (`@@index`, …): valid, but not modelled by the AST.
+    /// `@@unique([a, b])` — a composite-unique group (ADR 0043).
+    Unique(Vec<String>),
+    /// `@@id([a, b])` — a composite primary key (ADR 0043).
+    Id(Vec<String>),
+    /// `@@index([a, b])` — a composite index (ADR 0044).
+    Index(Vec<String>),
+    /// Anything else: valid, but not modelled by the AST.
     Ignored,
 }
 
@@ -539,6 +634,56 @@ mod tests {
         let bad = parse("model T {\n  id Int @id\n  @@rag(fyelds: [id])\n}\n");
         assert!(bad.is_err());
         assert!(bad.unwrap_err().0.contains("unknown @@rag option"));
+    }
+
+    #[test]
+    fn a_top_level_enum_resolves_the_field_that_uses_it() {
+        use crate::Field;
+        // The enum is declared *after* the model that uses it, to prove the
+        // resolution pass runs once the whole schema is known.
+        let src = r#"
+            model Order {
+              id     Int         @id @default(autoincrement())
+              status OrderStatus
+            }
+
+            enum OrderStatus { pending paid shipped }
+        "#;
+        let schema = parse(src).expect("parses");
+        assert_eq!(schema.enums.len(), 1);
+        assert_eq!(schema.enums[0].name, "OrderStatus");
+        assert_eq!(schema.enums[0].variants, vec!["pending", "paid", "shipped"]);
+        // The `status` field is an enum field, not a relation.
+        let status = &schema.models[0].fields[1];
+        match status {
+            Field::Enum(e) => {
+                assert_eq!(e.name, "status");
+                assert_eq!(e.column, "status");
+                assert_eq!(e.enum_name, "OrderStatus");
+                assert!(!e.nullable);
+            }
+            other => panic!("expected Field::Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nullable_enum_field_keeps_its_nullability() {
+        use crate::Field;
+        let src = r#"
+            enum OrderStatus { pending paid }
+            model Order {
+              id     Int          @id @default(autoincrement())
+              status OrderStatus? @map("order_status")
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        match &schema.models[0].fields[1] {
+            Field::Enum(e) => {
+                assert!(e.nullable);
+                assert_eq!(e.column, "order_status");
+            }
+            other => panic!("expected Field::Enum, got {other:?}"),
+        }
     }
 
     #[test]

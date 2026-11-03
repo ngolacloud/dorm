@@ -65,11 +65,23 @@ pub fn initial(models: &[&'static ModelMeta]) -> Result<Migration> {
 /// The migrations ledger. Separate from `delonix-api`'s `schema_migrations` on
 /// purpose: while the two migrators coexist (ADR 0072 transition) they must not
 /// write the same table. The `contract` step folds them.
-const LEDGER: &str = "orm_schema_migrations";
+pub(crate) const LEDGER: &str = "orm_schema_migrations";
 
 /// A fixed, arbitrary advisory-lock key. Every process applying migrations takes
 /// it, so two `migrate` calls serialise instead of racing on `CREATE TABLE`.
 const MIGRATE_LOCK: i64 = 0x0072_0d61;
+
+/// The per-migration `lock_timeout`, in milliseconds (ADR 0022).
+pub const MIGRATE_LOCK_TIMEOUT_ENV: &str = "DELONIX_ORM_MIGRATE_LOCK_TIMEOUT_MS";
+
+/// The configured migration `lock_timeout` as a GUC string, or `None` to leave
+/// PostgreSQL's wait-forever default. `0` and empty both mean "no timeout".
+fn migrate_lock_timeout_ms() -> Option<String> {
+    std::env::var(MIGRATE_LOCK_TIMEOUT_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0")
+}
 
 /// Apply the migrations not yet recorded in `orm_schema_migrations`, in order,
 /// each inside the transaction that records it — the `prisma migrate deploy` /
@@ -100,6 +112,13 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
                 &[Value::I64(MIGRATE_LOCK)],
             )
             .await?;
+            // A migration that waits on a lock should fail fast rather than pile
+            // up connections behind a long-running transaction (ADR 0022). The
+            // `lock_timeout` is transaction-local via the safe `set_local` of ADR
+            // 0023; `0`/unset keeps PostgreSQL's wait-forever default.
+            if let Some(ms) = migrate_lock_timeout_ms() {
+                db::set_local("lock_timeout", &ms).await?;
+            }
         }
         db::run(
             &format!(
@@ -258,8 +277,16 @@ pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     // Transactional part: create missing tables and add missing columns, under
     // the advisory lock so two concurrent syncs serialise rather than racing on
     // `ALTER TABLE`.
+    // Native enum types (ADR 0046) are created before the tables — a column
+    // cannot reference a type that does not exist. Idempotent `DO` blocks, so a
+    // re-run is a no-op; not reported as a change (like the indexes).
+    let enum_types = ddl::create_enum_types(models, backend);
+
     let changes = db::atomic(|_tx| async move {
         db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+        for stmt in &enum_types {
+            db::execute(stmt, &[]).await?;
+        }
         let (tables, columns) = introspect().await?;
         let changes = changes_for(&plans, &tables, &columns);
         for stmt in &changes {
@@ -274,6 +301,14 @@ pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     // populated table.
     for idx in &index_stmts {
         db::execute(idx, &[]).await?;
+    }
+
+    // Also non-transactional: evolve any enum that gained a variant (ADR 0046
+    // follow-up). `ALTER TYPE … ADD VALUE` is best run outside a transaction, and
+    // `IF NOT EXISTS` makes emitting it for every declared variant idempotent, so
+    // a pre-existing type simply gains the labels it was missing.
+    for stmt in ddl::alter_enum_types(models, backend) {
+        db::execute(&stmt, &[]).await?;
     }
 
     Ok(changes)

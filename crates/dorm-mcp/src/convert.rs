@@ -39,6 +39,11 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Decimal(d) => Json::String(d.to_string()),
         Value::Timestamp(t) => Json::String(t.to_rfc3339()),
         Value::Uuid(u) => Json::String(u.to_string()),
+        Value::Inet(ip) => Json::String(ip.to_string()),
+        Value::Cidr(c) => Json::String(c.to_string()),
+        Value::MacAddr(m) => Json::String(m.to_hex_string()),
+        Value::TextArray(v) => Json::from(v.clone()),
+        Value::IntArray(v) => Json::from(v.clone()),
         Value::Json(j) => j.clone(),
         // Bytes as `\x`-hex, the same unambiguous rendering the REPL uses.
         Value::Bytes(b) => {

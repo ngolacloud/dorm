@@ -37,10 +37,12 @@
 
 pub mod compiler;
 pub mod cqrs;
+pub mod cursor;
 pub mod db;
 pub mod error;
 pub mod expr;
 pub mod field;
+pub mod idempotency;
 pub mod lookup;
 pub mod m2m;
 pub mod meta;
@@ -49,6 +51,7 @@ pub mod prefetch;
 pub mod queryset;
 pub mod registry;
 pub mod row;
+pub mod scope;
 pub mod value;
 
 pub use error::{Error, Result};

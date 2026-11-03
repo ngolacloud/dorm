@@ -86,6 +86,17 @@ fn to_sqlite(v: &Value) -> rusqlite::types::Value {
         Value::Uuid(u) => S::Text(u.to_string()),
         Value::Json(j) => S::Text(j.to_string()),
         Value::Bytes(b) => S::Blob(b.clone()),
+        Value::Inet(ip) => S::Text(ip.to_string()),
+        Value::Cidr(c) => S::Text(c.to_string()),
+        Value::MacAddr(m) => S::Text(m.to_hex_string()),
+        Value::TextArray(v) => S::Text(format!("{{{}}}", v.join(","))),
+        Value::IntArray(v) => S::Text(format!(
+            "{{{}}}",
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
     }
 }
 
@@ -138,6 +149,14 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
                 .parse()
                 .map_err(|_| mismatch("uuid"))?,
         ),
+        FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
+        FieldType::Cidr => return Err(mismatch("cidr, which SQLite does not support")),
+        FieldType::MacAddr => return Err(mismatch("macaddr, which SQLite does not support")),
+        FieldType::TextArray | FieldType::IntArray => {
+            return Err(mismatch("arrays, which SQLite does not support"))
+        }
+        // An enum is a plain TEXT column on SQLite (ADR 0046); read the label.
+        FieldType::Enum(_) => Value::Text(as_text(&raw).ok_or(mismatch("enum text"))?),
         FieldType::Json => Value::Json(
             serde_json::from_str(&as_text(&raw).ok_or(mismatch("json text"))?)
                 .map_err(|_| mismatch("json"))?,

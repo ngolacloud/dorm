@@ -185,6 +185,11 @@ pub struct Resolved {
     pub alias: String,
     pub field: &'static FieldMeta,
     pub lookup: Lookup,
+    /// A path *inside* a `Json` column, when the lookup reaches into JSONB — e.g.
+    /// `spec__cpu__gte` resolves `spec` (a `Json` field) with `json_path = ["cpu"]`
+    /// and `lookup = Gte`. Empty for an ordinary column. The compiler turns it into
+    /// a `jsonb_extract_path_text(...)` with each segment **bound** (ADR 0025).
+    pub json_path: Vec<String>,
 }
 
 /// The alias for the root table of a query.
@@ -235,6 +240,7 @@ pub fn resolve(root: &'static ModelMeta, path: &str) -> Result<Resolved> {
                     alias,
                     field,
                     lookup: Lookup::Exact,
+                    json_path: Vec::new(),
                 });
             }
 
@@ -253,8 +259,28 @@ pub fn resolve(root: &'static ModelMeta, path: &str) -> Result<Resolved> {
                         alias,
                         field,
                         lookup,
+                        json_path: Vec::new(),
                     });
                 }
+            }
+
+            // A `Json` field with more path after it is not a relation to traverse
+            // but a reach *into* the document: `spec__cpu__gte` reads `spec->cpu`.
+            // The trailing segment is the lookup when it names one (and there is a
+            // path before it); otherwise the whole remainder is the path and the
+            // lookup is `exact`.
+            if field.ty == crate::value::FieldType::Json {
+                let (path_segs, lookup) = match Lookup::parse(rest[rest.len() - 1]) {
+                    Some(lk) if rest.len() >= 2 => (&rest[..rest.len() - 1], lk),
+                    _ => (rest, Lookup::Exact),
+                };
+                return Ok(Resolved {
+                    joins,
+                    alias,
+                    field,
+                    lookup,
+                    json_path: path_segs.iter().map(|s| (*s).to_string()).collect(),
+                });
             }
 
             // More path to walk, so this field had better be a relation.

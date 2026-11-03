@@ -36,6 +36,10 @@ doc: ## Build and open the API docs
 shell: ## Run the dynamic REPL (reads DELONIX_ORM_DSN for live queries)
 	cargo run -p dorm-shell
 
+.PHONY: bench
+bench: ## Scale benchmark + regression gate against $(DSN) (ADR 0036). DORM_BENCH_ROWS/BENCH_MIN_SPEEDUP tune it.
+	DSN='$(DSN)' scripts/bench_gate.sh
+
 .PHONY: test-live
 test-live: ## Run the live suites against $(DSN) — needs a throwaway PostgreSQL
 	DELONIX_ORM_DSN='$(DSN)' cargo test -p dorm-models --test migrate_live -- --nocapture

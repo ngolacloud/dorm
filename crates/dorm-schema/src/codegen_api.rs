@@ -356,6 +356,10 @@ fn component_schema(m: &Model) -> J {
                 // The foreign key is exposed as its integer id column.
                 props.insert(r.column.clone(), json!({ "type": "integer" }));
             }
+            // An enum column is a native-enum-backed string (ADR 0046/0047).
+            Field::Enum(e) => {
+                props.insert(e.column.clone(), json!({ "type": "string" }));
+            }
             Field::ToMany { .. } => {}
         }
     }
@@ -371,6 +375,10 @@ fn openapi_scalar(ty: Scalar, nullable: bool) -> J {
         Scalar::Decimal => ("string", None),
         Scalar::Json => ("object", None),
         Scalar::Uuid => ("string", Some("uuid")),
+        // The network scalars are strings in JSON, with a format hint (ADR 0040/0048).
+        Scalar::Inet => ("string", Some("ipv4")),
+        Scalar::Cidr => ("string", Some("cidr")),
+        Scalar::MacAddr => ("string", Some("macaddr")),
     };
     let mut obj = Map::new();
     obj.insert("type".into(), J::String(t.into()));
