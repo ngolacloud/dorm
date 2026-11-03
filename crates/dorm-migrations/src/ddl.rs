@@ -474,6 +474,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             // SQLite has no INET; the text form is stored, and a read is refused
             // (ADR 0040) — network operators are PostgreSQL-only.
             FieldType::Inet => "TEXT",
+            FieldType::Cidr | FieldType::MacAddr => "TEXT",
             FieldType::TextArray | FieldType::IntArray => "TEXT",
             // No native enum portably; the label is stored as TEXT (ADR 0046).
             FieldType::Enum(_) => "TEXT",
@@ -498,6 +499,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Json => "JSON",
             FieldType::Bytes => "LONGBLOB",
             FieldType::Inet => "TEXT",
+            FieldType::Cidr | FieldType::MacAddr => "TEXT",
             FieldType::TextArray | FieldType::IntArray => "TEXT",
             FieldType::Enum(_) => "TEXT",
         }

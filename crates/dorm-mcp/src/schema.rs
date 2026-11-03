@@ -20,6 +20,8 @@ fn json_type(ty: FieldType) -> Value {
         FieldType::Bytes => json!({ "type": "string", "contentEncoding": "base16" }),
         FieldType::Text => json!({ "type": "string" }),
         FieldType::Inet => json!({ "type": "string", "format": "ipv4" }),
+        FieldType::Cidr => json!({ "type": "string", "format": "cidr" }),
+        FieldType::MacAddr => json!({ "type": "string", "format": "macaddr" }),
         FieldType::TextArray => json!({ "type": "array", "items": { "type": "string" } }),
         FieldType::IntArray => json!({ "type": "array", "items": { "type": "integer" } }),
         // A native enum is a string constrained to its variants (ADR 0046).

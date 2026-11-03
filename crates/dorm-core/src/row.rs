@@ -321,6 +321,26 @@ impl_decode!(
         "inet is a PostgreSQL-only type; MySQL does not support it".into()
     ))
 );
+// `CIDR` → `cidr::IpCidr`, `MACADDR` → `eui48::MacAddress`, native on PostgreSQL
+// (ADR 0048); SQLite/MySQL have neither, so a typed read there is refused.
+impl_decode!(
+    cidr::IpCidr,
+    |_c| Err(Error::Db(
+        "cidr is a PostgreSQL-only type; SQLite does not support it".into()
+    )),
+    |_c| Err(Error::Db(
+        "cidr is a PostgreSQL-only type; MySQL does not support it".into()
+    ))
+);
+impl_decode!(
+    eui48::MacAddress,
+    |_c| Err(Error::Db(
+        "macaddr is a PostgreSQL-only type; SQLite does not support it".into()
+    )),
+    |_c| Err(Error::Db(
+        "macaddr is a PostgreSQL-only type; MySQL does not support it".into()
+    ))
+);
 
 /// A SQLite integer cell, or a type error.
 #[cfg(feature = "sqlite")]
@@ -404,6 +424,10 @@ pub(crate) fn value_to_sqlite(v: &crate::value::Value) -> rusqlite::types::Value
         // SQLite has no INET; stored as text if it ever reaches here (the DDL
         // refuses an inet column on SQLite — ADR 0040).
         Value::Inet(ip) => S::Text(ip.to_string()),
+        // CIDR/MACADDR are PostgreSQL-only (the DDL refuses them on SQLite,
+        // ADR 0048); stored as text if one ever reaches here.
+        Value::Cidr(c) => S::Text(c.to_string()),
+        Value::MacAddr(m) => S::Text(m.to_hex_string()),
         Value::TextArray(v) => S::Text(format!("{{{}}}", v.join(","))),
         Value::IntArray(v) => S::Text(format!(
             "{{{}}}",
@@ -464,6 +488,8 @@ pub(crate) fn cell_to_value(
         ),
         FieldType::Bytes => Value::Bytes(sqlite_blob(cell).map_err(|_| mismatch("bytes"))?),
         FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
+        FieldType::Cidr => return Err(mismatch("cidr, which SQLite does not support")),
+        FieldType::MacAddr => return Err(mismatch("macaddr, which SQLite does not support")),
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which SQLite does not support"))
         }
@@ -571,6 +597,8 @@ pub(crate) fn value_to_mysql(v: &crate::value::Value) -> mysql_async::Value {
         Value::Json(j) => M::Bytes(j.to_string().into_bytes()),
         Value::Bytes(b) => M::Bytes(b.clone()),
         Value::Inet(ip) => M::Bytes(ip.to_string().into_bytes()),
+        Value::Cidr(c) => M::Bytes(c.to_string().into_bytes()),
+        Value::MacAddr(m) => M::Bytes(m.to_hex_string().into_bytes()),
         Value::TextArray(v) => M::Bytes(format!("{{{}}}", v.join(",")).into_bytes()),
         Value::IntArray(v) => M::Bytes(
             format!(
@@ -632,6 +660,8 @@ pub(crate) fn mysql_cell_to_value(
         ),
         FieldType::Bytes => Value::Bytes(mysql_blob(cell).map_err(|_| mismatch("bytes"))?),
         FieldType::Inet => return Err(mismatch("inet, which MySQL does not support")),
+        FieldType::Cidr => return Err(mismatch("cidr, which MySQL does not support")),
+        FieldType::MacAddr => return Err(mismatch("macaddr, which MySQL does not support")),
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which MySQL does not support"))
         }

@@ -84,6 +84,10 @@ postgres-openssl = { version = "0.5" }
 openssl = { version = "0.10" }
 inventory = { version = "0.3" }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+# Native PostgreSQL `CIDR`/`MACADDR` value types (ADR 0048); wired to the wire
+# through `tokio-postgres`'s `with-cidr-0_3`/`with-eui48-1` features.
+cidr = { version = "0.3" }
+eui48 = { version = "1" }
 # Observability (ADR 0008). `tracing` is a facade: with no subscriber installed
 # every macro compiles to a cheap disabled check, so an always-on direct
 # dependency costs the ~nothing a library should when nobody is listening — no

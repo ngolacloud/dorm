@@ -544,6 +544,8 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
         "uuid" => "Uuid",
         "json" | "jsonb" => "Json",
         "inet" => "Inet",
+        "cidr" => "Cidr",
+        "macaddr" => "MacAddr",
         "text[]" => "TextArray",
         "bigint[]" => "IntArray",
         other => {
@@ -551,7 +553,7 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
                 s.span(),
                 format!(
                     "unknown column_type `{other}`; known: int, bigint, text, bool, decimal, \
-                     timestamp, uuid, json"
+                     timestamp, uuid, json, inet, cidr, macaddr, text[], bigint[]"
                 ),
             ))
         }
@@ -616,6 +618,9 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
         "Value" | "JsonValue" => "Json",
         // `std::net::IpAddr` → INET (ADR 0040).
         "IpAddr" => "Inet",
+        // `cidr::IpCidr` → CIDR, `eui48::MacAddress` → MACADDR (ADR 0048).
+        "IpCidr" => "Cidr",
+        "MacAddress" => "MacAddr",
         other => {
             return Err(Error::new_spanned(
                 ty,

@@ -193,10 +193,10 @@ impl Lookup {
             });
         }
 
-        if self.is_network() && ty != FieldType::Inet {
+        if self.is_network() && !matches!(ty, FieldType::Inet | FieldType::Cidr) {
             return Err(Error::UnexpectedColumnType {
                 column: path.to_string(),
-                want: "inet column, for a network lookup",
+                want: "inet or cidr column, for a network lookup",
             });
         }
 

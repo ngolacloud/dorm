@@ -13,6 +13,8 @@ use std::fmt;
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
+use cidr::IpCidr;
+use eui48::MacAddress;
 use rust_decimal::Decimal;
 use tokio_postgres::types::{to_sql_checked, IsNull, Kind, ToSql, Type};
 use uuid::Uuid;
@@ -52,6 +54,13 @@ pub enum FieldType {
     /// ENUM (…)` and that a read decodes as a string. SQLite/MySQL store it as
     /// `TEXT`.
     Enum(&'static str),
+    /// A network block, `CIDR` (PostgreSQL only) — `10.0.0.0/24`. The IPAM
+    /// companion to [`Inet`](FieldType::Inet): a host is `INET`, a subnet is
+    /// `CIDR`, and the same containment lookups span both (ADR 0048).
+    Cidr,
+    /// A MAC address, `MACADDR` (PostgreSQL only) — `08:00:2b:01:02:03`
+    /// (ADR 0048).
+    MacAddr,
 }
 
 impl FieldType {
@@ -76,6 +85,8 @@ impl FieldType {
             FieldType::IntArray => "BIGINT[]",
             // The column's SQL type *is* the enum type's name.
             FieldType::Enum(name) => name,
+            FieldType::Cidr => "CIDR",
+            FieldType::MacAddr => "MACADDR",
         }
     }
 
@@ -103,6 +114,8 @@ impl FieldType {
             FieldType::TextArray => "text[]",
             FieldType::IntArray => "bigint[]",
             FieldType::Enum(name) => name,
+            FieldType::Cidr => "cidr",
+            FieldType::MacAddr => "macaddr",
         }
     }
 }
@@ -127,6 +140,8 @@ pub enum Value {
     Json(serde_json::Value),
     Bytes(Vec<u8>),
     Inet(IpAddr),
+    Cidr(IpCidr),
+    MacAddr(MacAddress),
     TextArray(Vec<String>),
     IntArray(Vec<i64>),
 }
@@ -148,6 +163,8 @@ impl Value {
             Value::Json(_) => FieldType::Json,
             Value::Bytes(_) => FieldType::Bytes,
             Value::Inet(_) => FieldType::Inet,
+            Value::Cidr(_) => FieldType::Cidr,
+            Value::MacAddr(_) => FieldType::MacAddr,
             Value::TextArray(_) => FieldType::TextArray,
             Value::IntArray(_) => FieldType::IntArray,
         })
@@ -228,6 +245,13 @@ impl Value {
             (Value::Text(s), FieldType::Inet) => {
                 Value::Inet(s.parse().map_err(|_| mismatch("inet address"))?)
             }
+            // A subnet / MAC typed as text (`"10.0.0.0/24"`, `"08:00:2b:01:02:03"`).
+            (Value::Text(s), FieldType::Cidr) => {
+                Value::Cidr(s.parse().map_err(|_| mismatch("cidr network"))?)
+            }
+            (Value::Text(s), FieldType::MacAddr) => {
+                Value::MacAddr(s.parse().map_err(|_| mismatch("mac address"))?)
+            }
 
             // An enum column takes its label as text; the database validates the
             // label against the type's variants (ADR 0046).
@@ -264,6 +288,8 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Value::Inet(ip) => write!(f, "{ip}"),
+            Value::Cidr(c) => write!(f, "{c}"),
+            Value::MacAddr(m) => write!(f, "{}", m.to_hex_string()),
             Value::TextArray(v) => write!(f, "{{{}}}", v.join(",")),
             Value::IntArray(v) => write!(
                 f,
@@ -319,6 +345,23 @@ impl ToSql for Value {
             Value::Json(v) => v.to_sql_checked(ty, out),
             Value::Bytes(v) => v.to_sql_checked(ty, out),
             Value::Inet(v) => v.to_sql_checked(ty, out),
+            // A bare parameter next to a `cidr` column is inferred as `inet` by
+            // PostgreSQL (cidr is implicitly castable to inet), so `cidr_col = $1`
+            // hands us `Type::INET`. `cidr` and `inet` share a wire format, so the
+            // same network is serialized as an `IpInet` to satisfy that inference;
+            // the comparison is still equal. A genuine `cidr` slot keeps the
+            // checked path (ADR 0048).
+            Value::Cidr(v) => {
+                if *ty == Type::INET {
+                    match cidr::IpInet::new(v.first_address(), v.network_length()) {
+                        Ok(inet) => inet.to_sql_checked(ty, out),
+                        Err(_) => v.to_sql_checked(ty, out),
+                    }
+                } else {
+                    v.to_sql_checked(ty, out)
+                }
+            }
+            Value::MacAddr(v) => v.to_sql_checked(ty, out),
             Value::TextArray(v) => v.to_sql_checked(ty, out),
             Value::IntArray(v) => v.to_sql_checked(ty, out),
         }
@@ -390,6 +433,10 @@ to_value!(Vec<u8>, Bytes, Bytes, |v| v.clone());
 // An `IpAddr` field maps to `INET`; the derive infers `FieldType::Inet` from it,
 // and the typed API binds it natively (ADR 0040).
 to_value!(IpAddr, Inet, Inet, |v| *v);
+// A `cidr::IpCidr`/`eui48::MacAddress` field maps to `CIDR`/`MACADDR`; the derive
+// infers the `FieldType` from the Rust type (ADR 0048).
+to_value!(IpCidr, Cidr, Cidr, |v| *v);
+to_value!(MacAddress, MacAddr, MacAddr, |v| *v);
 // Arrays map to `TEXT[]`/`BIGINT[]` and bind as one native array parameter
 // (ADR 0041).
 to_value!(Vec<String>, TextArray, TextArray, |v| v.clone());
@@ -502,6 +549,14 @@ pub fn read_column(
             .try_get::<_, Option<IpAddr>>(idx)
             .map_err(|_| fail("inet"))?
             .map_or(Value::Null, Value::Inet),
+        FieldType::Cidr => row
+            .try_get::<_, Option<IpCidr>>(idx)
+            .map_err(|_| fail("cidr"))?
+            .map_or(Value::Null, Value::Cidr),
+        FieldType::MacAddr => row
+            .try_get::<_, Option<MacAddress>>(idx)
+            .map_err(|_| fail("macaddr"))?
+            .map_or(Value::Null, Value::MacAddr),
         FieldType::TextArray => row
             .try_get::<_, Option<Vec<String>>>(idx)
             .map_err(|_| fail("text[]"))?

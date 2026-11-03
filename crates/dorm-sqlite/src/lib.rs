@@ -87,6 +87,8 @@ fn to_sqlite(v: &Value) -> rusqlite::types::Value {
         Value::Json(j) => S::Text(j.to_string()),
         Value::Bytes(b) => S::Blob(b.clone()),
         Value::Inet(ip) => S::Text(ip.to_string()),
+        Value::Cidr(c) => S::Text(c.to_string()),
+        Value::MacAddr(m) => S::Text(m.to_hex_string()),
         Value::TextArray(v) => S::Text(format!("{{{}}}", v.join(","))),
         Value::IntArray(v) => S::Text(format!(
             "{{{}}}",
@@ -148,6 +150,8 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
                 .map_err(|_| mismatch("uuid"))?,
         ),
         FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
+        FieldType::Cidr => return Err(mismatch("cidr, which SQLite does not support")),
+        FieldType::MacAddr => return Err(mismatch("macaddr, which SQLite does not support")),
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which SQLite does not support"))
         }
