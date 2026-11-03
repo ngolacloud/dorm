@@ -26,9 +26,9 @@
 //! `ROLLBACK`, because it also covers the process being killed.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::types::ToSql;
@@ -45,11 +45,20 @@ use crate::value::Value;
 pub const DSN_ENV: &str = "DELONIX_ORM_DSN";
 /// Accepted fallback, checked only when [`DSN_ENV`] is absent.
 pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
-/// An optional read-replica DSN. When set, the process-default [`Database`]
-/// routes the reads DORM compiles (`StatementKind::Read`) to it, while writes —
-/// and anything inside a transaction — stay on [`DSN_ENV`]'s primary. Absent,
-/// there is no replica and every statement runs on the primary, unchanged.
+/// Read-replica DSN(s). When set, the process-default [`Database`] routes the
+/// reads DORM compiles (`StatementKind::Read`) to a replica, while writes — and
+/// anything inside a transaction — stay on [`DSN_ENV`]'s primary. Absent, there
+/// is no replica and every statement runs on the primary, unchanged.
+///
+/// **Several replicas** may be listed, comma-separated: reads are balanced across
+/// them round-robin, and a replica that fails to hand out a connection is ejected
+/// for a cooldown and skipped, reads going to the others (or the primary if all
+/// are down) — ADR 0050.
 pub const REPLICA_DSN_ENV: &str = "DELONIX_ORM_REPLICA_DSN";
+/// Seconds a read replica stays ejected after a failed acquire before it is
+/// retried (ADR 0050). Default [`REPLICA_EJECT_COOLDOWN_DEFAULT`].
+pub const REPLICA_EJECT_COOLDOWN_ENV: &str = "DELONIX_ORM_REPLICA_EJECT_COOLDOWN_SECS";
+const REPLICA_EJECT_COOLDOWN_DEFAULT: u64 = 10;
 /// Ceiling on pooled connections.
 pub const POOL_MAX_ENV: &str = "DELONIX_ORM_POOL_MAX";
 /// How long a caller waits for a connection before giving up.
@@ -685,14 +694,26 @@ pub async fn replica_lag_seconds() -> Result<Option<f64>> {
 /// integration tests did first, and five of them failed on it.
 pub struct Database {
     primary: Pool,
-    /// Present when a replica DSN was configured; reads route here.
-    replica: Option<Pool>,
+    /// Zero or more read replicas; reads balance across the healthy ones (ADR 0050).
+    replicas: Vec<Replica>,
+    /// Round-robin cursor over [`Database::replicas`], so successive reads spread
+    /// across them rather than hammering the first.
+    rr: AtomicUsize,
     /// The primary DSN, kept so backend/dialect detection can consult the active
     /// database rather than only the process environment.
     dsn: String,
     /// The read-only default for sessions on this database. A task can still
     /// override it per request with [`with_read_only`] (B-12).
     read_only: bool,
+}
+
+/// One read replica and its health (ADR 0050).
+struct Replica {
+    pool: Pool,
+    /// Unix seconds until which this replica is ejected (`0` = healthy). Set when
+    /// an acquire fails; the replica rejoins automatically once the cooldown
+    /// passes, with no background task.
+    ejected_until: AtomicU64,
 }
 
 impl Database {
@@ -705,6 +726,18 @@ impl Database {
     /// frees the module from requiring the global pool.
     pub fn connect(primary_dsn: &str, replica_dsn: Option<&str>, read_only: bool) -> Result<Self> {
         Self::connect_in(primary_dsn, replica_dsn, read_only, None)
+    }
+
+    /// Connect with several read replicas, balanced and ejected as in
+    /// [`REPLICA_DSN_ENV`] (ADR 0050). The list-shaped twin of [`connect`]; an
+    /// empty slice is simply no replica.
+    pub fn connect_replicas(
+        primary_dsn: &str,
+        replica_dsns: &[&str],
+        read_only: bool,
+    ) -> Result<Self> {
+        let joined = replica_dsns.join(",");
+        Self::connect_in(primary_dsn, Some(joined.as_str()), read_only, None)
     }
 
     /// Connect a database **bound to a PostgreSQL `schema`** (ADR 0028): every
@@ -729,16 +762,30 @@ impl Database {
         schema: Option<&str>,
     ) -> Result<Self> {
         let primary = build_pool(primary_dsn, schema)?;
-        let replica = match replica_dsn {
-            Some(r) if !r.trim().is_empty() => Some(build_pool(r, schema)?),
-            _ => None,
-        };
+        // One DSN string may carry several replicas, comma-separated (ADR 0050).
+        let mut replicas = Vec::new();
+        for r in replica_dsn.into_iter().flat_map(|s| s.split(',')) {
+            let r = r.trim();
+            if !r.is_empty() {
+                replicas.push(Replica {
+                    pool: build_pool(r, schema)?,
+                    ejected_until: AtomicU64::new(0),
+                });
+            }
+        }
         Ok(Database {
             primary,
-            replica,
+            replicas,
+            rr: AtomicUsize::new(0),
             dsn: primary_dsn.to_string(),
             read_only,
         })
+    }
+
+    /// The number of read replicas configured, healthy or not — for observability
+    /// and tests (ADR 0050).
+    pub fn replica_count(&self) -> usize {
+        self.replicas.len()
     }
 
     /// Build the process-default database from the environment: [`DSN_ENV`] for
@@ -751,18 +798,62 @@ impl Database {
         Database::connect(&primary, replica.as_deref(), false)
     }
 
-    /// The pool a route resolves to. A [`Route::ReadReplica`] picks the replica
-    /// only when one exists **and** no transaction is open: a transaction already
-    /// holds its own connection and must not be split across primary and replica,
-    /// and it is the one place a read must see its own uncommitted writes.
-    fn pool_for(&self, route: Route) -> &Pool {
-        match route {
-            Route::ReadReplica if !in_transaction() => {
-                self.replica.as_ref().unwrap_or(&self.primary)
+    /// Acquire a connection for `route`, balancing reads across the healthy
+    /// replicas and ejecting a failing one (ADR 0050).
+    ///
+    /// A [`Route::ReadReplica`] goes to a replica only when one exists **and** no
+    /// transaction is open: a transaction already holds its own connection and
+    /// must not be split across primary and replica, and it is the one place a
+    /// read must see its own uncommitted writes. Among the replicas, a round-robin
+    /// cursor spreads the load; a replica whose `get()` fails is ejected for a
+    /// cooldown and skipped, the read trying the next; if every replica is
+    /// ejected or failing, the read falls back to the primary rather than erroring.
+    async fn acquire(&self, route: Route) -> Result<Object> {
+        if matches!(route, Route::ReadReplica) && !in_transaction() && !self.replicas.is_empty() {
+            let now = now_unix();
+            let n = self.replicas.len();
+            let start = self.rr.fetch_add(1, Ordering::Relaxed);
+            for k in 0..n {
+                let idx = (start.wrapping_add(k)) % n;
+                let replica = &self.replicas[idx];
+                // Skip a replica still in its ejection cooldown.
+                if replica.ejected_until.load(Ordering::Relaxed) > now {
+                    continue;
+                }
+                match replica.pool.get().await {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        let cooldown =
+                            env_u64(REPLICA_EJECT_COOLDOWN_ENV, REPLICA_EJECT_COOLDOWN_DEFAULT);
+                        replica
+                            .ejected_until
+                            .store(now.saturating_add(cooldown), Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "dorm::db",
+                            replica = idx,
+                            cooldown_secs = cooldown,
+                            error = %e,
+                            "ejecting an unhealthy read replica; routing reads elsewhere"
+                        );
+                    }
+                }
             }
-            _ => &self.primary,
+            // Every replica is ejected or failing: serve the read from the primary.
         }
+        self.primary
+            .get()
+            .await
+            .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
     }
+}
+
+/// Unix seconds now, for the replica ejection clock (ADR 0050). Wall-clock
+/// metadata, not a value a query reasons about, so `SystemTime` is right here.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Build one connection pool for a DSN. This is the former body of `pool()`,
@@ -1234,17 +1325,9 @@ async fn acquire(route: Route) -> Result<Object> {
 /// process default's.
 async fn acquire_once(route: Route) -> Result<Object> {
     if let Ok(db) = SESSION.try_with(|d| d.clone()) {
-        return db
-            .pool_for(route)
-            .get()
-            .await
-            .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")));
+        return db.acquire(route).await;
     }
-    default_db()?
-        .pool_for(route)
-        .get()
-        .await
-        .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
+    default_db()?.acquire(route).await
 }
 
 /// Run a query, on the transaction in scope if there is one.
@@ -1269,7 +1352,7 @@ pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRo
 /// Run a read on a read replica when the active [`Database`] has one — otherwise
 /// identical to [`query`]. This is the entry the typed read funnel uses for a
 /// `StatementKind::Read`; a transaction in scope keeps it on the primary (a
-/// transaction must read its own writes), as `Database::pool_for` enforces.
+/// transaction must read its own writes), as `Database::acquire` enforces.
 pub async fn query_read(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     query_routed(sql, params, Route::ReadReplica).await
 }
