@@ -210,6 +210,24 @@ impl_decode!(Vec<u8>, sqlite_blob, mysql_blob);
 // have no INET type, so a typed read there is refused rather than silently
 // reinterpreting the stored text — the same explicit refusal `cell_to_value` makes.
 impl_decode!(
+    Vec<String>,
+    |_c| Err(Error::Db(
+        "text[] is a PostgreSQL array; SQLite does not support it".into()
+    )),
+    |_c| Err(Error::Db(
+        "text[] is a PostgreSQL array; MySQL does not support it".into()
+    ))
+);
+impl_decode!(
+    Vec<i64>,
+    |_c| Err(Error::Db(
+        "bigint[] is a PostgreSQL array; SQLite does not support it".into()
+    )),
+    |_c| Err(Error::Db(
+        "bigint[] is a PostgreSQL array; MySQL does not support it".into()
+    ))
+);
+impl_decode!(
     std::net::IpAddr,
     |_c| Err(Error::Db(
         "inet is a PostgreSQL-only type; SQLite does not support it".into()
@@ -301,6 +319,14 @@ pub(crate) fn value_to_sqlite(v: &crate::value::Value) -> rusqlite::types::Value
         // SQLite has no INET; stored as text if it ever reaches here (the DDL
         // refuses an inet column on SQLite — ADR 0040).
         Value::Inet(ip) => S::Text(ip.to_string()),
+        Value::TextArray(v) => S::Text(format!("{{{}}}", v.join(","))),
+        Value::IntArray(v) => S::Text(format!(
+            "{{{}}}",
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
     }
 }
 
@@ -353,6 +379,9 @@ pub(crate) fn cell_to_value(
         ),
         FieldType::Bytes => Value::Bytes(sqlite_blob(cell).map_err(|_| mismatch("bytes"))?),
         FieldType::Inet => return Err(mismatch("inet, which SQLite does not support")),
+        FieldType::TextArray | FieldType::IntArray => {
+            return Err(mismatch("arrays, which SQLite does not support"))
+        }
     })
 }
 
@@ -455,6 +484,17 @@ pub(crate) fn value_to_mysql(v: &crate::value::Value) -> mysql_async::Value {
         Value::Json(j) => M::Bytes(j.to_string().into_bytes()),
         Value::Bytes(b) => M::Bytes(b.clone()),
         Value::Inet(ip) => M::Bytes(ip.to_string().into_bytes()),
+        Value::TextArray(v) => M::Bytes(format!("{{{}}}", v.join(",")).into_bytes()),
+        Value::IntArray(v) => M::Bytes(
+            format!(
+                "{{{}}}",
+                v.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .into_bytes(),
+        ),
     }
 }
 
@@ -505,5 +545,8 @@ pub(crate) fn mysql_cell_to_value(
         ),
         FieldType::Bytes => Value::Bytes(mysql_blob(cell).map_err(|_| mismatch("bytes"))?),
         FieldType::Inet => return Err(mismatch("inet, which MySQL does not support")),
+        FieldType::TextArray | FieldType::IntArray => {
+            return Err(mismatch("arrays, which MySQL does not support"))
+        }
     })
 }

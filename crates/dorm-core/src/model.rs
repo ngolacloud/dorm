@@ -69,6 +69,15 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
             meta.name
         ))
     })?;
+    // Composite-key tables create and query fine (ADR 0042), but instance save by
+    // key needs all key columns, which `Model::pk` (one value) does not carry yet.
+    if meta.is_composite_pk() {
+        return Err(Error::Config(format!(
+            "model `{}` has a composite primary key; save it with an explicit insert/update \
+             (QuerySet) until instance save on composite keys lands (ADR 0042)",
+            meta.name
+        )));
+    }
 
     if obj.pk().is_null() {
         let values = obj.column_values();
@@ -242,6 +251,13 @@ pub async fn delete_instance<T: Model>(obj: &T) -> Result<u64> {
             meta.name
         ))
     })?;
+    if meta.is_composite_pk() {
+        return Err(Error::Config(format!(
+            "model `{}` has a composite primary key; delete it with a filtered QuerySet \
+             until instance delete on composite keys lands (ADR 0042)",
+            meta.name
+        )));
+    }
     if obj.pk().is_null() {
         return Err(Error::Config(
             "this instance has never been saved, so there is nothing to delete".into(),

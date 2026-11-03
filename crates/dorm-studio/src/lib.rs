@@ -329,6 +329,14 @@ fn value_to_cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Inet(ip) => ip.to_string(),
+        Value::TextArray(v) => format!("{{{}}}", v.join(",")),
+        Value::IntArray(v) => format!(
+            "{{{}}}",
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         Value::Bool(b) => b.to_string(),
         Value::I32(n) => n.to_string(),
         Value::I64(n) => n.to_string(),
@@ -555,6 +563,8 @@ fn value_to_json(v: &Value) -> JsonValue {
     match v {
         Value::Null => JsonValue::Null,
         Value::Inet(ip) => JsonValue::from(ip.to_string()),
+        Value::TextArray(v) => JsonValue::from(v.clone()),
+        Value::IntArray(v) => JsonValue::from(v.clone()),
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::I32(n) => JsonValue::from(*n),
         Value::I64(n) => JsonValue::from(*n),

@@ -34,6 +34,11 @@ pub enum Lookup {
     NetContains,
     NetContainedBy,
     NetOverlaps,
+    /// Array set operators on a `TEXT[]`/`BIGINT[]` column (ADR 0041): `@>`
+    /// contains, `<@` contained-by, `&&` overlaps. The value is an array.
+    ArrayContains,
+    ArrayContainedBy,
+    ArrayOverlap,
 }
 
 /// How many values a lookup binds.
@@ -73,6 +78,9 @@ impl Lookup {
             "net_contains" => Lookup::NetContains,
             "net_contained_by" => Lookup::NetContainedBy,
             "net_overlaps" => Lookup::NetOverlaps,
+            "array_contains" => Lookup::ArrayContains,
+            "array_contained_by" => Lookup::ArrayContainedBy,
+            "array_overlap" => Lookup::ArrayOverlap,
             _ => return None,
         })
     }
@@ -99,6 +107,9 @@ impl Lookup {
             Lookup::NetContains => "net_contains",
             Lookup::NetContainedBy => "net_contained_by",
             Lookup::NetOverlaps => "net_overlaps",
+            Lookup::ArrayContains => "array_contains",
+            Lookup::ArrayContainedBy => "array_contained_by",
+            Lookup::ArrayOverlap => "array_overlap",
         }
     }
 
@@ -134,6 +145,15 @@ impl Lookup {
         matches!(
             self,
             Lookup::NetContains | Lookup::NetContainedBy | Lookup::NetOverlaps
+        )
+    }
+
+    /// Whether this is an array-set operator (`@>`/`<@`/`&&`), meaningful only on
+    /// an array column (ADR 0041).
+    pub fn is_array(self) -> bool {
+        matches!(
+            self,
+            Lookup::ArrayContains | Lookup::ArrayContainedBy | Lookup::ArrayOverlap
         )
     }
 
@@ -179,6 +199,13 @@ impl Lookup {
                 want: "inet column, for a network lookup",
             });
         }
+
+        if self.is_array() && !matches!(ty, FieldType::TextArray | FieldType::IntArray) {
+            return Err(Error::UnexpectedColumnType {
+                column: path.to_string(),
+                want: "array column, for an array lookup",
+            });
+        }
         Ok(())
     }
 }
@@ -217,6 +244,9 @@ mod tests {
             Lookup::NetContains,
             Lookup::NetContainedBy,
             Lookup::NetOverlaps,
+            Lookup::ArrayContains,
+            Lookup::ArrayContainedBy,
+            Lookup::ArrayOverlap,
         ] {
             assert_eq!(Lookup::parse(l.name()), Some(l), "{}", l.name());
         }

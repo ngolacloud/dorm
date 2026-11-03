@@ -42,6 +42,10 @@ pub enum FieldType {
     /// An IP address, `INET` (PostgreSQL only). The IPAM building block: a host
     /// address stored natively, with network-containment lookups (ADR 0040).
     Inet,
+    /// `TEXT[]` — a text array (tags), with set lookups `@>`/`&&`/`<@` (ADR 0041).
+    TextArray,
+    /// `BIGINT[]` — an integer array (id lists), same set lookups (ADR 0041).
+    IntArray,
 }
 
 impl FieldType {
@@ -62,6 +66,8 @@ impl FieldType {
             FieldType::Json => "JSONB",
             FieldType::Bytes => "BYTEA",
             FieldType::Inet => "INET",
+            FieldType::TextArray => "TEXT[]",
+            FieldType::IntArray => "BIGINT[]",
         }
     }
 
@@ -86,6 +92,8 @@ impl FieldType {
             FieldType::Json => "json",
             FieldType::Bytes => "bytes",
             FieldType::Inet => "inet",
+            FieldType::TextArray => "text[]",
+            FieldType::IntArray => "bigint[]",
         }
     }
 }
@@ -110,6 +118,8 @@ pub enum Value {
     Json(serde_json::Value),
     Bytes(Vec<u8>),
     Inet(IpAddr),
+    TextArray(Vec<String>),
+    IntArray(Vec<i64>),
 }
 
 impl Value {
@@ -129,6 +139,8 @@ impl Value {
             Value::Json(_) => FieldType::Json,
             Value::Bytes(_) => FieldType::Bytes,
             Value::Inet(_) => FieldType::Inet,
+            Value::TextArray(_) => FieldType::TextArray,
+            Value::IntArray(_) => FieldType::IntArray,
         })
     }
 
@@ -239,6 +251,15 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Value::Inet(ip) => write!(f, "{ip}"),
+            Value::TextArray(v) => write!(f, "{{{}}}", v.join(",")),
+            Value::IntArray(v) => write!(
+                f,
+                "{{{}}}",
+                v.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         }
     }
 }
@@ -273,6 +294,8 @@ impl ToSql for Value {
             Value::Json(v) => v.to_sql_checked(ty, out),
             Value::Bytes(v) => v.to_sql_checked(ty, out),
             Value::Inet(v) => v.to_sql_checked(ty, out),
+            Value::TextArray(v) => v.to_sql_checked(ty, out),
+            Value::IntArray(v) => v.to_sql_checked(ty, out),
         }
     }
 
@@ -342,6 +365,10 @@ to_value!(Vec<u8>, Bytes, Bytes, |v| v.clone());
 // An `IpAddr` field maps to `INET`; the derive infers `FieldType::Inet` from it,
 // and the typed API binds it natively (ADR 0040).
 to_value!(IpAddr, Inet, Inet, |v| *v);
+// Arrays map to `TEXT[]`/`BIGINT[]` and bind as one native array parameter
+// (ADR 0041).
+to_value!(Vec<String>, TextArray, TextArray, |v| v.clone());
+to_value!(Vec<i64>, IntArray, IntArray, |v| v.clone());
 
 impl ToValue for &str {
     fn to_value(&self) -> Value {
@@ -450,6 +477,14 @@ pub fn read_column(
             .try_get::<_, Option<IpAddr>>(idx)
             .map_err(|_| fail("inet"))?
             .map_or(Value::Null, Value::Inet),
+        FieldType::TextArray => row
+            .try_get::<_, Option<Vec<String>>>(idx)
+            .map_err(|_| fail("text[]"))?
+            .map_or(Value::Null, Value::TextArray),
+        FieldType::IntArray => row
+            .try_get::<_, Option<Vec<i64>>>(idx)
+            .map_err(|_| fail("bigint[]"))?
+            .map_or(Value::Null, Value::IntArray),
     })
 }
 

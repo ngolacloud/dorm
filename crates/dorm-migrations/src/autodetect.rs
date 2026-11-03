@@ -144,6 +144,8 @@ fn type_tag(ty: FieldType) -> &'static str {
         FieldType::Decimal => "decimal",
         FieldType::Timestamp => "timestamp",
         FieldType::Inet => "inet",
+        FieldType::TextArray => "text[]",
+        FieldType::IntArray => "bigint[]",
         FieldType::Uuid => "uuid",
         FieldType::Json => "json",
         FieldType::Bytes => "bytes",

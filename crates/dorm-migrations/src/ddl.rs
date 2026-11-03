@@ -83,8 +83,26 @@ pub fn create_table_on(meta: &ModelMeta, backend: Backend) -> Result<String> {
 pub fn create_table_named_on(meta: &ModelMeta, name: &str, backend: Backend) -> Result<String> {
     let mut parts =
         Vec::with_capacity(meta.fields.len() + meta.unique_together.len() + meta.checks.len());
+    // A composite primary key (>1 `primary_key` field) is a table-level
+    // `PRIMARY KEY (a, b)` (ADR 0042); its columns are emitted plain (no inline
+    // `PRIMARY KEY`). A single key stays inline, serial shortcut included.
+    let pk_cols: Vec<&str> = meta
+        .fields
+        .iter()
+        .filter(|f| f.primary_key)
+        .map(|f| f.column)
+        .collect();
+    let composite = pk_cols.len() > 1;
     for f in meta.fields {
-        parts.push(column_def(f, backend)?);
+        if composite && f.primary_key {
+            // A plain column — the key-ness is the table-level constraint below.
+            parts.push(format!("{} {}", f.column, column_modifiers(f, backend)?));
+        } else {
+            parts.push(column_def(f, backend)?);
+        }
+    }
+    if composite {
+        parts.push(format!("PRIMARY KEY ({})", pk_cols.join(", ")));
     }
     for group in meta.unique_together {
         parts.push(format!("UNIQUE ({})", group.join(", ")));
@@ -393,6 +411,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             // SQLite has no INET; the text form is stored, and a read is refused
             // (ADR 0040) — network operators are PostgreSQL-only.
             FieldType::Inet => "TEXT",
+            FieldType::TextArray | FieldType::IntArray => "TEXT",
         }
         .to_string(),
         Backend::MySql => match ty {
@@ -414,6 +433,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Json => "JSON",
             FieldType::Bytes => "LONGBLOB",
             FieldType::Inet => "TEXT",
+            FieldType::TextArray | FieldType::IntArray => "TEXT",
         }
         .to_string(),
     }

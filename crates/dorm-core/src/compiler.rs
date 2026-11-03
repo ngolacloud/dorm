@@ -616,6 +616,10 @@ fn compile_comparison(
         Lookup::NetContains => net_op(operand, ">>", &values[0], binder),
         Lookup::NetContainedBy => net_op(operand, "<<", &values[0], binder),
         Lookup::NetOverlaps => net_op(operand, "&&", &values[0], binder),
+        // Array set operators (ADR 0041): the value binds as one native array.
+        Lookup::ArrayContains => format!("{operand} @> {}", binder.bind(first())),
+        Lookup::ArrayContainedBy => format!("{operand} <@ {}", binder.bind(first())),
+        Lookup::ArrayOverlap => format!("{operand} && {}", binder.bind(first())),
     })
 }
 

@@ -126,8 +126,21 @@ impl ModelMeta {
 
     /// The primary key field. A model without one cannot be saved or deleted by
     /// instance, so the rest of the code asks for it rather than assuming `id`.
+    /// For a composite key this is the first key column — use
+    /// [`primary_keys`](Self::primary_keys) when all of them are needed.
     pub fn primary_key(&self) -> Option<&'static FieldMeta> {
         self.fields.iter().find(|f| f.primary_key)
+    }
+
+    /// Every primary-key column, in declaration order — one for a simple key,
+    /// several for a composite one (ADR 0042).
+    pub fn primary_keys(&self) -> impl Iterator<Item = &'static FieldMeta> + '_ {
+        self.fields.iter().filter(|f| f.primary_key)
+    }
+
+    /// Whether this model has a composite (multi-column) primary key.
+    pub fn is_composite_pk(&self) -> bool {
+        self.primary_keys().count() > 1
     }
 
     /// The field holding the tenant, for `tenant_scoped` models.

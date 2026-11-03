@@ -154,11 +154,22 @@ fn expand(ast: &DeriveInput) -> Result<TokenStream2> {
         specs.push(parse_field(f)?);
     }
 
-    if specs.iter().filter(|s| s.primary_key).count() > 1 {
-        return Err(Error::new_spanned(
-            name,
-            "a model can declare only one `primary_key`",
-        ));
+    // Zero or one `primary_key` is the common case; more than one is a *composite*
+    // primary key (ADR 0042), emitted as a table-level `PRIMARY KEY (a, b)`. Its
+    // columns are caller-supplied (never the serial shortcut), so they must not be
+    // bare `i32`/`i64` — those would be read as auto-increment keys and dropped
+    // from the insert. A composite key is on natural columns (TEXT, etc.).
+    let pk_count = specs.iter().filter(|s| s.primary_key).count();
+    if pk_count > 1 {
+        for s in specs.iter().filter(|s| s.primary_key) {
+            if matches!(s.field_type.to_string().as_str(), "I32" | "I64") {
+                return Err(Error::new_spanned(
+                    name,
+                    "a composite primary key must be on non-serial columns (e.g. String); a bare \
+                     i32/i64 key is treated as auto-increment and cannot be part of a composite key",
+                ));
+            }
+        }
     }
 
     let m2m = parse_m2m_specs(ast)?;
@@ -460,6 +471,8 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
         "uuid" => "Uuid",
         "json" | "jsonb" => "Json",
         "inet" => "Inet",
+        "text[]" => "TextArray",
+        "bigint[]" => "IntArray",
         other => {
             return Err(Error::new(
                 s.span(),
@@ -491,6 +504,33 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
         .last()
         .ok_or_else(|| Error::new_spanned(ty, "a model field must be a plain named type"))?;
     let name = seg.ident.to_string();
+    // `Vec<T>` → an array column (ADR 0041), or `BYTEA` for `Vec<u8>`. The inner
+    // type decides; a `Vec` of anything else needs an explicit `column_type`.
+    if name == "Vec" {
+        let inner = if let PathArguments::AngleBracketed(a) = &seg.arguments {
+            a.args.iter().find_map(|g| match g {
+                GenericArgument::Type(Type::Path(ip)) => {
+                    ip.path.segments.last().map(|s| s.ident.to_string())
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let mapped = match inner.as_deref() {
+            Some("String") => "TextArray",
+            Some("i64") => "IntArray",
+            Some("u8") => "Bytes",
+            _ => {
+                return Err(Error::new_spanned(
+                    ty,
+                    "a `Vec` column must be `Vec<String>` (TEXT[]), `Vec<i64>` (BIGINT[]) \
+                     or `Vec<u8>` (BYTEA); state anything else with `#[field(column_type = \"...\")]`",
+                ))
+            }
+        };
+        return Ok(format_ident!("{}", mapped));
+    }
     let mapped = match name.as_str() {
         "i32" => "I32",
         "i64" => "I64",
