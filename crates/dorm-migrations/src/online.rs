@@ -613,6 +613,7 @@ mod tests {
                 "a",
                 vec![col("id", "i64", false), col("name", "text", false)],
             )],
+            enum_types: vec![],
         };
         // New adds a nullable column and a whole new table — both additive.
         let new = Snapshot {
@@ -627,6 +628,7 @@ mod tests {
                 ),
                 table("b", vec![col("id", "i64", false)]),
             ],
+            enum_types: vec![],
         };
         assert!(check_compat(&old, &new).is_empty());
     }
@@ -638,9 +640,11 @@ mod tests {
                 "a",
                 vec![col("id", "i64", false), col("name", "text", false)],
             )],
+            enum_types: vec![],
         };
         let new = Snapshot {
             tables: vec![table("a", vec![col("id", "i64", false)])],
+            enum_types: vec![],
         };
         let issues = check_compat(&old, &new);
         assert_eq!(issues.len(), 1);
@@ -663,6 +667,7 @@ mod tests {
                     ],
                 ),
             ],
+            enum_types: vec![],
         };
         // `gone` dropped; `opt` tightened to NOT NULL with no default; `n` retyped.
         let new = Snapshot {
@@ -674,6 +679,7 @@ mod tests {
                     col("n", "i64", false),
                 ],
             )],
+            enum_types: vec![],
         };
         let issues = check_compat(&old, &new);
         assert_eq!(issues.len(), 3, "{issues:#?}");
@@ -695,11 +701,13 @@ mod tests {
                 "a",
                 vec![col("id", "i64", false), col("opt", "text", true)],
             )],
+            enum_types: vec![],
         };
         let mut tightened = col("opt", "text", false);
         tightened.default = Some("''".to_string());
         let new = Snapshot {
             tables: vec![table("a", vec![col("id", "i64", false), tightened])],
+            enum_types: vec![],
         };
         assert!(
             check_compat(&old, &new).is_empty(),

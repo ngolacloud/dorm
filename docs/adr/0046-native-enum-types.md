@@ -71,8 +71,18 @@ no-op), corrido **fora da transação** (como os índices), simétrico ao
 `create_enum_types`. Só acrescenta (reordenar/remover não é expressável em
 PostgreSQL). Prova live (`enum_types_live.rs::sync_evolves_an_enum_that_grew_a_variant`):
 um tipo pré-existente com `{open, closed}` passa a `{open, closed, archived}` após
-`sync`, e uma linha com o rótulo novo insere. Continua de fora: a emissão de
-`CREATE TYPE`/`ALTER TYPE` nos ficheiros do `migrate` **versionado** (autodetector).
+`sync`, e uma linha com o rótulo novo insere.
+
+**`migrate` versionado (autodetector):** o `Snapshot` passou a carregar os tipos
+enum (`enum_types`, `#[serde(default)]` p/ snapshots antigos); o `autodetect` emite
+`CREATE TYPE` (antes da tabela que o usa, balde próprio) para um tipo novo e
+`ALTER TYPE … ADD VALUE IF NOT EXISTS` para cada rótulo que um tipo existente
+ganhou; o `down_for` dropa um tipo acabado de criar (depois das tabelas) e torna a
+migração **irreversível** se um enum cresceu (o PostgreSQL não remove rótulos).
+Prova unit (`autodetect.rs`) + live (`migrate_enum_live.rs`): uma migração
+versionada cria o tipo+tabela e outra cresce-o com `ADD VALUE` dentro da transação
+do `migrate`, com o rótulo usável após o commit (seguro no PG 12+, alvo 16, desde
+que o rótulo não seja usado na mesma migração).
 
 ## Proof
 

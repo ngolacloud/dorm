@@ -56,6 +56,18 @@ use dorm_core::value::FieldType;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub tables: Vec<Table>,
+    /// Native enum types the models declare (ADR 0046/0053). `#[serde(default)]`
+    /// so a snapshot written before enums existed still deserialises.
+    #[serde(default)]
+    pub enum_types: Vec<EnumType>,
+}
+
+/// One native enum type in a [`Snapshot`] — its name and ordered labels. A new
+/// type is a `CREATE TYPE`; a type that gained labels is `ALTER TYPE … ADD VALUE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumType {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 /// One table in a [`Snapshot`].
@@ -100,6 +112,13 @@ impl Snapshot {
     pub fn from_models(models: &[&'static ModelMeta]) -> Self {
         Snapshot {
             tables: models.iter().map(|m| table_of(m)).collect(),
+            enum_types: dorm_core::meta::enum_types_of(models)
+                .into_iter()
+                .map(|(name, variants)| EnumType {
+                    name: name.to_string(),
+                    variants: variants.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -226,6 +245,12 @@ pub fn autodetect_with_renames(
 
     let mut b = Buckets::default();
 
+    // Enum types the models declare, diffed against the snapshot: a new type is a
+    // `CREATE TYPE`, a type that gained labels is `ALTER TYPE … ADD VALUE`
+    // (ADR 0046/0053). Postgres-only — SQLite/MySQL store the column as TEXT.
+    b.enum_ddl
+        .extend(enum_type_ddl(previous, &current, backend));
+
     // Tables the models declare: new ones get a full CREATE; existing ones get a
     // column-, index- and alteration-level diff — after any renames for that
     // table are applied to the previous snapshot.
@@ -265,6 +290,55 @@ pub fn autodetect_with_renames(
     }
 
     Ok(b.into_ordered())
+}
+
+/// The forward enum DDL between two snapshots (ADR 0046/0053): a `CREATE TYPE`
+/// (idempotent `DO`-block guard) for each type new in `current`, and an
+/// `ALTER TYPE … ADD VALUE IF NOT EXISTS` for each label a kept type gained. Empty
+/// off PostgreSQL. `ADD VALUE` runs fine inside the migration transaction on
+/// PostgreSQL 12+ as long as the new label is not *used* in the same migration,
+/// which a schema migration never does.
+fn enum_type_ddl(previous: &Snapshot, current: &Snapshot, backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    let prev: BTreeMap<&str, &EnumType> = previous
+        .enum_types
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let mut out = Vec::new();
+    for e in &current.enum_types {
+        match prev.get(e.name.as_str()) {
+            None => {
+                let labels = e
+                    .variants
+                    .iter()
+                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push(format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN \
+                     CREATE TYPE {} AS ENUM ({labels}); \
+                     END IF; END $$",
+                    e.name, e.name
+                ));
+            }
+            Some(old) => {
+                for v in &e.variants {
+                    if !old.variants.contains(v) {
+                        let label = v.replace('\'', "''");
+                        out.push(format!(
+                            "ALTER TYPE {} ADD VALUE IF NOT EXISTS '{label}'",
+                            e.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The inverse of the migration [`autodetect_with_renames`] produces — the
@@ -308,6 +382,23 @@ pub fn down_for(
         }
     }
 
+    // An enum that gained a label is irreversible (PostgreSQL has no way to remove
+    // an enum value), so the whole migration has no `down` — like an altered column.
+    let prev_enums: BTreeMap<&str, &EnumType> = previous
+        .enum_types
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    if backend == Backend::Postgres {
+        for e in &current.enum_types {
+            if let Some(old) = prev_enums.get(e.name.as_str()) {
+                if e.variants.iter().any(|v| !old.variants.contains(v)) {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+
     // Purely additive: invert it.
     let prev_tables: BTreeMap<&str, &Table> = previous
         .tables
@@ -342,12 +433,27 @@ pub fn down_for(
     // Drop new tables child-first, mirroring the parent-first create order.
     drop_tables.reverse();
 
+    // A type new in this migration is dropped on the way down — after the tables
+    // that referenced it are gone (Postgres only).
+    let drop_types: Vec<String> = if backend == Backend::Postgres {
+        current
+            .enum_types
+            .iter()
+            .filter(|e| !prev_enums.contains_key(e.name.as_str()))
+            .map(|e| format!("DROP TYPE IF EXISTS {}", e.name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Order mirrors the forward migration undone: added indexes, then columns,
-    // then tables, then the renames (which ran first on the way up, so last here).
+    // then tables, then the enum types, then the renames (which ran first on the
+    // way up, so last here).
     let mut down = Vec::new();
     down.extend(drop_idx);
     down.extend(drop_cols);
     down.extend(drop_tables);
+    down.extend(drop_types);
     down.extend(
         renames
             .iter()
@@ -400,6 +506,9 @@ fn apply_renames(prev: &Table, cur: &Table, renames: &[&ColumnRename]) -> Result
 /// additive-before-destructive regardless of the order tables are visited in.
 #[derive(Default)]
 struct Buckets {
+    /// `CREATE TYPE`/`ALTER TYPE … ADD VALUE` — first, so a type exists before any
+    /// `CREATE TABLE` that references it (ADR 0046/0053).
+    enum_ddl: Vec<String>,
     renames: Vec<String>,
     creates: Vec<String>,
     adds: Vec<String>,
@@ -413,10 +522,13 @@ struct Buckets {
 
 impl Buckets {
     fn into_ordered(self) -> Vec<String> {
-        // Renames run first: the rest of the diff was computed against a snapshot
+        // Enum types first of all: a `CREATE TABLE` with an enum column needs the
+        // type to exist already.
+        let mut out = self.enum_ddl;
+        // Renames run next: the rest of the diff was computed against a snapshot
         // already rewritten to the new names, so the database must carry them by
         // the time an alter/add/drop/rebuild for that table runs.
-        let mut out = self.renames;
+        out.extend(self.renames);
         out.extend(self.creates);
         out.extend(self.adds);
         out.extend(self.index_adds);
@@ -1234,6 +1346,97 @@ mod tests {
         assert!(
             !stmts.iter().any(|s| s.contains("DROP COLUMN")),
             "nothing is dropped — the rename replaced the drop: {stmts:?}"
+        );
+    }
+
+    // A model with a native enum column (ADR 0046/0053). The variants live in the
+    // `EnumMeta` slice, submitted here the way the derive does it.
+    dorm_core::inventory::submit! {
+        dorm_core::meta::EnumMeta { type_name: "ticket_status", variants: &["open", "closed", "archived"] }
+    }
+    const STATUS: FieldMeta = col("status", FieldType::Enum("ticket_status"));
+    const TICKET_FIELDS: &[FieldMeta] = &[ID, STATUS];
+    const TICKET_META: ModelMeta = ModelMeta {
+        name: "Ticket",
+        table: "tickets",
+        fields: TICKET_FIELDS,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    /// The snapshot `TICKET_META` gives, with its one enum type's variants trimmed
+    /// to the first `keep` — the state before the model grew the rest.
+    fn ticket_snapshot_with(keep: usize) -> Snapshot {
+        let mut s = Snapshot::from_models(&[&TICKET_META]);
+        s.enum_types[0].variants.truncate(keep);
+        s
+    }
+
+    #[test]
+    fn a_new_enum_type_is_created_before_its_table() {
+        let stmts = autodetect(&Snapshot::empty(), &[&TICKET_META], Backend::Postgres).unwrap();
+        let create_type = stmts
+            .iter()
+            .position(|s| {
+                s.contains("CREATE TYPE ticket_status AS ENUM ('open', 'closed', 'archived')")
+            })
+            .expect("a CREATE TYPE is emitted");
+        let create_table = stmts
+            .iter()
+            .position(|s| s.contains("CREATE TABLE") && s.contains("tickets"))
+            .expect("the table is created");
+        assert!(
+            create_type < create_table,
+            "the type must precede the table that uses it: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn a_grown_enum_emits_add_value_and_no_type_or_table_change() {
+        // Previous knew only {open, closed}; the model now declares a third label.
+        let prev = ticket_snapshot_with(2);
+        let stmts = autodetect(&prev, &[&TICKET_META], Backend::Postgres).unwrap();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s == "ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'archived'"),
+            "the added label is emitted: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| s.contains("CREATE TYPE") || s.contains("CREATE TABLE")),
+            "an existing type and table are not recreated: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn down_drops_a_newly_created_enum_type_but_a_grown_one_is_irreversible() {
+        // A fresh type is dropped on the way down, after its table.
+        let down = down_for(&Snapshot::empty(), &[&TICKET_META], Backend::Postgres, &[]).unwrap();
+        let drop_table = down
+            .iter()
+            .position(|s| s.contains("DROP TABLE") && s.contains("tickets"));
+        let drop_type = down
+            .iter()
+            .position(|s| s == "DROP TYPE IF EXISTS ticket_status");
+        assert!(
+            drop_table.is_some() && drop_type.is_some(),
+            "both drops present: {down:?}"
+        );
+        assert!(
+            drop_table < drop_type,
+            "the table is dropped before its type: {down:?}"
+        );
+
+        // Growing an enum has no inverse (PostgreSQL cannot remove a value).
+        let prev = ticket_snapshot_with(2);
+        let down = down_for(&prev, &[&TICKET_META], Backend::Postgres, &[]).unwrap();
+        assert!(
+            down.is_empty(),
+            "a grown enum makes the migration irreversible: {down:?}"
         );
     }
 }
