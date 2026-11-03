@@ -14,7 +14,7 @@ use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+use tokio_postgres::types::{to_sql_checked, IsNull, Kind, ToSql, Type};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -46,6 +46,12 @@ pub enum FieldType {
     TextArray,
     /// `BIGINT[]` — an integer array (id lists), same set lookups (ADR 0041).
     IntArray,
+    /// A native PostgreSQL `ENUM` type, named by its `&'static str` type name
+    /// (ADR 0046). The value travels as text — a `Value::Text` label — so `Value`
+    /// gains no variant; this only tells the DDL the column is `CREATE TYPE … AS
+    /// ENUM (…)` and that a read decodes as a string. SQLite/MySQL store it as
+    /// `TEXT`.
+    Enum(&'static str),
 }
 
 impl FieldType {
@@ -68,6 +74,8 @@ impl FieldType {
             FieldType::Inet => "INET",
             FieldType::TextArray => "TEXT[]",
             FieldType::IntArray => "BIGINT[]",
+            // The column's SQL type *is* the enum type's name.
+            FieldType::Enum(name) => name,
         }
     }
 
@@ -94,6 +102,7 @@ impl FieldType {
             FieldType::Inet => "inet",
             FieldType::TextArray => "text[]",
             FieldType::IntArray => "bigint[]",
+            FieldType::Enum(name) => name,
         }
     }
 }
@@ -220,6 +229,10 @@ impl Value {
                 Value::Inet(s.parse().map_err(|_| mismatch("inet address"))?)
             }
 
+            // An enum column takes its label as text; the database validates the
+            // label against the type's variants (ADR 0046).
+            (Value::Text(s), FieldType::Enum(_)) => Value::Text(s),
+
             (_, w) => return Err(mismatch(w.describe())),
         })
     }
@@ -287,7 +300,19 @@ impl ToSql for Value {
             Value::I32(v) => v.to_sql_checked(ty, out),
             Value::I64(v) => v.to_sql_checked(ty, out),
             Value::F64(v) => v.to_sql_checked(ty, out),
-            Value::Text(v) => v.to_sql_checked(ty, out),
+            // A native enum's binary wire format is simply its label as UTF-8.
+            // `String`'s own `accepts` rejects a custom enum type — its OID is not
+            // one of the built-ins it knows — so the label is written directly for
+            // an enum parameter; the database still rejects a label outside the
+            // type's variants (ADR 0046). Any other type keeps the checked path.
+            Value::Text(v) => {
+                if matches!(ty.kind(), Kind::Enum(_)) {
+                    out.extend_from_slice(v.as_bytes());
+                    Ok(IsNull::No)
+                } else {
+                    v.to_sql_checked(ty, out)
+                }
+            }
             Value::Decimal(v) => v.to_sql_checked(ty, out),
             Value::Timestamp(v) => v.to_sql_checked(ty, out),
             Value::Uuid(v) => v.to_sql_checked(ty, out),
@@ -485,6 +510,13 @@ pub fn read_column(
             .try_get::<_, Option<Vec<i64>>>(idx)
             .map_err(|_| fail("bigint[]"))?
             .map_or(Value::Null, Value::IntArray),
+        // An enum column decodes as its text label. `String`'s `FromSql` rejects a
+        // custom enum type, so a small wrapper reads the raw UTF-8 bytes — the
+        // enum's wire format (ADR 0046).
+        FieldType::Enum(_) => row
+            .try_get::<_, Option<crate::row::PgEnumLabel>>(idx)
+            .map_err(|_| fail("enum"))?
+            .map_or(Value::Null, |l| Value::Text(l.0)),
     })
 }
 

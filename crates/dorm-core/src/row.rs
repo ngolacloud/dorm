@@ -26,6 +26,28 @@
 //! [ADR 0003]: https://github.com/ngolacloud/dorm/blob/main/docs/adr/0003-backend-generic-db.md
 
 use crate::error::{Error, Result};
+use tokio_postgres::types::{FromSql, Kind, Type};
+
+/// Reads a native enum column as its text label (ADR 0046).
+///
+/// `String`'s own `FromSql` rejects a custom enum type — the mirror of the
+/// `ToSql` side in [`crate::value`] — so this wrapper accepts `Kind::Enum` and
+/// decodes the raw bytes, which for an enum are exactly the label's UTF-8. Shared
+/// by the untyped [`crate::value::read_column`] and the typed `String` [`Decode`].
+pub(crate) struct PgEnumLabel(pub String);
+
+impl<'a> FromSql<'a> for PgEnumLabel {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(PgEnumLabel(std::str::from_utf8(raw)?.to_owned()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Enum(_))
+    }
+}
 
 /// One row of a result set, from whichever backend produced it.
 pub enum Row {
@@ -171,7 +193,70 @@ impl_decode!(i32, |c| sqlite_int(c).map(|n| n as i32), |c| mysql_int(c)
 impl_decode!(i64, sqlite_int, mysql_int);
 impl_decode!(bool, |c| sqlite_int(c).map(|n| n != 0), |c| mysql_int(c)
     .map(|n| n != 0));
-impl_decode!(String, sqlite_text, mysql_text);
+// `String` is hand-written rather than `impl_decode!`'d: a native enum column
+// decodes to a `String`, but `String`'s own `FromSql` rejects the custom enum
+// type, so `from_pg` falls back to reading the label bytes (ADR 0046). SQLite and
+// MySQL store the enum as `TEXT`, so their paths are the plain text decode.
+impl Decode for String {
+    fn from_pg(row: &tokio_postgres::Row, idx: usize) -> Result<Self> {
+        match row.try_get::<usize, String>(idx) {
+            Ok(s) => Ok(s),
+            // A `Kind::Enum` column: read its label directly.
+            Err(_) => row
+                .try_get::<usize, PgEnumLabel>(idx)
+                .map(|l| l.0)
+                .map_err(|e| Error::Db(e.to_string())),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn from_sqlite(cell: &rusqlite::types::Value) -> Result<Self> {
+        match cell {
+            rusqlite::types::Value::Null => Err(Error::Db(
+                "unexpected NULL reading a non-null String".into(),
+            )),
+            other => sqlite_text(other),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    fn from_mysql(cell: &mysql_async::Value) -> Result<Self> {
+        match cell {
+            mysql_async::Value::NULL => Err(Error::Db(
+                "unexpected NULL reading a non-null String".into(),
+            )),
+            other => mysql_text(other),
+        }
+    }
+}
+
+impl Decode for Option<String> {
+    fn from_pg(row: &tokio_postgres::Row, idx: usize) -> Result<Self> {
+        match row.try_get::<usize, Option<String>>(idx) {
+            Ok(s) => Ok(s),
+            Err(_) => row
+                .try_get::<usize, Option<PgEnumLabel>>(idx)
+                .map(|o| o.map(|l| l.0))
+                .map_err(|e| Error::Db(e.to_string())),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn from_sqlite(cell: &rusqlite::types::Value) -> Result<Self> {
+        match cell {
+            rusqlite::types::Value::Null => Ok(None),
+            other => sqlite_text(other).map(Some),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    fn from_mysql(cell: &mysql_async::Value) -> Result<Self> {
+        match cell {
+            mysql_async::Value::NULL => Ok(None),
+            other => mysql_text(other).map(Some),
+        }
+    }
+}
 impl_decode!(
     rust_decimal::Decimal,
     |c| {
@@ -382,6 +467,8 @@ pub(crate) fn cell_to_value(
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which SQLite does not support"))
         }
+        // An enum is a plain TEXT column here (ADR 0046); decode the label.
+        FieldType::Enum(_) => Value::Text(sqlite_text(cell).map_err(|_| mismatch("enum text"))?),
     })
 }
 
@@ -548,5 +635,6 @@ pub(crate) fn mysql_cell_to_value(
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which MySQL does not support"))
         }
+        FieldType::Enum(_) => Value::Text(mysql_text(cell).map_err(|_| mismatch("enum text"))?),
     })
 }

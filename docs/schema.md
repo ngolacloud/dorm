@@ -88,8 +88,11 @@ or `dorm validate` names the typo.
 
 ## Not yet (roadmap)
 
-Table-level `@@check`, enums, default-ordering, partial/expression indexes, and
-multi-file schemas. A composite `@@index` added to an *existing* table is built by
-`sync` but not yet emitted as a versioned incremental migration step (ADR 0044).
-All additive — see [roadmap.md](roadmap.md). Writing Rust models by hand still
-works; the schema is the tooled path.
+Table-level `@@check`, a top-level `enum` block, default-ordering,
+partial/expression indexes, and multi-file schemas. A composite `@@index` added
+to an *existing* table is built by `sync` but not yet emitted as a versioned
+incremental migration step (ADR 0044). Native enum **types** already work on a
+hand-written model via `#[field(enum_type = "…", enum_variants = "…")]` (ADR
+0046); only the `dorm.schema` `enum` block is pending. All additive — see
+[roadmap.md](roadmap.md). Writing Rust models by hand still works; the schema is
+the tooled path.

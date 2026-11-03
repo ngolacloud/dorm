@@ -149,6 +149,9 @@ fn type_tag(ty: FieldType) -> &'static str {
         FieldType::Uuid => "uuid",
         FieldType::Json => "json",
         FieldType::Bytes => "bytes",
+        // The enum type's own name is its tag — a change of type is a change of
+        // this string (ADR 0046).
+        FieldType::Enum(name) => name,
     }
 }
 

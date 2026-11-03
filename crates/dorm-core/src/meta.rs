@@ -247,6 +247,54 @@ pub struct IndexMeta {
 
 inventory::collect!(IndexMeta);
 
+/// A native enum type declared on a field with
+/// `#[field(enum_type = "…", enum_variants = "…")]` (ADR 0046): the SQL type name
+/// and its ordered variants. Kept in a slice so the migrator can emit
+/// `CREATE TYPE … AS ENUM (…)` and so `FieldType` carries only the type's name
+/// (a `Copy` `&'static str`) rather than a growing list of labels. The same type
+/// may be declared on several fields; [`enum_variants`] dedupes by name.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumMeta {
+    /// The SQL enum type name, matching [`crate::value::FieldType::Enum`].
+    pub type_name: &'static str,
+    /// The variants, in declaration order — the order PostgreSQL stores and sorts.
+    pub variants: &'static [&'static str],
+}
+
+inventory::collect!(EnumMeta);
+
+/// The variants of the native enum type named `type_name`, or `None` if no model
+/// declares it. Resolved through the [`EnumMeta`] slice (ADR 0046).
+pub fn enum_variants(type_name: &str) -> Option<&'static [&'static str]> {
+    inventory::iter::<EnumMeta>
+        .into_iter()
+        .find(|e| e.type_name == type_name)
+        .map(|e| e.variants)
+}
+
+/// Every distinct native enum type declared across the given models, as
+/// `(type_name, variants)`, deduped by name — what the migrator iterates to emit
+/// `CREATE TYPE` once per type (ADR 0046).
+pub fn enum_types_of(
+    models: &[&'static ModelMeta],
+) -> Vec<(&'static str, &'static [&'static str])> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut out: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    for m in models {
+        for f in m.fields {
+            if let crate::value::FieldType::Enum(name) = f.ty {
+                if !seen.contains(&name) {
+                    seen.push(name);
+                    if let Some(vs) = enum_variants(name) {
+                        out.push((name, vs));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Marks a model as soft-deleting, naming its `deleted_at`-style timestamp column
 /// (ADR 0033). In its own slice rather than on [`ModelMeta`], so the metadata is
 /// unchanged; the scope seam reads it to hide deleted rows by default.

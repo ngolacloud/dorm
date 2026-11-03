@@ -91,6 +91,12 @@ struct FieldSpec {
     foreign_key: Option<String>,
     on_delete: String,
     related_name: Option<String>,
+    /// A native enum type on this field (`#[field(enum_type = "…")]`, ADR 0046):
+    /// the SQL type name and its variants. When set, the field's `FieldType` is
+    /// `Enum(type_name)` and an `EnumMeta` is submitted. The value stays a
+    /// `String`.
+    enum_type: Option<String>,
+    enum_variants: Vec<String>,
 }
 
 impl FieldSpec {
@@ -354,6 +360,8 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
         foreign_key: None,
         on_delete: "restrict".to_string(),
         related_name: None,
+        enum_type: None,
+        enum_variants: Vec::new(),
     };
 
     let mut stated_type: Option<Ident> = None;
@@ -412,16 +420,62 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
                     let s: LitStr = meta.value()?.parse()?;
                     stated_type = Some(column_type_ident(&s)?);
                 }
+                "enum_type" => {
+                    // The SQL enum type name (ADR 0046). Validated as a plain SQL
+                    // identifier so it can be quoted into DDL without escaping.
+                    let s: LitStr = meta.value()?.parse()?;
+                    let name = s.value();
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                        || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    {
+                        return Err(syn::Error::new(
+                            s.span(),
+                            "enum_type must be a lower_snake_case SQL identifier, e.g. \
+                             \"order_status\"",
+                        ));
+                    }
+                    spec.enum_type = Some(name);
+                }
+                "enum_variants" => {
+                    // Comma-separated labels, in declaration order (ADR 0046).
+                    let s: LitStr = meta.value()?.parse()?;
+                    spec.enum_variants = s
+                        .value()
+                        .split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                }
                 other => {
                     return Err(meta.error(format!(
                         "unknown `field` option `{other}`; known: primary_key, unique, index, \
                          column, default, max_length, auto_now_add, auto_now, version, \
-                         foreign_key, on_delete, related_name, column_type"
+                         foreign_key, on_delete, related_name, column_type, enum_type, \
+                         enum_variants"
                     )))
                 }
             }
             Ok(())
         })?;
+    }
+
+    // An enum field needs both halves: the type name and its variants. A type
+    // with no variants would compile to `CREATE TYPE … AS ENUM ()`, which is
+    // never what was meant (ADR 0046).
+    if spec.enum_type.is_some() && spec.enum_variants.is_empty() {
+        return Err(Error::new_spanned(
+            f,
+            "a field with `enum_type` needs `enum_variants = \"a, b, …\"`",
+        ));
+    }
+    if spec.enum_type.is_none() && !spec.enum_variants.is_empty() {
+        return Err(Error::new_spanned(
+            f,
+            "`enum_variants` needs `enum_type = \"…\"` to name the SQL type",
+        ));
     }
 
     // A `ForeignKey<T>` in the type position says the same thing as
@@ -625,7 +679,15 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
     let field_entries = specs.iter().map(|s| {
         let fname = s.ident.to_string();
         let column = &s.column;
-        let ft = &s.field_type;
+        // An enum field's type carries the type name; everything else is a bare
+        // `FieldType` variant inferred or stated (ADR 0046).
+        let ty_tok = match &s.enum_type {
+            Some(name) => quote!(::dorm_core::value::FieldType::Enum(#name)),
+            None => {
+                let ft = &s.field_type;
+                quote!(::dorm_core::value::FieldType::#ft)
+            }
+        };
         let nullable = s.nullable;
         let pk = s.primary_key;
         let unique = s.unique;
@@ -665,7 +727,7 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
             ::dorm_core::meta::FieldMeta {
                 name: #fname,
                 column: #column,
-                ty: ::dorm_core::value::FieldType::#ft,
+                ty: #ty_tok,
                 nullable: #nullable,
                 primary_key: #pk,
                 unique: #unique,
@@ -728,6 +790,22 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         }
     });
 
+    // One `EnumMeta` submission per enum field (ADR 0046): the SQL type name and
+    // its variants, for the migrator's `CREATE TYPE`. The type carried on
+    // `FieldType::Enum` is only the name.
+    let enum_submits = specs.iter().filter_map(|s| {
+        let type_name = s.enum_type.as_ref()?;
+        let variants = s.enum_variants.iter().map(|v| quote!(#v));
+        Some(quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::EnumMeta {
+                    type_name: #type_name,
+                    variants: &[#(#variants),*],
+                }
+            }
+        })
+    });
+
     quote! {
         #[doc(hidden)]
         const #fields_const: &[::dorm_core::meta::FieldMeta] = &[#(#field_entries),*];
@@ -757,6 +835,7 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         #(#version_submits)*
         #soft_delete_submit
         #(#index_submits)*
+        #(#enum_submits)*
     }
 }
 

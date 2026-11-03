@@ -47,6 +47,12 @@ pub fn schema_for(models: &[&'static ModelMeta]) -> Result<String> {
 /// `CREATE TABLE` followed by its `CREATE INDEX`es, terminated by `;\n`.
 pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<String> {
     let mut out = String::new();
+    // Native enum types come first — a column cannot reference a type that does
+    // not exist yet (ADR 0046).
+    for stmt in create_enum_types(models, backend) {
+        out.push_str(&stmt);
+        out.push_str(";\n");
+    }
     for (i, m) in models.iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -59,6 +65,38 @@ pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<
         }
     }
     Ok(out)
+}
+
+/// `CREATE TYPE … AS ENUM (…)` for every distinct native enum type the models
+/// declare, idempotent, in dependency order (types before the tables that use
+/// them) — ADR 0046.
+///
+/// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, so each is wrapped in a `DO`
+/// block that checks `pg_type` first; re-running is a no-op. On SQLite/MySQL the
+/// enum column is a plain `TEXT` ([`sql_type`]), so there is no type to create and
+/// this is empty. The variants are model-definition constants (compile time,
+/// never a caller), so they are quoted straight in — the same rule as a field
+/// default or a `CHECK`.
+pub fn create_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    dorm_core::meta::enum_types_of(models)
+        .into_iter()
+        .map(|(name, variants)| {
+            let labels = variants
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "DO $$ BEGIN \
+                 IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{name}') THEN \
+                 CREATE TYPE {name} AS ENUM ({labels}); \
+                 END IF; END $$"
+            )
+        })
+        .collect()
 }
 
 /// `CREATE TABLE …` for PostgreSQL. See [`create_table_on`] for another backend.
@@ -437,6 +475,8 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             // (ADR 0040) — network operators are PostgreSQL-only.
             FieldType::Inet => "TEXT",
             FieldType::TextArray | FieldType::IntArray => "TEXT",
+            // No native enum portably; the label is stored as TEXT (ADR 0046).
+            FieldType::Enum(_) => "TEXT",
         }
         .to_string(),
         Backend::MySql => match ty {
@@ -459,6 +499,7 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::Bytes => "LONGBLOB",
             FieldType::Inet => "TEXT",
             FieldType::TextArray | FieldType::IntArray => "TEXT",
+            FieldType::Enum(_) => "TEXT",
         }
         .to_string(),
     }

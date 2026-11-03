@@ -151,6 +151,8 @@ fn decode(row: &rusqlite::Row, i: usize, ty: FieldType, column: &str) -> Result<
         FieldType::TextArray | FieldType::IntArray => {
             return Err(mismatch("arrays, which SQLite does not support"))
         }
+        // An enum is a plain TEXT column on SQLite (ADR 0046); read the label.
+        FieldType::Enum(_) => Value::Text(as_text(&raw).ok_or(mismatch("enum text"))?),
         FieldType::Json => Value::Json(
             serde_json::from_str(&as_text(&raw).ok_or(mismatch("json text"))?)
                 .map_err(|_| mismatch("json"))?,

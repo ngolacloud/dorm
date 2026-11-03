@@ -277,8 +277,16 @@ pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     // Transactional part: create missing tables and add missing columns, under
     // the advisory lock so two concurrent syncs serialise rather than racing on
     // `ALTER TABLE`.
+    // Native enum types (ADR 0046) are created before the tables — a column
+    // cannot reference a type that does not exist. Idempotent `DO` blocks, so a
+    // re-run is a no-op; not reported as a change (like the indexes).
+    let enum_types = ddl::create_enum_types(models, backend);
+
     let changes = db::atomic(|_tx| async move {
         db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+        for stmt in &enum_types {
+            db::execute(stmt, &[]).await?;
+        }
         let (tables, columns) = introspect().await?;
         let changes = changes_for(&plans, &tables, &columns);
         for stmt in &changes {
