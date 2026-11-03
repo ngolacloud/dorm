@@ -1126,6 +1126,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dorm-eventstore"
+version = "0.1.0"
+dependencies = [
+ "dorm-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dorm-example"
 version = "0.2.0"
 dependencies = [

@@ -47,6 +47,10 @@ members = [
     # Optional messaging: CloudEvents envelope + Publisher/Subscriber, outbox-backed
     # by default, broker backends behind features (ADR 0031).
     "crates/dorm-messaging",
+    # Optional PostgreSQL event store: append-only per-aggregate event streams with
+    # optimistic-concurrency append, aggregate snapshots and event-version upcasting
+    # (ADR 0039). dorm-core never depends on it.
+    "crates/dorm-eventstore",
 ]
 
 [workspace.package]
