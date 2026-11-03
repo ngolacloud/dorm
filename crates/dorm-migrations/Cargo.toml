@@ -49,4 +49,4 @@ sqlite = ["dorm-core/sqlite"]
 insta = { workspace = true }
 # Proves the generated SQLite DDL creates a working database (ADR 0002, brick 1).
 # `bundled` compiles SQLite, so the test needs no system library.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }

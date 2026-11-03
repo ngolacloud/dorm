@@ -61,7 +61,7 @@ tracing = { workspace = true }
 # The SQLite driver, opt-in behind the `sqlite` feature (ADR 0003). `bundled`
 # compiles SQLite in, so a user who turns the feature on needs no system
 # library; a user who leaves it off pulls neither this crate nor SQLite.
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 # The MySQL driver, opt-in behind the `mysql` feature (ADR 0018). `minimal` drops
 # TLS and compression (added later); the non-scalar types (Decimal, Timestamp,
 # Uuid, Json) travel as text, so no chrono/bigdecimal feature of the driver is
