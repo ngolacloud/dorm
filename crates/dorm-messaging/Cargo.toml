@@ -20,15 +20,20 @@ dorm-core = { version = "0.6", path = "../dorm-core" }
 dorm-outbox = { version = "0.1", path = "../dorm-outbox" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The NATS backend's client, pulled only when the `nats` feature is on (ADR 0031).
+async-nats = { version = "0.45", optional = true }
 
 [features]
 default = []
 # Broker backends land behind features so a build that only uses the outbox-backed
-# bus pulls no client library. `nats` (JetStream) is prioritised (ADR 0031); it
-# needs a running broker to prove, so it is not enabled or exercised here yet.
-nats = []
+# bus pulls no client library. `nats` is implemented (ADR 0031/0051): a
+# `NatsPublisher` plus the outbox→broker bridge, proven against a live NATS. Kafka
+# and AMQP are the same shape, behind their own features, not yet wired.
+nats = ["dep:async-nats"]
 kafka = []
 amqp = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# The nats_live test subscribes and reads the delivered messages off the stream.
+futures = "0.3"

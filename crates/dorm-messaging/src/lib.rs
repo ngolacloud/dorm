@@ -9,9 +9,11 @@
 //! **exactly-once effect** — the handler's database work and the inbox record
 //! commit together, so a redelivered event is a no-op.
 //!
-//! Broker backends (NATS JetStream, Kafka, AMQP) implement the same [`Publisher`]
-//! trait behind Cargo features; they need a running broker and are not exercised
-//! here yet.
+//! Broker backends implement the same [`Publisher`] trait behind Cargo features,
+//! and [`OutboxBus::forward`] bridges the outbox to any of them, at-least-once.
+//! **NATS** is implemented ([`nats`], feature `nats`) and proven against a live
+//! server (ADR 0051); Kafka and AMQP are the same shape, behind their features,
+//! not yet wired.
 
 use std::future::Future;
 
@@ -161,6 +163,84 @@ impl OutboxBus {
         })
         .await?;
         Ok(stats.processed)
+    }
+
+    /// Forward outbox events to an external broker through `publisher` (ADR 0031):
+    /// drain what `consumer` has not seen for `topic` and publish each, advancing
+    /// the cursor **only after** a successful publish. This is the
+    /// transactional-outbox → broker bridge — the business write committed the
+    /// event with its own transaction ([`OutboxBus::publish`]); this relay carries
+    /// it to the broker with **at-least-once** delivery (a publish that fails
+    /// leaves the cursor where it was, so the event is retried, and after
+    /// `max_attempts` it dead-letters, exactly as [`dorm_outbox::relay`] defines).
+    ///
+    /// Works with any [`Publisher`]: the [`nats::NatsPublisher`] behind the `nats`
+    /// feature, or a test double. Returns how many events it forwarded this pass.
+    pub async fn forward<P: Publisher>(
+        &self,
+        consumer: &str,
+        topic: &str,
+        cfg: dorm_outbox::RelayConfig,
+        publisher: &P,
+    ) -> Result<u64> {
+        let stats = dorm_outbox::relay(consumer, topic, cfg, move |ev| async move {
+            let event = CloudEvent::from_json(&ev.payload)?;
+            publisher.publish(topic, &event).await
+        })
+        .await?;
+        Ok(stats.processed)
+    }
+}
+
+/// The NATS broker backend (ADR 0031/0051), behind the `nats` feature.
+///
+/// A [`NatsPublisher`] carries [`CloudEvent`]s to a NATS subject in
+/// CloudEvents **structured** JSON (the whole envelope is the message body).
+/// Pair it with [`OutboxBus::forward`] for the durable, at-least-once path:
+/// business writes land in the outbox transactionally, and the relay forwards
+/// them here.
+#[cfg(feature = "nats")]
+pub mod nats {
+    use super::{CloudEvent, Error, Publisher, Result};
+
+    /// A [`Publisher`] that publishes to a NATS server.
+    pub struct NatsPublisher {
+        client: async_nats::Client,
+    }
+
+    impl NatsPublisher {
+        /// Connect to a NATS server (`nats://host:port`).
+        pub async fn connect(url: &str) -> Result<Self> {
+            let client = async_nats::connect(url)
+                .await
+                .map_err(|e| Error::Db(format!("NATS connect failed: {e}")))?;
+            Ok(NatsPublisher { client })
+        }
+
+        /// The underlying client, for a subscription or JetStream context the
+        /// caller wants to drive directly.
+        pub fn client(&self) -> &async_nats::Client {
+            &self.client
+        }
+    }
+
+    impl Publisher for NatsPublisher {
+        /// Publish the CloudEvents-JSON envelope to `topic` (the NATS subject) and
+        /// flush, so a failure surfaces here rather than being buffered — the
+        /// relay must not advance its cursor on an unacknowledged publish.
+        async fn publish(&self, topic: &str, event: &CloudEvent) -> Result<()> {
+            let bytes = serde_json::to_vec(&event.to_json())
+                .map_err(|e| Error::Db(format!("CloudEvent serialize failed: {e}")))?;
+            self.client
+                .publish(topic.to_string(), bytes.into())
+                .await
+                .map_err(|e| Error::Db(format!("NATS publish failed: {e}")))?;
+            self.client
+                .flush()
+                .await
+                .map_err(|e| Error::Db(format!("NATS flush failed: {e}")))?;
+            Ok(())
+        }
     }
 }
 
