@@ -17,10 +17,29 @@ generate`, Prisma-faithful syntax, [ADR 0001](adr/0001-declarative-schema.md),
 `QuerySet` (ADR 0001's corollary), proven serving live JSON (create → 201,
 update, delete → 204, 404 on a missing id).
 
-Next on this front: typed request/response schemas (today the write body is a
-dynamic JSON object), pagination metadata and filtering on list endpoints, then
-`db pull` (introspect → schema) and `format` (pretty-print the schema), which the
-schema file now makes tractable.
+> **Boundary note ([ADR 0054](adr/0054-orm-boundary.md)):** a generated HTTP API
+> is a service-layer concern, not the ORM's. `dorm api` is slated to **move out**
+> of DORM to the framework layer — deprecated in 0.3, removed in 0.4 — where it
+> is generated from facades, not tables. It keeps working until then; new HTTP
+> work does not happen here. The remaining ORM-side follow-ups below are the
+> ones that stay: `db pull` and `format`.
+
+Next on this front: `db pull` (introspect → schema) and `format` (pretty-print
+the schema), which the schema file now makes tractable.
+
+## The ORM boundary (ADR 0054)
+
+DORM is the data-source layer — one database, one transaction, one process.
+[ADR 0054](adr/0054-orm-boundary.md) fixes which capabilities stay and which
+move to a framework built on top: a capability enters DORM only if a plain
+command-line user with no server and no other services would need it, **and** its
+guarantee comes from a database transaction. Leaving for the layer above, with
+git history preserved: the message-broker clients, the generated REST API, user
+accounts, the looping RAG worker, the MCP HTTP transport, and command/query
+*dispatch* (the read/write routing mechanism stays). Staying, as optional crates
+that implement the ports that layer owns: the outbox, jobs/leases, the event
+store, and idempotency keys. The dependency is one-way — a framework depends on
+DORM, never the reverse.
 
 ## Guiding rules
 

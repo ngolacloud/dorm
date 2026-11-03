@@ -65,6 +65,14 @@ pub enum Error {
     /// current models. The message names the table and columns.
     #[error("invalid column rename: {0}")]
     InvalidRename(String),
+    /// A migration would DROP a column and ADD another of the **same type** in
+    /// the same table — which silently loses the dropped column's data if it is
+    /// really a rename. Rather than guess, DORM refuses: declare the rename (a
+    /// [`ColumnRename`], or `@map` in the schema) so it becomes a data-preserving
+    /// `RENAME COLUMN`; if the columns are genuinely unrelated, make the drop and
+    /// the add in separate migrations. The message names the table and columns.
+    #[error("ambiguous column change (possible rename): {0}")]
+    AmbiguousColumnChange(String),
     /// A problem reading or writing the on-disk migration history: a directory
     /// that cannot be read, a file that is not valid JSON, or a backend that does
     /// not match the migrations already there. The message says which.

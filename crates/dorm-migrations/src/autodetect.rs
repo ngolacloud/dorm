@@ -541,6 +541,49 @@ impl Buckets {
     }
 }
 
+/// Refuse a same-type drop+add that could be an undeclared rename (B-24). A
+/// column dropped here alongside one added of the same type reads exactly like a
+/// rename; emitting DROP + ADD would silently lose the old column's data. A
+/// declared rename never reaches here (it is resolved upstream), so any such
+/// pair is undeclared — refuse and name the candidates. Types that differ are
+/// not rename candidates and pass through.
+fn refuse_ambiguous_rename(
+    prev: &Table,
+    cur: &Table,
+    prev_cols: &BTreeMap<&str, &Column>,
+    cur_cols: &BTreeMap<&str, &Column>,
+) -> Result<()> {
+    let dropped = prev
+        .columns
+        .iter()
+        .filter(|c| !cur_cols.contains_key(c.name.as_str()));
+    let added: Vec<&Column> = cur
+        .columns
+        .iter()
+        .filter(|c| !prev_cols.contains_key(c.name.as_str()))
+        .collect();
+
+    let mut pairs = Vec::new();
+    for d in dropped {
+        for a in &added {
+            if d.ty == a.ty {
+                pairs.push(format!("`{}` → `{}` ({})", d.name, a.name, d.ty));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    Err(Error::AmbiguousColumnChange(format!(
+        "table `{}`: dropping and adding columns of the same type looks like a \
+         rename and would lose data — {}. Declare the rename (a ColumnRename, or \
+         `@map` in the schema) to emit RENAME COLUMN instead; if the columns are \
+         unrelated, make the drop and the add in separate migrations.",
+        cur.name,
+        pairs.join(", ")
+    )))
+}
+
 /// Diff one table that exists in both the previous snapshot and the current
 /// models, appending the statements to the right ordered bucket.
 fn diff_table(
@@ -559,6 +602,16 @@ fn diff_table(
         cur.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let field_by_col: BTreeMap<&str, &FieldMeta> =
         meta.fields.iter().map(|f| (f.column, f)).collect();
+
+    // Data-loss guard (B-24): a column dropped here alongside a column added of
+    // the **same type** looks exactly like a rename, and emitting DROP + ADD
+    // would silently lose the old column's data. A declared rename is already
+    // resolved upstream (the previous snapshot was rewritten to the new name, so
+    // the column matches and is neither dropped nor added); so anything that
+    // reaches here as a same-type drop+add is an *undeclared* rename candidate.
+    // Refuse rather than guess — the SQLite rebuild would drop it too, since it
+    // only copies columns shared by name.
+    refuse_ambiguous_rename(prev, cur, &prev_cols, &cur_cols)?;
 
     // Columns present in both whose definition (ignoring the index flag) changed.
     let altered: Vec<(&Column, &Column)> = cur
@@ -1239,24 +1292,50 @@ mod tests {
     }
 
     #[test]
-    fn without_a_hint_a_rename_is_a_data_losing_drop_and_add() {
+    fn without_a_hint_a_same_type_rename_is_refused_not_a_data_losing_drop_and_add() {
+        // title (TEXT) → headline (TEXT): same type, so a plain DROP+ADD would
+        // silently lose the data. B-24 refuses rather than guess.
         let prev = Snapshot::from_models(&[&NOTE_V1_META]);
-        let stmts = autodetect(&prev, &[&NOTE_RENAMED_META], Backend::Postgres).unwrap();
+        let err = autodetect(&prev, &[&NOTE_RENAMED_META], Backend::Postgres).unwrap_err();
+        assert!(
+            matches!(err, Error::AmbiguousColumnChange(_)),
+            "an undeclared same-type rename must be refused, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("headline"),
+            "the message names the candidate columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_different_type_drop_and_add_is_allowed_not_a_rename_candidate() {
+        // Drop `title` (TEXT) and add `count` (I64): different types, so it cannot
+        // be a rename — the plain DROP + ADD is emitted, not refused.
+        const COUNT: FieldMeta = col("count", FieldType::I64);
+        const FIELDS: &[FieldMeta] = &[ID, COUNT];
+        const META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: FIELDS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect(&prev, &[&META], Backend::Postgres).unwrap();
         assert!(
             stmts
                 .iter()
-                .any(|s| s.contains("ADD COLUMN") && s.contains("headline")),
-            "the new name is added: {stmts:?}"
+                .any(|s| s.contains("ADD COLUMN") && s.contains("count")),
+            "the new column is added: {stmts:?}"
         );
         assert!(
             stmts
                 .iter()
                 .any(|s| s.contains("DROP COLUMN") && s.contains("title")),
-            "the old name — and its data — is dropped: {stmts:?}"
-        );
-        assert!(
-            !stmts.iter().any(|s| s.contains("RENAME COLUMN")),
-            "no rename without a hint: {stmts:?}"
+            "the unrelated column is dropped: {stmts:?}"
         );
     }
 

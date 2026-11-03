@@ -1,6 +1,12 @@
-# ADR 0013 — Objectos de BD remotos e allow-list de SQL nomeado
+# ADR 0058 — Objectos de BD remotos e allow-list de SQL nomeado
 
-Status: Proposed · 2026-10-31
+Status: **Rejected** · see [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0013 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0013](0013-prefetch-related.md).
+> **Rejected:** a remote named-SQL allow-list only exists to serve non-Rust
+> clients across the wire — a data-plane concern outside the ORM (ADR 0054).
+> Local advanced/raw SQL stays available to embedders via [ADR 0005](0005-raw-sql.md).
 
 ## Context
 
@@ -12,7 +18,7 @@ funções de base de dados (achado GW-05). O único SQL cru existe no caminho
 (`crates/dorm-core/src/model.rs:27-29`). Não existe qualquer registo de
 *statements* nomeados nem allow-list versionada.
 
-Num Data Plane poliglota (ADR 0012), abrir SQL cru ao cliente violaria o
+Num Data Plane poliglota (ADR 0057), abrir SQL cru ao cliente violaria o
 invariante nuclear — "No identifier comes from a caller" (`ARCHITECTURE.md:56`).
 Sem um mecanismo de objectos declarados e de *statements* nomeados registados, ou
 se fecha a porta a SQL avançado, ou se abre um buraco de injecção.
@@ -23,8 +29,8 @@ Dar acesso remoto a SQL avançado **sem** aceitar texto livre do cliente, por du
 vias, ambas declaradas no servidor e versionadas como migração:
 
 1. **Procedures e funções declaradas no esquema → RPCs tipados.** Uma *procedure*
-   ou função declarada em `dorm.schema` entra no `SchemaDescriptor` (ADR 0011)
-   com entrada e saída tipadas e torna-se um RPC gerado no serviço do ADR 0012. O
+   ou função declarada em `dorm.schema` entra no `SchemaDescriptor` (ADR 0056)
+   com entrada e saída tipadas e torna-se um RPC gerado no serviço do ADR 0057. O
    cliente invoca pelo nome lógico do objecto com parâmetros tipados; não escreve
    `CALL`/`SELECT fn(...)` nenhum.
 2. **SQL cru remoto só por *statements* nomeados registados numa allow-list
@@ -66,5 +72,5 @@ pedido.
   parâmetros; recusa de um nome não registado; prova de que não existe RPC que
   aceite texto SQL livre do cliente; *round-trip* de versão (editar um *statement*
   é uma migração, não uma edição silenciosa).
-- **Dependências:** assenta no ADR 0012 (Data Plane) e estende o descritor do
-  ADR 0011; o SQL cru local (ADR 0005) mantém-se inalterado para embedders.
+- **Dependências:** assenta no ADR 0057 (Data Plane) e estende o descritor do
+  ADR 0056; o SQL cru local (ADR 0005) mantém-se inalterado para embedders.
