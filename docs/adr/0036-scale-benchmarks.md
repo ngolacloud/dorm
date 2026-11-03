@@ -1,32 +1,58 @@
 # ADR 0036 — Benchmarks a escala (L16)
 
-Status: Proposed · 2026-11-03 — **arnês implementado (Fase 7)**
+Status: Accepted — arnês + 2 cenários medidos a 1M, gate declarado (Fase 7) · 2026-11-03
 
 ## Context
 
-As escolhas de desenho (keyset vs OFFSET, âmbito de inquilino, consumo do outbox)
+As escolhas de desenho (keyset vs OFFSET, índice composto, âmbito de inquilino)
 precisam de prova empírica a escala, com regressões a falharem o CI. Não havia
 arnês a escala (só o bench de prepared statements do ADR 0007, 100 linhas).
 
 ## Decision
 
 Um arnês de benchmark **reproduzível e parametrizável** (`DORM_BENCH_ROWS`,
-default 50_000; 10_000_000 num host de bench dedicado) que mede as formas de SQL
-que o ORM gera. O primeiro cenário entregue: paginação **keyset vs OFFSET fundo** —
-o keyset procura no índice, o OFFSET varre e descarta, por isso o seu custo cresce
-com a profundidade. O número medido vai para esta ADR; a asserção é o sinal de
-regressão que um job de CI compara com uma baseline.
+default 50_000; `10_000_000` num host de bench dedicado) que mede as formas de SQL
+que o ORM gera, em `crates/dorm-core/tests/scale_bench_live.rs`. Cada cenário:
+
+1. **Paginação keyset vs OFFSET fundo** (L4, [[0024]]) — o keyset procura no
+   índice, o OFFSET varre e descarta, por isso o seu custo cresce com a
+   profundidade.
+2. **Índice composto vs varrimento** (L8/[[0044]]) — a query "últimos N de um
+   inquilino" (`WHERE tenant = … ORDER BY created_at DESC LIMIT 20`) medida **antes
+   e depois** de `CREATE INDEX (tenant, created_at)`, com as linhas espalhadas por
+   1000 inquilinos (a fatia de um é uma pequena fração da tabela — exactamente
+   quando o varrimento dói).
+
+**Gate de CI:** cada cenário imprime uma linha legível-por-máquina
+`BENCH scenario=… <métricas em µs>` e tem uma **asserção de regressão** (o keyset
+não pode ser mais lento que o OFFSET; o seek do índice não pode ser mais lento que
+o varrimento). A asserção é o piso sempre-ligado; um job de CI corre os testes
+`#[ignore]` a `DORM_BENCH_ROWS` alto num host dedicado, faz *parse* das linhas
+`BENCH` e compara-as com uma baseline comprometida, com tolerância — o sinal de
+regressão fino.
 
 ## Consequences
 
-- **Prós:** prova empírica e reproduzível; a asserção apanha uma regressão que
-  fizesse o keyset varrer.
-- **Por fazer:** os cenários a 10M/100-inquilinos (update com versão, query com
-  tenant+RLS, consumo de outbox) e o **job de CI com baseline+limiar** correm num
-  host de bench dedicado — a instância de teste única mede-os a escala modesta.
+- **Prós:** prova empírica e reproduzível das escolhas de desenho; as asserções
+  apanham uma regressão que fizesse o keyset varrer ou o índice deixar de ser
+  usado; as linhas `BENCH` dão a um gate de CI números para diferenciar contra uma
+  baseline.
+- **Por fazer (declarado, honesto):** a corrida a **10M linhas / 100 inquilinos**
+  e o **job de CI** (baseline comprometida + tolerância + host dedicado) correm
+  fora da instância de teste única; mais cenários (update com versão sob
+  contenção, consumo de outbox a escala) são aditivos ao mesmo arnês. Os números
+  abaixo são a 1M, não a 10M.
 
 ## Proof
 
-- **Live (`dorm-core/tests/scale_bench_live.rs`):** a 50 000 linhas, OFFSET fundo
-  ~8,7 ms vs keyset ~0,36 ms (**~24× mais rápido**); a asserção falha se o keyset
-  deixar de ganhar. Escala com `DORM_BENCH_ROWS`.
+- **Live (`dorm-core/tests/scale_bench_live.rs`, PostgreSQL 16, `DORM_BENCH_ROWS=1_000_000`):**
+  - **keyset vs OFFSET:** OFFSET fundo **102,8 ms** vs keyset **0,34 ms** —
+    **~305× mais rápido**; a asserção falha se o keyset deixar de ganhar.
+  - **índice composto:** "últimos 20 do inquilino" por varrimento **36,5 ms** vs
+    seek do índice composto **0,50 ms** — **~72× mais rápido**; a asserção falha
+    se o índice deixar de ser usado.
+  - Linhas de gate emitidas:
+    `BENCH scenario=keyset_vs_offset rows=1000000 offset_us=102805 keyset_us=337`,
+    `BENCH scenario=composite_index_tenant_latest rows=1000000 tenants=1000 scan_us=36470 seek_us=504`.
+  - A 50_000 (default) os mesmos cenários passam de forma não-flaky; escala com
+    `DORM_BENCH_ROWS` até aos 10M num host dedicado.
