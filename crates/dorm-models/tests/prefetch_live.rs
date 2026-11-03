@@ -71,7 +71,12 @@ fn prefetch_loads_all_children_in_one_query() {
     let subscriber = tracing_subscriber::registry().with(counter.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    runtime().block_on(async {
+    // This test spans three tenants deliberately — it creates apps for each and
+    // then prefetches across all of them in one query. That cross-tenant load is
+    // an admin operation, so it runs under `with_system_scope`: tenant scoping
+    // (ADR 0021) is bypassed on purpose here, which is exactly what that audited
+    // escape is for.
+    runtime().block_on(db::with_system_scope(async {
         // Three tenants, a plan, and a known number of applications each. Slugs are
         // unique to this test so it is parallel- and rerun-safe.
         let plan = Plan::objects()
@@ -144,5 +149,5 @@ fn prefetch_loads_all_children_in_one_query() {
         for app in apps.of(&tenants[0]) {
             assert_eq!(app.tenant.id(), &tenants[0].pk());
         }
-    });
+    }));
 }

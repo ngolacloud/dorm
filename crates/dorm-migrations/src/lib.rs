@@ -36,6 +36,7 @@
 pub mod autodetect;
 pub mod ddl;
 pub mod history;
+pub mod lint;
 pub mod migrator;
 
 /// What can go wrong building or applying a migration.

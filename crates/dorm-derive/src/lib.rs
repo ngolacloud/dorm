@@ -80,6 +80,10 @@ struct FieldSpec {
     default: Option<String>,
     auto_now_add: bool,
     auto_now: bool,
+    /// Marks this column as the model's optimistic-locking version counter
+    /// (`#[field(version)]`). Emitted into the `VersionMeta` slice, not onto
+    /// `FieldMeta` — the version is read by the write seam, not the compiler.
+    version: bool,
     foreign_key: Option<String>,
     on_delete: String,
     related_name: Option<String>,
@@ -313,6 +317,7 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
         default: None,
         auto_now_add: false,
         auto_now: false,
+        version: false,
         foreign_key: None,
         on_delete: "restrict".to_string(),
         related_name: None,
@@ -335,6 +340,7 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
                 "index" => spec.index = true,
                 "auto_now_add" => spec.auto_now_add = true,
                 "auto_now" => spec.auto_now = true,
+                "version" => spec.version = true,
                 "column" => {
                     let s: LitStr = meta.value()?.parse()?;
                     spec.column = s.value();
@@ -376,8 +382,8 @@ fn parse_field(f: &syn::Field) -> Result<FieldSpec> {
                 other => {
                     return Err(meta.error(format!(
                         "unknown `field` option `{other}`; known: primary_key, unique, index, \
-                         column, default, max_length, auto_now_add, auto_now, foreign_key, \
-                         on_delete, related_name, column_type"
+                         column, default, max_length, auto_now_add, auto_now, version, \
+                         foreign_key, on_delete, related_name, column_type"
                     )))
                 }
             }
@@ -617,6 +623,18 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
     });
     let checks = opts.checks.iter().map(|c| quote!(#c));
 
+    // One `VersionMeta` submission per `#[field(version)]` column (normally zero
+    // or one). Kept out of `FieldMeta` so the compiler never sees it; the write
+    // seam reads it through `ModelMeta::version_field`.
+    let version_submits = specs.iter().filter(|s| s.version).map(|s| {
+        let field_name = s.ident.to_string();
+        quote! {
+            ::dorm_core::inventory::submit! {
+                ::dorm_core::meta::VersionMeta { model: #model_name, field: #field_name }
+            }
+        }
+    });
+
     quote! {
         #[doc(hidden)]
         const #fields_const: &[::dorm_core::meta::FieldMeta] = &[#(#field_entries),*];
@@ -642,6 +660,8 @@ fn build_meta(name: &Ident, table: &str, opts: &ModelOpts, specs: &[FieldSpec]) 
         // This is the line that makes the model visible to the REPL. The linker
         // gathers every submission; nothing enumerates models by hand.
         ::dorm_core::inventory::submit! { #meta_const }
+
+        #(#version_submits)*
     }
 }
 
@@ -720,16 +740,23 @@ fn build_model_impl(name: &Ident, specs: &[FieldSpec], m2m: &[M2mSpec]) -> Resul
         None => quote!(::dorm_core::value::Value::Null),
     };
 
-    let column_values = specs.iter().filter(|s| s.caller_supplied()).map(|s| {
-        let ident = &s.ident;
-        let fname = s.ident.to_string();
-        quote! {
-            (
-                #fname.to_string(),
-                ::dorm_core::value::ToValue::to_value(&self.#ident),
-            )
-        }
-    });
+    // The version column is kept here even when it has a database default, so the
+    // write seam can read the loaded row's current version for its optimistic
+    // guard — but it stays out of `NewRow` below, so an insert still lets the
+    // database initialise it (ADR 0023).
+    let column_values = specs
+        .iter()
+        .filter(|s| s.caller_supplied() || s.version)
+        .map(|s| {
+            let ident = &s.ident;
+            let fname = s.ident.to_string();
+            quote! {
+                (
+                    #fname.to_string(),
+                    ::dorm_core::value::ToValue::to_value(&self.#ident),
+                )
+            }
+        });
 
     let attach_arms = specs
         .iter()

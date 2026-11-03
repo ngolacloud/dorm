@@ -159,6 +159,36 @@ impl ModelMeta {
 // and the linker gathers them; nothing enumerates models by hand.
 inventory::collect!(ModelMeta);
 
+/// Marks one field of one model as its optimistic-locking version column.
+///
+/// Kept in a slice of its own rather than as a flag on [`FieldMeta`]: the version
+/// is read only by the write seam (`save`/`update_if_version`), never by the pure
+/// compiler, so it does not belong in the metadata the compiler reads — the same
+/// discipline `dorm-rag` uses for `RagMeta`. `#[field(version)]` emits one of
+/// these; [`ModelMeta::version_field`] resolves it back to the column (ADR 0023).
+#[derive(Debug, Clone, Copy)]
+pub struct VersionMeta {
+    /// The model name, matching [`ModelMeta::name`].
+    pub model: &'static str,
+    /// The Rust field name carrying the version counter.
+    pub field: &'static str,
+}
+
+inventory::collect!(VersionMeta);
+
+impl ModelMeta {
+    /// This model's optimistic-locking version field, if one was declared with
+    /// `#[field(version)]`. Resolved through the [`VersionMeta`] slice, then the
+    /// field looked up by name so the caller gets the full [`FieldMeta`].
+    pub fn version_field(&self) -> Option<&'static FieldMeta> {
+        let name = inventory::iter::<VersionMeta>
+            .into_iter()
+            .find(|v| v.model == self.name)?
+            .field;
+        self.field(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +290,57 @@ mod tests {
     #[test]
     fn a_model_that_is_not_tenant_scoped_has_no_tenant_field() {
         assert!(META.tenant_field().is_none());
+    }
+
+    // A versioned model, registered the way the derive does it: a `VersionMeta`
+    // in the slice, naming the column. `version_field` resolves it back.
+    inventory::submit! { VersionMeta { model: "Versioned", field: "rev" } }
+
+    const VFIELDS: &[FieldMeta] = &[
+        FieldMeta {
+            name: "id",
+            column: "id",
+            ty: FieldType::I64,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+        FieldMeta {
+            name: "rev",
+            column: "rev",
+            ty: FieldType::I64,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: Some("0"),
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+    ];
+
+    const VMETA: ModelMeta = ModelMeta {
+        name: "Versioned",
+        table: "versioned",
+        fields: VFIELDS,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    #[test]
+    fn the_version_field_resolves_through_the_slice_and_is_absent_otherwise() {
+        assert_eq!(VMETA.version_field().map(|f| f.name), Some("rev"));
+        assert!(META.version_field().is_none());
     }
 
     #[test]

@@ -28,6 +28,12 @@ serde_json = { workspace = true }
 # `clock` is what gives `Utc::now()`, which `auto_now_add`/`auto_now` need. The
 # workspace entry turns defaults off, so it is listed here.
 chrono = { workspace = true, features = ["clock", "serde"] }
+# Keyset cursor signing (ADR 0024). Small, already in the workspace tree; the
+# cursor is a core query feature, not an optional subsystem. Easily feature-gated
+# later if a minimal build wants it gone.
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.22"
 uuid = { workspace = true, features = ["v4", "serde"] }
 rust_decimal = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }

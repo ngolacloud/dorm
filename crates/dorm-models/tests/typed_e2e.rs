@@ -115,11 +115,18 @@ async fn seed(slug: &str) -> (Tenant, Plan) {
     // `TRUNCATE` would not be.
     //
     // Deployments go with it: the foreign key is `ON DELETE CASCADE`.
-    Application::objects()
-        .filter(application::tenant.eq(tenant.pk()))
-        .delete()
-        .await
-        .expect("the tenant's applications are cleared");
+    //
+    // `Application` is `tenant_scoped` (ADR 0021), so this write runs inside
+    // `with_tenant`: the tenant predicate is injected automatically — the explicit
+    // `.filter` is now belt-and-braces.
+    db::with_tenant(tenant.pk(), async {
+        Application::objects()
+            .filter(application::tenant.eq(tenant.pk()))
+            .delete()
+            .await
+            .expect("the tenant's applications are cleared");
+    })
+    .await;
 
     let code = format!("basic-{slug}");
     let plan = Plan::objects()
@@ -151,7 +158,11 @@ macro_rules! e2e {
             let rt = runtime();
             rt.block_on(async {
                 let ($t, $p) = seed($slug).await;
-                $body
+                // The whole test body runs with this seed's tenant in scope, so
+                // every `tenant_scoped` model (Application) is constrained to it
+                // automatically (ADR 0021). Tests stay single-tenant, as before.
+                let tenant_pk = $t.pk();
+                db::with_tenant(tenant_pk, async { $body }).await;
             });
         }
     };
@@ -412,7 +423,10 @@ e2e!(
             Ok(())
         })
         .await;
-        assert!(outcome.is_ok(), "the outer transaction must still commit");
+        assert!(
+            outcome.is_ok(),
+            "the outer transaction must still commit: {outcome:?}"
+        );
 
         let names: Vec<String> = Application::objects()
             .filter(application::tenant.eq(tenant_pk.clone()))
@@ -783,32 +797,42 @@ fn two_sessions_have_independent_read_only_flags() {
     let rt = runtime();
     rt.block_on(async {
         let (t, p) = seed("acme-session-iso").await;
-        Application::objects()
-            .filter(application::tenant.eq(t.pk()))
-            .delete()
-            .await
-            .expect("clear the tenant's applications");
+        db::with_tenant(t.pk(), async {
+            Application::objects()
+                .filter(application::tenant.eq(t.pk()))
+                .delete()
+                .await
+                .expect("clear the tenant's applications");
+        })
+        .await;
 
         // Run both sessions concurrently. Each wraps its write in its own
-        // `with_read_only` scope; neither touches the process-wide flag.
-        let read_only_session = db::with_read_only(true, async {
-            Application::objects()
-                .create(NewApplication {
-                    tenant: t.as_fk(),
-                    plan: p.as_fk(),
-                    name: "from-the-read-only-session".into(),
-                })
-                .await
-        });
-        let writable_session = db::with_read_only(false, async {
-            Application::objects()
-                .create(NewApplication {
-                    tenant: t.as_fk(),
-                    plan: p.as_fk(),
-                    name: "from-the-writable-session".into(),
-                })
-                .await
-        });
+        // `with_read_only` scope (and the tenant scope it operates under); neither
+        // touches the process-wide flag.
+        let read_only_session = db::with_tenant(
+            t.pk(),
+            db::with_read_only(true, async {
+                Application::objects()
+                    .create(NewApplication {
+                        tenant: t.as_fk(),
+                        plan: p.as_fk(),
+                        name: "from-the-read-only-session".into(),
+                    })
+                    .await
+            }),
+        );
+        let writable_session = db::with_tenant(
+            t.pk(),
+            db::with_read_only(false, async {
+                Application::objects()
+                    .create(NewApplication {
+                        tenant: t.as_fk(),
+                        plan: p.as_fk(),
+                        name: "from-the-writable-session".into(),
+                    })
+                    .await
+            }),
+        );
         let (ro, rw) = tokio::join!(read_only_session, writable_session);
 
         // The read-only session refuses — while the writable one, running at the
@@ -826,6 +850,8 @@ fn two_sessions_have_independent_read_only_flags() {
             "the per-session scopes did not leak to the process default"
         );
 
-        app.delete().await.expect("cleanup");
+        db::with_tenant(t.pk(), app.delete())
+            .await
+            .expect("cleanup");
     });
 }

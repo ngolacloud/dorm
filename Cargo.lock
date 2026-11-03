@@ -1088,10 +1088,12 @@ dependencies = [
 name = "dorm-core"
 version = "0.6.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "deadpool-postgres",
  "dorm-derive",
+ "hmac",
  "insta",
  "inventory",
  "mysql_async",
@@ -1103,6 +1105,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",

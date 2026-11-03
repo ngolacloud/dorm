@@ -71,6 +71,18 @@ const LEDGER: &str = "orm_schema_migrations";
 /// it, so two `migrate` calls serialise instead of racing on `CREATE TABLE`.
 const MIGRATE_LOCK: i64 = 0x0072_0d61;
 
+/// The per-migration `lock_timeout`, in milliseconds (ADR 0022).
+pub const MIGRATE_LOCK_TIMEOUT_ENV: &str = "DELONIX_ORM_MIGRATE_LOCK_TIMEOUT_MS";
+
+/// The configured migration `lock_timeout` as a GUC string, or `None` to leave
+/// PostgreSQL's wait-forever default. `0` and empty both mean "no timeout".
+fn migrate_lock_timeout_ms() -> Option<String> {
+    std::env::var(MIGRATE_LOCK_TIMEOUT_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0")
+}
+
 /// Apply the migrations not yet recorded in `orm_schema_migrations`, in order,
 /// each inside the transaction that records it — the `prisma migrate deploy` /
 /// Django `migrate` shape. Backend-agnostic: it runs on PostgreSQL and SQLite
@@ -100,6 +112,13 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
                 &[Value::I64(MIGRATE_LOCK)],
             )
             .await?;
+            // A migration that waits on a lock should fail fast rather than pile
+            // up connections behind a long-running transaction (ADR 0022). The
+            // `lock_timeout` is transaction-local via the safe `set_local` of ADR
+            // 0023; `0`/unset keeps PostgreSQL's wait-forever default.
+            if let Some(ms) = migrate_lock_timeout_ms() {
+                db::set_local("lock_timeout", &ms).await?;
+            }
         }
         db::run(
             &format!(

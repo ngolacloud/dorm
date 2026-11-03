@@ -138,6 +138,16 @@ impl Value {
         }
     }
 
+    /// Read this value as an `i64`, widening an `i32`. Used by the optimistic-lock
+    /// seam, whose version column may be `INTEGER` or `BIGINT` (ADR 0023).
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::I64(n) => Some(*n),
+            Value::I32(n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
     /// Coerce towards a declared field type, so that a REPL literal `1` lands in
     /// an `i64` column and a `"..."` lands in a `Uuid` one.
     ///

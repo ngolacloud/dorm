@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::meta::ModelMeta;
 use crate::queryset::Manager;
 use crate::row::Row;
+use crate::scope;
 use crate::value::Value;
 
 /// A type that maps to one table.
@@ -60,7 +61,9 @@ pub trait NewRow<T: Model> {
 pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
     db::guard_write("save")?;
     let meta = T::meta();
-    let pk_field = meta.primary_key().ok_or_else(|| {
+    // Validate early that the model can be saved by instance; `versioned_update`
+    // and `insert_returning` both rely on there being a primary key.
+    meta.primary_key().ok_or_else(|| {
         Error::Config(format!(
             "model `{}` declares no primary key, so an instance cannot be saved",
             meta.name
@@ -70,7 +73,7 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
     if obj.pk().is_null() {
         let values = obj.column_values();
         let batch = std::slice::from_ref(&values);
-        let sql = compiler::compile_insert_on(meta, batch, db::dialect())?;
+        let sql = scope::compile_insert(meta, batch)?;
         let rows = insert_returning(meta, &sql, batch).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
@@ -79,10 +82,48 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
         return Ok(());
     }
 
-    // An update by primary key, which needs no subquery and no join.
+    // An update by primary key, which needs no subquery and no join. On a
+    // versioned model (`#[field(version)]`) the current version — the one read
+    // into `obj` — is the expected one.
+    let expected = meta
+        .version_field()
+        .map(|vf| {
+            obj.column_values()
+                .iter()
+                .find(|(n, _)| n == vf.name)
+                .and_then(|(_, v)| v.as_i64())
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "model `{}` has a version field `{}` that is not an integer value",
+                        meta.name, vf.name
+                    ))
+                })
+        })
+        .transpose()?;
+    versioned_update(obj, expected).await
+}
+
+/// The update half of [`save_instance`], shared with [`update_if_version`].
+///
+/// When `expected` is `Some`, the model is versioned (ADR 0023): the `UPDATE`
+/// bumps the version column and guards on `version = expected`, so a row changed
+/// under the writer's feet matches nothing and surfaces as [`Error::Conflict`]
+/// rather than silently clobbering the other writer. When `None`, it is an
+/// ordinary last-write-wins update by primary key.
+async fn versioned_update<T: Model>(obj: &mut T, expected: Option<i64>) -> Result<()> {
+    let meta = T::meta();
+    let pk_field = meta
+        .primary_key()
+        .ok_or_else(|| Error::Config(format!("model `{}` declares no primary key", meta.name)))?;
+    let version = meta.version_field();
+
     let values = obj.column_values();
-    let mut assignments = Vec::new();
-    for (name, _) in &values {
+    let mut plan = compiler::Plan::new(meta);
+    plan.filters
+        .push(crate::expr::Q::new(pk_field.name.to_string(), obj.pk()));
+
+    let mut sets: Vec<crate::expr::Assignment> = Vec::new();
+    for (name, v) in &values {
         let f = meta.field(name).ok_or_else(|| Error::UnknownField {
             model: meta.name.to_string(),
             field: name.clone(),
@@ -92,26 +133,103 @@ pub async fn save_instance<T: Model>(obj: &mut T) -> Result<()> {
         if f.auto_now_add {
             continue;
         }
-        assignments.push(name.clone());
+        // The version column is not written as a literal: the database increments
+        // it, so two concurrent bumps cannot land on the same number.
+        if version.is_some_and(|vf| vf.name == name) {
+            continue;
+        }
+        sets.push(crate::expr::Assignment::new(
+            name.clone(),
+            crate::expr::F::Lit(v.clone()),
+        ));
     }
 
-    let mut plan = compiler::Plan::new(meta);
-    plan.filters
-        .push(crate::expr::Q::new(pk_field.name.to_string(), obj.pk()));
-    let sets: Vec<crate::expr::Assignment> = assignments
-        .iter()
-        .map(|name| {
-            let v = values
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.clone())
-                .unwrap_or(Value::Null);
-            crate::expr::Assignment::new(name.clone(), crate::expr::F::Lit(v))
-        })
-        .collect();
-    let sql = compiler::compile_update(&plan, &sets)?;
+    if let (Some(vf), Some(expected)) = (version, expected) {
+        // version = version + 1, guarded by version = $expected.
+        sets.push(crate::expr::Assignment::new(
+            vf.name.to_string(),
+            crate::expr::F::col(vf.name) + 1i64,
+        ));
+        plan.filters.push(crate::expr::Q::new(
+            vf.name.to_string(),
+            Value::I64(expected),
+        ));
+        let sql = scope::compile_update(&plan, &sets)?;
+        let affected = run_execute(&sql).await?;
+        if affected == 0 {
+            let actual = current_version(meta, vf, pk_field, obj.pk()).await?;
+            return Err(Error::Conflict {
+                model: meta.name.to_string(),
+                expected,
+                actual,
+            });
+        }
+        // Reload so `obj` carries the new version — a second save in the same
+        // scope then guards on the right number.
+        refresh_instance(obj).await?;
+        return Ok(());
+    }
+
+    let sql = scope::compile_update(&plan, &sets)?;
     run_execute(&sql).await?;
     Ok(())
+}
+
+/// Save `obj` only if its version column still equals `expected`, otherwise
+/// [`Error::Conflict`] — the explicit form of the optimistic check that `save`
+/// does implicitly, for an `If-Match`/`ETag` request that carries the expected
+/// version separately from the in-memory object (ADR 0023).
+pub async fn update_if_version<T: Model>(obj: &mut T, expected: i64) -> Result<()> {
+    db::guard_write("update")?;
+    if T::meta().version_field().is_none() {
+        return Err(Error::Config(format!(
+            "model `{}` has no `#[field(version)]`, so update_if_version does not apply",
+            T::meta().name
+        )));
+    }
+    versioned_update(obj, Some(expected)).await
+}
+
+/// Read a row's current version counter, or `None` if the row is gone — the
+/// `actual` an [`Error::Conflict`] reports after a lost optimistic write.
+async fn current_version(
+    meta: &'static ModelMeta,
+    version_field: &'static crate::meta::FieldMeta,
+    pk_field: &'static crate::meta::FieldMeta,
+    pk: Value,
+) -> Result<Option<i64>> {
+    let mut plan = compiler::Plan::new(meta);
+    plan.filters
+        .push(crate::expr::Q::new(pk_field.name.to_string(), pk));
+    plan.values = vec![version_field.name.to_string()];
+    plan.limit = Some(1);
+    let sql = scope::compile_select(&plan)?;
+    let rows = run_query(&sql).await?;
+    match rows.first() {
+        None => Ok(None),
+        Some(row) => Ok(row
+            .try_get::<i64>(0)
+            .ok()
+            .or_else(|| row.try_get::<i32>(0).ok().map(|n| n as i64))),
+    }
+}
+
+/// An opaque `ETag` for a row's version, for `If-Match` optimistic concurrency
+/// over HTTP. Decodable back to the version with [`version_from_etag`]; a wrong
+/// version simply loses the [`update_if_version`] guard, so the token needs no
+/// signature (ADR 0023).
+pub fn etag(version: i64) -> String {
+    format!("\"dorm-v{version}\"")
+}
+
+/// Recover the version an [`etag`] encodes, accepting a weak (`W/"..."`) prefix.
+pub fn version_from_etag(tag: &str) -> Option<i64> {
+    tag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .strip_prefix("dorm-v")?
+        .parse()
+        .ok()
 }
 
 /// Delete this instance by primary key.
@@ -132,7 +250,7 @@ pub async fn delete_instance<T: Model>(obj: &T) -> Result<u64> {
     let mut plan = compiler::Plan::new(meta);
     plan.filters
         .push(crate::expr::Q::new(pk_field.name.to_string(), obj.pk()));
-    let sql = compiler::compile_delete(&plan)?;
+    let sql = scope::compile_delete(&plan)?;
     run_execute(&sql).await
 }
 
@@ -146,7 +264,7 @@ pub async fn refresh_instance<T: Model>(obj: &mut T) -> Result<()> {
     plan.filters
         .push(crate::expr::Q::new(pk_field.name.to_string(), obj.pk()));
     plan.limit = Some(1);
-    let sql = compiler::compile_select(&plan)?;
+    let sql = scope::compile_select(&plan)?;
     let rows = run_query(&sql).await?;
     let row = rows.first().ok_or_else(|| Error::DoesNotExist {
         model: meta.name.to_string(),
@@ -232,7 +350,7 @@ pub async fn insert_returning(
             path: pk.name.to_string(),
             descending: false,
         }];
-        let reload = compiler::compile_select_on(&plan, db::dialect())?;
+        let reload = scope::compile_select(&plan)?;
         // On the primary, on the transaction's pinned connection — not a replica.
         db::fetch(&reload.text, &reload.params).await
     })
@@ -255,4 +373,24 @@ pub async fn run_query(sql: &compiler::Sql) -> Result<Vec<Row>> {
 /// Run compiled SQL for its row count, against whichever backend the DSN names.
 pub async fn run_execute(sql: &compiler::Sql) -> Result<u64> {
     db::run(&sql.text, &sql.params).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{etag, version_from_etag};
+
+    #[test]
+    fn an_etag_round_trips_to_its_version() {
+        let tag = etag(7);
+        assert_eq!(version_from_etag(&tag), Some(7));
+        // A weak-etag prefix an HTTP stack may add is tolerated.
+        assert_eq!(version_from_etag(&format!("W/{tag}")), Some(7));
+    }
+
+    #[test]
+    fn a_foreign_or_malformed_etag_does_not_parse() {
+        assert_eq!(version_from_etag("\"42\""), None);
+        assert_eq!(version_from_etag("garbage"), None);
+        assert_eq!(version_from_etag("\"dorm-vNaN\""), None);
+    }
 }

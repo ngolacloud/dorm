@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use crate::error::{Error, Result};
 use crate::expr::{Aggregate, Assignment, OrderBy, Predicate, F, Q};
 use crate::lookup::Lookup;
-use crate::meta::ModelMeta;
+use crate::meta::{FieldMeta, ModelMeta};
 use crate::registry::{self, Join, Resolved};
 use crate::value::{FieldType, Value};
 
@@ -86,6 +86,18 @@ pub struct Plan {
     pub annotations: Vec<Aggregate>,
     /// Explicit output columns: field paths, or annotation aliases.
     pub values: Vec<String>,
+    /// Keyset pagination boundary (ADR 0024): the ordering-key values of the last
+    /// row of the previous page, in effective-order order (the `order` terms, then
+    /// the primary key appended as a tiebreak). When set, the compiler adds the
+    /// strict "row after this one" predicate and appends the PK to `ORDER BY` so
+    /// the ordering is total. Decoded from a signed cursor by the `QuerySet`.
+    pub keyset: Option<Vec<Value>>,
+    /// Set by `QuerySet::fetch_page`: the query is being keyset-paginated, so the
+    /// primary-key tiebreak is appended to the ordering **from the first page**
+    /// (not only once a cursor exists) — otherwise rows with an equal sort key
+    /// could be skipped between pages. Non-paginated queries leave it `false` and
+    /// their ordering is unchanged.
+    pub paginate: bool,
 }
 
 impl Plan {
@@ -102,7 +114,40 @@ impl Plan {
             select_related: Vec::new(),
             annotations: Vec::new(),
             values: Vec::new(),
+            keyset: None,
+            paginate: false,
         }
+    }
+
+    /// The effective ordering: the explicit `order`, or the model's declared
+    /// ordering, with the primary key appended as a final tiebreak **when the
+    /// query is being keyset-paginated** so the order is total and the cursor
+    /// predicate is unambiguous. Non-paginated queries are unchanged (no snapshot
+    /// churn).
+    pub(crate) fn effective_order(&self) -> Vec<OrderBy> {
+        let mut terms: Vec<OrderBy> = if self.order.is_empty() {
+            self.model
+                .ordering
+                .iter()
+                .map(|s| OrderBy::parse(s))
+                .collect()
+        } else {
+            self.order.clone()
+        };
+        if self.paginate || self.keyset.is_some() {
+            if let Some(pk) = self.model.primary_key() {
+                if !terms.iter().any(|t| t.path == pk.name) {
+                    // Match the last term's direction so the tiebreak reads
+                    // naturally with it; default ascending when there are none.
+                    let descending = terms.last().is_some_and(|t| t.descending);
+                    terms.push(OrderBy {
+                        path: pk.name.to_string(),
+                        descending,
+                    });
+                }
+            }
+        }
+        terms
     }
 
     fn annotation(&self, alias: &str) -> Option<&Aggregate> {
@@ -363,8 +408,19 @@ fn compile_predicate(
         alias,
         field,
         lookup,
+        json_path,
     } = registry::resolve(plan.model, &p.path)?;
     joins.absorb(path_joins);
+
+    // A reach into a JSONB document (`spec__cpu__gte`): extract the path as text
+    // with each segment bound, cast to the comparison type the value implies, and
+    // compare. The document has no declared type for the path, so the value's type
+    // is what the cast follows.
+    if !json_path.is_empty() {
+        return compile_json_predicate(
+            &alias, field, &json_path, lookup, &p.path, &p.values, binder,
+        );
+    }
 
     // A foreign key compared without traversing it is compared on its own
     // column, and the value is the referenced primary key.
@@ -387,6 +443,82 @@ fn compile_predicate(
     };
     Ok(Clause::Where(compile_comparison(
         &operand, lookup, ty, &values, binder,
+    )?))
+}
+
+/// A lookup that reaches into a JSONB column (ADR 0025).
+///
+/// `jsonb_extract_path_text(col, $1, $2)` pulls the path out as text — each
+/// segment **bound**, never spliced, so a key named by the caller cannot break
+/// out of the path — and a cast to the type the comparison value implies makes
+/// the comparison behave like a native column (`… ::numeric >= $3`).
+#[allow(clippy::too_many_arguments)]
+fn compile_json_predicate(
+    alias: &str,
+    field: &FieldMeta,
+    json_path: &[String],
+    lookup: Lookup,
+    path: &str,
+    values: &[Value],
+    binder: &mut Binder,
+) -> Result<Clause> {
+    if binder.dialect != Dialect::Postgres {
+        return Err(Error::Config(format!(
+            "JSONB path lookups (`{path}`) are supported on PostgreSQL only"
+        )));
+    }
+
+    // The path has no declared type, so the comparison type follows the value —
+    // except `isnull`, whose boolean belongs to the operator, not the extract.
+    let json_ty = if lookup == Lookup::IsNull {
+        FieldType::Text
+    } else {
+        values
+            .first()
+            .and_then(|v| v.field_type())
+            .unwrap_or(FieldType::Text)
+    };
+    // The cast must be the value's **native** SQL type, not a convenient wider one:
+    // the server infers the bound parameter's type from this comparison, and
+    // `Value`'s `ToSql` writes each variant in its own binary format. Casting an
+    // `i64` operand to `numeric` would make the server expect a numeric parameter
+    // while the client writes int8 bytes — silently garbage. Matching the cast to
+    // the value keeps the inferred parameter type right.
+    let cast = match json_ty {
+        FieldType::I32 => "::int",
+        FieldType::I64 => "::bigint",
+        FieldType::F64 => "::double precision",
+        FieldType::Decimal => "::numeric",
+        FieldType::Bool => "::boolean",
+        FieldType::Timestamp => "::timestamptz",
+        FieldType::Uuid => "::uuid",
+        _ => "",
+    };
+
+    // Bind the path segments first — their placeholders precede the comparison
+    // value's, which `compile_comparison` binds next.
+    let segs: Vec<String> = json_path
+        .iter()
+        .map(|s| binder.bind(Value::Text(s.clone())))
+        .collect();
+    let operand = format!(
+        "(jsonb_extract_path_text({}, {})){cast}",
+        qualified(alias, field.column)?,
+        segs.join(", ")
+    );
+
+    lookup.validate(json_ty, path, values)?;
+    let values = if lookup == Lookup::IsNull {
+        values.to_vec()
+    } else {
+        values
+            .iter()
+            .cloned()
+            .map(|v| v.coerce(json_ty, field.column))
+            .collect::<Result<Vec<_>>>()?
+    };
+    Ok(Clause::Where(compile_comparison(
+        &operand, lookup, json_ty, &values, binder,
     )?))
 }
 
@@ -732,28 +864,19 @@ fn compile_select_list(plan: &Plan, joins: &mut Joins) -> Result<(String, Vec<Co
     Ok((parts.join(", "), specs))
 }
 
-/// `ORDER BY`, falling back to the model's declared ordering.
+/// `ORDER BY`, falling back to the model's declared ordering (and, under keyset
+/// pagination, the primary-key tiebreak — see [`Plan::effective_order`]).
 fn compile_order(plan: &Plan, joins: &mut Joins) -> Result<Option<String>> {
     if plan.unordered {
         return Ok(None);
     }
-    let declared: Vec<OrderBy> = plan
-        .model
-        .ordering
-        .iter()
-        .map(|s| OrderBy::parse(s))
-        .collect();
-    let terms = if plan.order.is_empty() {
-        &declared
-    } else {
-        &plan.order
-    };
+    let terms = plan.effective_order();
     if terms.is_empty() {
         return Ok(None);
     }
 
     let mut parts = Vec::new();
-    for t in terms {
+    for t in &terms {
         let direction = if t.descending { "DESC" } else { "ASC" };
         if let Some(agg) = plan.annotation(&t.path) {
             parts.push(format!("{} {direction}", quote(&agg.alias)?));
@@ -767,6 +890,69 @@ fn compile_order(plan: &Plan, joins: &mut Joins) -> Result<Option<String>> {
         ));
     }
     Ok(Some(parts.join(", ")))
+}
+
+/// The keyset "row strictly after the cursor" predicate (ADR 0024).
+///
+/// For effective order terms `(c0 d0), (c1 d1), …, (pk dpk)` and boundary values
+/// `b0, b1, …`, it is the lexicographic expansion
+///
+/// ```text
+/// (c0 >|< b0)
+///   OR (c0 = b0 AND c1 >|< b1)
+///   OR (c0 = b0 AND c1 = b1 AND pk >|< bpk)
+/// ```
+///
+/// where each comparison is `>` for an ascending term and `<` for a descending
+/// one — the direction each term's page advances. Every boundary value is bound
+/// once and its placeholder reused across the equality prefixes, so the parameter
+/// list stays minimal and nothing is formatted into the text.
+fn compile_keyset(plan: &Plan, binder: &mut Binder, joins: &mut Joins) -> Result<Option<String>> {
+    let Some(boundary) = &plan.keyset else {
+        return Ok(None);
+    };
+    let terms = plan.effective_order();
+    if terms.is_empty() {
+        return Err(Error::Config(
+            "keyset pagination needs an ordering (declare one or give the model a default)".into(),
+        ));
+    }
+    if terms.len() != boundary.len() {
+        return Err(Error::Config(format!(
+            "this cursor has {} values but the query orders by {} columns — it is from a \
+             different query",
+            boundary.len(),
+            terms.len()
+        )));
+    }
+
+    // Resolve each term to its column SQL (keyset keys must be plain columns, not
+    // aggregates), binding each boundary value once.
+    let mut cols = Vec::with_capacity(terms.len());
+    for t in &terms {
+        if plan.annotation(&t.path).is_some() {
+            return Err(Error::Config(
+                "keyset pagination cannot order by an annotation; order by columns".into(),
+            ));
+        }
+        let r = registry::resolve(plan.model, &t.path)?;
+        joins.absorb(r.joins);
+        cols.push((qualified(&r.alias, r.field.column)?, t.descending));
+    }
+    let placeholders: Vec<String> = boundary.iter().map(|v| binder.bind(v.clone())).collect();
+
+    let mut disjuncts = Vec::with_capacity(cols.len());
+    for i in 0..cols.len() {
+        let mut conj = Vec::with_capacity(i + 1);
+        for (col, ph) in cols.iter().zip(&placeholders).take(i) {
+            conj.push(format!("{} = {}", col.0, ph));
+        }
+        let (col, descending) = &cols[i];
+        let cmp = if *descending { "<" } else { ">" };
+        conj.push(format!("{} {cmp} {}", col, placeholders[i]));
+        disjuncts.push(format!("({})", conj.join(" AND ")));
+    }
+    Ok(Some(format!("({})", disjuncts.join(" OR "))))
 }
 
 /// Compile a `SELECT` for PostgreSQL. See [`compile_select_on`] for SQLite.
@@ -784,7 +970,16 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
     // compiled in the order they will appear, so placeholder numbers match.
     let (select_list, columns) = compile_select_list(plan, &mut joins)?;
     let (where_clause, having_clause) = compile_conditions(plan, &mut binder, &mut joins)?;
+    let keyset_clause = compile_keyset(plan, &mut binder, &mut joins)?;
     let order_clause = compile_order(plan, &mut joins)?;
+
+    // The keyset predicate is `AND`ed onto whatever the filters already produced.
+    let where_clause = match (where_clause, keyset_clause) {
+        (Some(w), Some(k)) => Some(format!("{w} AND {k}")),
+        (Some(w), None) => Some(w),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    };
 
     let mut text = String::from("SELECT ");
     if plan.distinct {

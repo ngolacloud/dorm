@@ -153,6 +153,22 @@ tokio::task_local! {
     static READ_ONLY_SCOPE: bool;
 }
 
+tokio::task_local! {
+    /// The tenant in scope for this task. A `tenant_scoped` model compiled with
+    /// this set gets its tenant predicate (and insert value) injected by the
+    /// scope seam; compiled without it — and outside [`SYSTEM_SCOPE`] — it is
+    /// refused with [`Error::TenantScopeMissing`] (ADR 0021). Task-scoped, like
+    /// the read-only override, so concurrent sessions never leak into each other.
+    static TENANT: Value;
+}
+
+tokio::task_local! {
+    /// An explicit, audited bypass of tenant scoping — for the rare
+    /// cross-tenant admin path. Set by [`with_system_scope`], which emits a
+    /// `tracing` event on entry so a bypass is never silent (ADR 0021).
+    static SYSTEM_SCOPE: bool;
+}
+
 /// The slow-query threshold, read from the environment exactly once.
 ///
 /// Like the pool sizing, this is process configuration set at launch, not a
@@ -360,6 +376,41 @@ where
     READ_ONLY_SCOPE.scope(yes, fut).await
 }
 
+/// Run `fut` with `tenant` as the active tenant for this task (ADR 0021).
+///
+/// Inside the scope, every `tenant_scoped` model the ORM compiles is constrained
+/// to this tenant automatically — the predicate on reads/updates/deletes, the
+/// column value on inserts — so a forgotten `.filter` cannot cross tenants. Like
+/// [`with_read_only`], it covers the whole async subtree but not tasks spawned
+/// off it.
+pub async fn with_tenant<F, T>(tenant: impl crate::value::ToValue, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TENANT.scope(tenant.to_value(), fut).await
+}
+
+/// Run `fut` with tenant scoping **bypassed** — the audited cross-tenant admin
+/// escape (ADR 0021). Emits a `tracing` event on entry so the bypass is on the
+/// record; prefer [`with_tenant`] for everything that is not deliberately global.
+pub async fn with_system_scope<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tracing::warn!(target: "dorm::tenant", "entering with_system_scope: tenant isolation bypassed");
+    SYSTEM_SCOPE.scope(true, fut).await
+}
+
+/// The tenant in scope for this task, if any ([`with_tenant`]).
+pub fn current_tenant() -> Option<Value> {
+    TENANT.try_with(|v| v.clone()).ok()
+}
+
+/// Whether this task is running under [`with_system_scope`] (tenant scoping off).
+pub fn is_system_scope() -> bool {
+    SYSTEM_SCOPE.try_with(|&b| b).unwrap_or(false)
+}
+
 /// Whether the current context is read-only, most specific wins: the per-task
 /// scope ([`with_read_only`], B-12) overrides the session's [`Database`] default
 /// ([`with_session`]), which overrides the process-wide [`set_read_only`] flag.
@@ -378,6 +429,47 @@ pub fn guard_write(op: &'static str) -> Result<()> {
     if is_read_only() {
         return Err(Error::ReadOnly(op));
     }
+    Ok(())
+}
+
+/// The GUCs [`set_local`] is allowed to set. A closed list, because the key of a
+/// `SET` cannot be a bound parameter — it is spliced into the statement — so it
+/// must never come freely from a caller. Values always bind (ADR 0023).
+///
+/// `dorm.tenant` is the RLS GUC the tenant-scope policies read (ADR 0021); the
+/// timeout GUCs are what online migrations set per transaction (ADR 0022).
+pub const SET_LOCAL_ALLOWED: &[&str] = &[
+    "dorm.tenant",
+    "lock_timeout",
+    "statement_timeout",
+    "idle_in_transaction_session_timeout",
+];
+
+/// Set a transaction-local GUC safely: the key is checked against
+/// [`SET_LOCAL_ALLOWED`] and the value is **bound**, via
+/// `set_config(key, value, is_local = true)` rather than `SET LOCAL key = value`
+/// (which takes no parameter). Must run inside a transaction — a `SET LOCAL`
+/// outside one is a no-op the caller would not expect.
+///
+/// This is the one mechanism the RLS tenant GUC (ADR 0021) and the migration
+/// lock timeout (ADR 0022) go through, so the allow-list is enforced in exactly
+/// one place.
+pub async fn set_local(key: &str, value: &str) -> Result<()> {
+    if !SET_LOCAL_ALLOWED.contains(&key) {
+        return Err(Error::Config(format!(
+            "`{key}` is not a settable GUC (allowed: {})",
+            SET_LOCAL_ALLOWED.join(", ")
+        )));
+    }
+    if !in_transaction() {
+        return Err(Error::Config(format!(
+            "set_local(`{key}`) must run inside a transaction; outside one a SET LOCAL has no effect"
+        )));
+    }
+    // `set_config`'s first argument is the GUC name; splicing it is safe because
+    // it came from the allow-list above, never from the caller. The value binds.
+    let sql = format!("SELECT set_config('{key}', $1, true)");
+    fetch(&sql, &[Value::Text(value.to_string())]).await?;
     Ok(())
 }
 
@@ -2428,6 +2520,35 @@ mod tests {
         assert!(savepoint_name(3)
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    #[tokio::test]
+    async fn set_local_refuses_a_guc_outside_the_allow_list_before_touching_the_database() {
+        // The key of a `SET` is spliced, not bound, so a key off the allow-list
+        // must be refused up front — this returns before any connection is used.
+        let e = set_local("app.evil; DROP TABLE x", "1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a settable GUC"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn set_local_refuses_an_allowed_guc_outside_a_transaction() {
+        // A `SET LOCAL` outside a transaction is a silent no-op; refuse it so the
+        // caller is not misled into thinking the GUC took.
+        let e = set_local("dorm.tenant", "acme")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("inside a transaction"), "{e}");
+    }
+
+    #[test]
+    fn the_rls_tenant_guc_is_on_the_set_local_allow_list() {
+        // ADR 0021's RLS reads `dorm.tenant`; if it left the list the policies
+        // would silently stop isolating.
+        assert!(SET_LOCAL_ALLOWED.contains(&"dorm.tenant"));
     }
 
     #[test]

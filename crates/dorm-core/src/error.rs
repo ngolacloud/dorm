@@ -76,6 +76,23 @@ pub enum Error {
     #[error("this session is read-only; `{0}` would write")]
     ReadOnly(&'static str),
 
+    /// An optimistic-concurrency check failed: the row's version moved under the
+    /// writer's feet between read and write, so the update touched no row. The
+    /// caller re-reads and retries. `actual` is the version now in the database,
+    /// or `None` when the row is gone entirely (ADR 0023).
+    #[error("version conflict on {model}: expected version {expected}, found {actual:?}")]
+    Conflict {
+        model: String,
+        expected: i64,
+        actual: Option<i64>,
+    },
+
+    /// A `tenant_scoped` model was queried with no tenant context in scope, and
+    /// not under an explicit `with_system_scope`. Fail-closed: refusing beats
+    /// silently reading or writing across tenants (ADR 0021).
+    #[error("model `{0}` is tenant-scoped but no tenant is in scope (use with_tenant or with_system_scope)")]
+    TenantScopeMissing(&'static str),
+
     /// The server cancelled a statement that ran past
     /// `DELONIX_ORM_STATEMENT_TIMEOUT_MS` (SQLSTATE `57014`). Named separately
     /// from [`Error::Db`] so a caller can retry or report it as a timeout rather
