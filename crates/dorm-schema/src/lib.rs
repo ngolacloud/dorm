@@ -58,6 +58,23 @@ pub use validate::{validate, Issue, Severity};
 pub struct Schema {
     pub datasource: Option<Datasource>,
     pub models: Vec<Model>,
+    /// Top-level `enum` blocks (ADR 0047). A model field typed as one of these
+    /// becomes a [`Field::Enum`], compiled to a native database enum (ADR 0046).
+    pub enums: Vec<EnumDecl>,
+}
+
+/// A top-level `enum Name { v1 v2 … }` block (ADR 0047).
+///
+/// It declares a named set of string variants. A `String`-shaped field typed as
+/// the enum (`status OrderStatus`) is compiled by [`generate_rust`] into the
+/// native `#[field(enum_type = …, enum_variants = …)]` the `Model` derive turns
+/// into a `CREATE TYPE … AS ENUM` (ADR 0046).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDecl {
+    /// The schema name, e.g. `OrderStatus` (snake_cased to the SQL type name).
+    pub name: String,
+    /// The variants, in declaration order, spelled exactly as written.
+    pub variants: Vec<String>,
 }
 
 /// The `datasource` block. Only `provider` and `url` are read today.
@@ -141,6 +158,21 @@ pub enum Field {
         name: String,
         target: String,
     },
+    /// A field typed as a top-level `enum` (ADR 0047): a `String` column backed
+    /// by a native database enum (ADR 0046). Produced by the parser's resolution
+    /// pass from a field whose declared type names a declared `enum`.
+    Enum(EnumField),
+}
+
+/// A model field typed as a top-level `enum` (ADR 0047).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumField {
+    /// The schema field name (Rust field and column are its snake_case form).
+    pub name: String,
+    pub column: String,
+    /// The name of the referenced [`EnumDecl`], e.g. `OrderStatus`.
+    pub enum_name: String,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -101,6 +101,7 @@ fn model(schema: &Schema, m: &Model) -> String {
             // promoted to `primary_key` here (ADR 0043).
             Field::Scalar(s) => out.push_str(&scalar_field(s, m.composite_id.contains(&s.name))),
             Field::ToOne(r) => out.push_str(&relation_field(schema, m, r)),
+            Field::Enum(e) => out.push_str(&enum_field(schema, e)),
             // A `Target[]` is a reverse relation: no column, so no struct field.
             Field::ToMany { .. } => {}
         }
@@ -196,6 +197,34 @@ fn scalar_field(s: &crate::ScalarField, composite_pk: bool) -> String {
         let _ = writeln!(out, "    #[field({})]", attrs.join(", "));
     }
     let _ = writeln!(out, "    pub {}: {ty},", snake(&s.name));
+    out
+}
+
+/// Render an enum-typed field (ADR 0047) as the native enum attribute the
+/// `Model` derive turns into a `CREATE TYPE … AS ENUM` (ADR 0046): a `String`
+/// column (`Option<String>` when nullable) carrying `#[field(enum_type = …,
+/// enum_variants = …)]`. The type name is snake_cased (`OrderStatus` →
+/// `order_status`); the variants are emitted exactly as declared, comma-joined.
+fn enum_field(schema: &Schema, e: &crate::EnumField) -> String {
+    let variants = schema
+        .enums
+        .iter()
+        .find(|d| d.name == e.enum_name)
+        .map(|d| d.variants.join(", "))
+        .unwrap_or_default();
+    let ty = if e.nullable {
+        "Option<String>"
+    } else {
+        "String"
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "    #[field(enum_type = \"{}\", enum_variants = \"{variants}\")]",
+        snake(&e.enum_name)
+    );
+    let _ = writeln!(out, "    pub {}: {ty},", snake(&e.name));
     out
 }
 
@@ -324,6 +353,56 @@ mod tests {
             ),
             "{rust}"
         );
+    }
+
+    const ENUM: &str = r#"
+        model Order {
+          id     Int         @id @default(autoincrement())
+          status OrderStatus
+        }
+
+        enum OrderStatus { pending paid shipped }
+    "#;
+
+    #[test]
+    fn an_enum_field_emits_the_native_enum_attribute() {
+        let rust = generate_rust(&parse(ENUM).expect("parses"));
+        // The exact native-enum attribute the Model derive reads (ADR 0046).
+        assert!(
+            rust.contains(
+                "#[field(enum_type = \"order_status\", enum_variants = \"pending, paid, shipped\")]"
+            ),
+            "{rust}"
+        );
+        // The column is a plain `String`, imposed by the database enum type.
+        assert!(rust.contains("pub status: String,"), "{rust}");
+    }
+
+    #[test]
+    fn a_nullable_enum_field_is_option_string() {
+        let src = r#"
+            enum OrderStatus { pending paid }
+            model Order {
+              id     Int          @id @default(autoincrement())
+              status OrderStatus?
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        assert!(
+            rust.contains(
+                "#[field(enum_type = \"order_status\", enum_variants = \"pending, paid\")]"
+            ),
+            "{rust}"
+        );
+        assert!(rust.contains("pub status: Option<String>,"), "{rust}");
+    }
+
+    #[test]
+    fn a_schema_with_no_enum_emits_no_enum_type() {
+        // The blog schema has no enum: generation is unchanged — no `enum_type`.
+        let rust = generate_rust(&parse(BLOG).expect("parses"));
+        assert!(!rust.contains("enum_type"), "{rust}");
+        assert!(!rust.contains("enum_variants"), "{rust}");
     }
 
     #[test]

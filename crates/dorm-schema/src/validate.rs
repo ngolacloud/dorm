@@ -57,6 +57,36 @@ impl Issue {
 /// `chunk_size`, and any `distance` is a known metric.
 pub fn validate(schema: &Schema) -> Vec<Issue> {
     let mut issues = Vec::new();
+
+    // Top-level `enum` blocks (ADR 0047): each needs at least one variant, no
+    // duplicate variants, and a name that does not collide with a model (both
+    // compile to a named database object). A field referencing an unknown enum
+    // never reaches here — the parser's resolution pass only rewrites a field to
+    // `Field::Enum` when the enum is declared; an unknown type stays a relation
+    // and is handled by the relation flow, so no extra check is needed.
+    for e in &schema.enums {
+        if e.variants.is_empty() {
+            issues.push(Issue::error(
+                &e.name,
+                format!("enum `{}` has no variants — it needs at least one", e.name),
+            ));
+        }
+        for (i, v) in e.variants.iter().enumerate() {
+            if e.variants[..i].contains(v) {
+                issues.push(Issue::error(
+                    &e.name,
+                    format!("enum `{}` has a duplicate variant `{v}`", e.name),
+                ));
+            }
+        }
+        if schema.models.iter().any(|m| m.name == e.name) {
+            issues.push(Issue::error(
+                &e.name,
+                format!("enum `{}` collides with a model of the same name", e.name),
+            ));
+        }
+    }
+
     for m in &schema.models {
         // `@@id([..])`/`@@unique([..])` must name real columns — a typo would
         // otherwise silently promote nothing to a key (ADR 0043).
@@ -174,6 +204,7 @@ fn has_column(m: &crate::Model, name: &str) -> bool {
     m.fields.iter().any(|f| match f {
         Field::Scalar(s) => s.name == name,
         Field::ToOne(r) => r.name == name,
+        Field::Enum(e) => e.name == name,
         Field::ToMany { .. } => false,
     })
 }
@@ -280,6 +311,55 @@ mod tests {
               code   String
               @@id([region, code])
               @@unique([region, code])
+            }
+        "#;
+        assert!(validate(&parse(src).expect("parses")).is_empty());
+    }
+
+    #[test]
+    fn an_empty_enum_and_a_duplicate_variant_are_rejected() {
+        let src = r#"
+            enum Empty { }
+            enum Dup { pending paid pending }
+            model Order {
+              id Int @id @default(autoincrement())
+            }
+        "#;
+        let issues = validate(&parse(src).expect("parses"));
+        assert!(
+            issues.iter().any(|i| i.message.contains("no variants")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("duplicate variant `pending`")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn an_enum_named_like_a_model_collides() {
+        let src = r#"
+            enum Order { pending paid }
+            model Order {
+              id Int @id @default(autoincrement())
+            }
+        "#;
+        let issues = validate(&parse(src).expect("parses"));
+        assert!(
+            issues.iter().any(|i| i.message.contains("collides")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_enum_validates_clean() {
+        let src = r#"
+            enum OrderStatus { pending paid shipped }
+            model Order {
+              id     Int         @id @default(autoincrement())
+              status OrderStatus
             }
         "#;
         assert!(validate(&parse(src).expect("parses")).is_empty());

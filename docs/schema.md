@@ -39,6 +39,7 @@ becomes a `ForeignKey<Tenant>` whose `related_name` is `posts` (read off
 |---|---|
 | `datasource <name> { provider = "…"  url = env("VAR") \| "…" }` | The backend and connection. Today `provider` must be `postgresql`; `url` is read by the runtime, not baked in. |
 | `model <Name> { … }` | One table / one Rust struct. |
+| `enum <Name> { v1 v2 … }` | A named set of string variants, compiled to a native database enum ([see below](#enums)). |
 | `generator … { }` | Accepted and ignored (eases paste-in from Prisma). |
 
 ## Field types
@@ -55,6 +56,7 @@ becomes a `ForeignKey<Tenant>` whose `related_name` is `posts` (read off
 | `Uuid` | `uuid::Uuid` | |
 | `<Model>` | `ForeignKey<Model>` | a to-one relation; needs `@relation` |
 | `<Model>[]` | *(no column)* | a to-many back-relation; names the `related_name` |
+| `<Enum>` | `String` | a field typed as a top-level `enum`; a native database enum ([see below](#enums)) |
 | `T?` | `Option<T>` | nullable column |
 
 ## Attributes
@@ -86,13 +88,54 @@ becomes a `ForeignKey<Tenant>` whose `related_name` is `posts` (read off
 A column named by `@@id`/`@@unique`/`@@index` must be a real column of the model,
 or `dorm validate` names the typo.
 
+## Enums
+
+A top-level `enum` block declares a named set of string variants
+([ADR 0047](adr/0047-schema-enum-block.md)):
+
+```dorm
+enum OrderStatus {
+  pending
+  paid
+  shipped
+}
+
+model Order {
+  id     Int         @id @default(autoincrement())
+  status OrderStatus
+  note   OrderStatus?
+}
+```
+
+Grammar: `enum <Name> { v1 v2 … }`. The variants are bare identifiers separated
+by whitespace or newlines (Prisma style), up to the closing `}`. An `enum` may be
+declared before or after the model that uses it.
+
+A field typed as an enum (`status OrderStatus`) compiles to a **native database
+enum** — a `String` column backed by a `CREATE TYPE <name> AS ENUM (…)`
+([ADR 0046](adr/0046-native-enum-types.md)):
+
+```rust
+#[field(enum_type = "order_status", enum_variants = "pending, paid, shipped")]
+pub status: String,
+```
+
+The SQL type name is the snake_case of the enum name (`OrderStatus` →
+`order_status`); the variants are emitted exactly as declared. A nullable field
+(`OrderStatus?`) becomes `Option<String>`. The value is a plain `String` in Rust,
+but the database rejects any value outside the declared set.
+
+`dorm validate` rejects an enum with no variants, with a duplicate variant, or
+whose name collides with a model. Adding a new variant to a live enum (Postgres
+`ALTER TYPE … ADD VALUE`) is not yet generated — see
+[ADR 0047](adr/0047-schema-enum-block.md).
+
 ## Not yet (roadmap)
 
-Table-level `@@check`, a top-level `enum` block, default-ordering,
-partial/expression indexes, and multi-file schemas. A composite `@@index` added
-to an *existing* table is built by `sync` but not yet emitted as a versioned
-incremental migration step (ADR 0044). Native enum **types** already work on a
-hand-written model via `#[field(enum_type = "…", enum_variants = "…")]` (ADR
-0046); only the `dorm.schema` `enum` block is pending. All additive — see
+Table-level `@@check`, default-ordering, partial/expression indexes, and
+multi-file schemas. A composite `@@index` added to an *existing* table is built
+by `sync` but not yet emitted as a versioned incremental migration step (ADR
+0044). `CIDR`/`MACADDR` columns work on a hand-written model (ADR 0048), not yet
+from a schema type. All additive — see
 [roadmap.md](roadmap.md). Writing Rust models by hand still works; the schema is
 the tooled path.

@@ -356,6 +356,10 @@ fn component_schema(m: &Model) -> J {
                 // The foreign key is exposed as its integer id column.
                 props.insert(r.column.clone(), json!({ "type": "integer" }));
             }
+            // An enum column is a native-enum-backed string (ADR 0046/0047).
+            Field::Enum(e) => {
+                props.insert(e.column.clone(), json!({ "type": "string" }));
+            }
             Field::ToMany { .. } => {}
         }
     }
