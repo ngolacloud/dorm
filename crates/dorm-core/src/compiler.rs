@@ -35,12 +35,27 @@ pub struct ColumnSpec {
     pub ty: FieldType,
 }
 
+/// Whether a compiled statement only reads, or writes.
+///
+/// The executor routes by this: a [`Read`](StatementKind::Read) may run on a
+/// read replica when one is configured, while a [`Write`](StatementKind::Write)
+/// — including an `INSERT … RETURNING`, which returns rows yet still writes —
+/// always runs on the primary. It is the compiler, not a guess from the SQL
+/// text, that classifies this: the one place that knows for certain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Read,
+    Write,
+}
+
 /// Compiled SQL, its parameters in binding order, and how to read the result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sql {
     pub text: String,
     pub params: Vec<Value>,
     pub columns: Vec<ColumnSpec>,
+    /// Read or write, for replica routing. See [`StatementKind`].
+    pub kind: StatementKind,
 }
 
 /// What a `QuerySet` accumulates, and all the compiler needs.
@@ -125,23 +140,131 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// The SQL dialect a plan is compiled for. Only the placeholder style (`$n` vs
-/// `?n`) and case-insensitive `LIKE` differ between the two today; identifiers,
-/// joins and clause structure are shared (ADR 0002). PostgreSQL is the default,
-/// so every existing caller and every snapshot is unchanged.
+/// The SQL dialect a plan is compiled for. The placeholder style, case-insensitive
+/// `LIKE`, and `now()` spelling differ between backends; identifiers, joins and
+/// clause structure are shared (ADR 0002). PostgreSQL is the default, so every
+/// existing caller and every snapshot is unchanged.
+///
+/// `MySql` is the dialect *profile* for the forthcoming MySQL backend (ADR 0011
+/// Phase 2.2): its capabilities and its simple dialect choices are declared here,
+/// so the capability matrix and the SQL shape are settled before the driver lands.
+/// The one thing still to wire is positional parameters — MySQL binds a bare `?`
+/// by order, not the numbered `$n`/`?n` the compiler renumbers today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,
     Sqlite,
+    MySql,
 }
 
+/// A backend feature DORM relies on but cannot assume every engine has (ADR
+/// 0011). The core asks [`Dialect::supports`] before it emits something a backend
+/// lacks, so partial support is **honest**: a backend without a capability gets a
+/// documented degradation or a named refusal, never silently-wrong SQL. As
+/// backends are added (MySQL, SQL Server, Oracle…) each declares its answer here,
+/// in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// `INSERT`/`UPDATE`/`DELETE … RETURNING` — read the written row back in the
+    /// same statement. Absent on MySQL/Oracle, which need a second round trip.
+    Returning,
+    /// Nested transactions via `SAVEPOINT`, which is how `atomic` nests.
+    Savepoints,
+    /// DDL participates in a transaction (so a failed migration step rolls back).
+    /// False on MySQL, where most DDL auto-commits.
+    DdlInTransaction,
+    /// `CREATE INDEX CONCURRENTLY` — build an index without locking writes.
+    ConcurrentIndex,
+    /// A real boolean column type, rather than an integer/`BIT` stand-in.
+    NativeBoolean,
+    /// A dedicated case-insensitive `ILIKE` operator (versus folding to `LIKE`).
+    IlikeOperator,
+}
+
+// Everything a dialect decides differently lives here, as methods on `Dialect` —
+// not as `match`es scattered through the compiler. Adding a SQL backend (ADR
+// 0011) is adding an arm to each of these, in one place, which is what keeps the
+// fan-out to MySQL/MSSQL/Cockroach/Oracle tractable.
 impl Dialect {
     /// The case-insensitive pattern operator: PostgreSQL's `ILIKE`, or `LIKE` on
     /// SQLite (whose `LIKE` is already case-insensitive for ASCII).
     fn ilike(self) -> &'static str {
         match self {
             Dialect::Postgres => "ILIKE",
-            Dialect::Sqlite => "LIKE",
+            // SQLite's and MySQL's `LIKE` are case-insensitive under their default
+            // collations, so neither needs a dedicated operator.
+            Dialect::Sqlite | Dialect::MySql => "LIKE",
+        }
+    }
+
+    /// The character that introduces a bound-parameter placeholder: `$` on
+    /// PostgreSQL (`$1`), `?` on SQLite (`?1`) and MySQL (`?`). Numbered on
+    /// Postgres/SQLite, which is what lets [`shift_placeholders`] renumber a
+    /// subquery's parameters.
+    fn placeholder_marker(self) -> char {
+        match self {
+            Dialect::Postgres => '$',
+            Dialect::Sqlite | Dialect::MySql => '?',
+        }
+    }
+
+    /// A bound-parameter placeholder for binding position `n` (1-based).
+    ///
+    /// **Numbered on every dialect, MySQL included.** MySQL ultimately binds a
+    /// bare positional `?`, but numbering it here (`?1`, `?2`) is what keeps the
+    /// compiler's one invariant intact: a `SELECT` with `HAVING` binds the HAVING
+    /// parameter before the WHERE one, so bind-order ≠ textual order, and a bare
+    /// `?` would then bind the values in the wrong slots. The number disambiguates
+    /// during compilation and `shift_placeholders` can renumber a subquery; the
+    /// numbered `?n` is converted to the bare positional `?` — reordering the
+    /// parameter vector by textual appearance — once, in the MySQL driver, by
+    /// [`positionalize`]. See ADR 0018.
+    fn placeholder(self, n: usize) -> String {
+        format!("{}{n}", self.placeholder_marker())
+    }
+
+    /// Whether this dialect binds a bare positional `?` (by order), rather than a
+    /// numbered placeholder. True only for MySQL; the executor (its driver) then
+    /// runs [`positionalize`] on the compiled SQL before sending it.
+    pub fn positional_unnumbered(self) -> bool {
+        matches!(self, Dialect::MySql)
+    }
+
+    /// The SQL expression for "now", used to refresh `auto_now` columns on write.
+    fn now(self) -> &'static str {
+        match self {
+            // `now()` is PostgreSQL's and MySQL's spelling alike.
+            Dialect::Postgres | Dialect::MySql => "now()",
+            Dialect::Sqlite => "CURRENT_TIMESTAMP",
+        }
+    }
+
+    /// Whether this dialect's backend has `cap`. The single source of truth for
+    /// what a backend can do (ADR 0011); the core consults it before emitting a
+    /// feature not every engine has.
+    pub fn supports(self, cap: Capability) -> bool {
+        use Capability::*;
+        match self {
+            // PostgreSQL (and the PG-wire CockroachDB) has all of these.
+            Dialect::Postgres => true,
+            Dialect::Sqlite => match cap {
+                // SQLite ≥ 3.35 has RETURNING and SAVEPOINT, and its DDL is
+                // transactional.
+                Returning | Savepoints | DdlInTransaction => true,
+                // No `CONCURRENTLY`, no dedicated boolean, no `ILIKE` keyword
+                // (its `LIKE` is already case-insensitive for ASCII).
+                ConcurrentIndex | NativeBoolean | IlikeOperator => false,
+            },
+            Dialect::MySql => match cap {
+                // MySQL has SAVEPOINT, but no `RETURNING` (a write reads the row
+                // back via `last_insert_id`), most DDL auto-commits (no DDL in a
+                // transaction), there is no `CREATE INDEX CONCURRENTLY`, a boolean
+                // is `TINYINT(1)`, and there is no `ILIKE` keyword.
+                Savepoints => true,
+                Returning | DdlInTransaction | ConcurrentIndex | NativeBoolean | IlikeOperator => {
+                    false
+                }
+            },
         }
     }
 }
@@ -164,10 +287,7 @@ impl Binder {
     /// SQLite.
     fn bind(&mut self, v: Value) -> String {
         self.params.push(v);
-        match self.dialect {
-            Dialect::Postgres => format!("${}", self.params.len()),
-            Dialect::Sqlite => format!("?{}", self.params.len()),
-        }
+        self.dialect.placeholder(self.params.len())
     }
 }
 
@@ -712,6 +832,7 @@ pub fn compile_select_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -738,6 +859,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
                 name: "count".into(),
                 ty: FieldType::I64,
             }],
+            kind: StatementKind::Read,
         });
     }
 
@@ -759,6 +881,7 @@ pub fn compile_count_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "count".into(),
             ty: FieldType::I64,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -781,6 +904,7 @@ pub fn compile_exists_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
             name: "exists".into(),
             ty: FieldType::Bool,
         }],
+        kind: StatementKind::Read,
     })
 }
 
@@ -823,6 +947,7 @@ pub fn compile_aggregate_on(plan: &Plan, aggs: &[Aggregate], dialect: Dialect) -
         text,
         params: binder.params,
         columns,
+        kind: StatementKind::Read,
     })
 }
 
@@ -901,10 +1026,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         ));
     }
     // `auto_now` columns are refreshed on every write without the caller asking.
-    let now = match dialect {
-        Dialect::Postgres => "now()",
-        Dialect::Sqlite => "CURRENT_TIMESTAMP",
-    };
+    let now = dialect.now();
     for f in plan.model.fields {
         if f.auto_now && !assignments.iter().any(|a| a.field == f.name) {
             sets.push(format!("{} = {now}", quote(f.column)?));
@@ -934,6 +1056,7 @@ pub fn compile_update_on(plan: &Plan, assignments: &[Assignment], dialect: Diale
         text,
         params,
         columns: vec![],
+        kind: StatementKind::Write,
     })
 }
 
@@ -964,6 +1087,7 @@ pub fn compile_delete_on(plan: &Plan, dialect: Dialect) -> Result<Sql> {
         ),
         params: inner.params,
         columns: vec![],
+        kind: StatementKind::Write,
     })
 }
 
@@ -977,10 +1101,7 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     if by == 0 {
         return sql.to_string();
     }
-    let marker = match dialect {
-        Dialect::Postgres => '$',
-        Dialect::Sqlite => '?',
-    };
+    let marker = dialect.placeholder_marker();
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1007,6 +1128,47 @@ fn shift_placeholders(sql: &str, by: usize, dialect: Dialect) -> String {
     out
 }
 
+/// Convert numbered `?n` placeholders to the bare positional `?` MySQL binds by
+/// order, reordering `params` into the order the placeholders appear in the text
+/// (ADR 0018). Pure, so it is unit-tested. The one step that makes the compiler's
+/// numbered output executable on MySQL; it runs once, in the MySQL driver.
+///
+/// The input `params` are in *bind* order; the output are in *textual* order. A
+/// `?k` emits `?` and takes `params[k-1]`; a repeated `?k` repeats that value; an
+/// out-of-order `?2 … ?1` — which a `SELECT` with `HAVING` produces — comes out
+/// correctly, because the output order is derived from the text, the single
+/// source of truth for positional binding. Only the compiler's own output is
+/// passed here, so every `?n` is a numbered placeholder in range.
+pub fn positionalize(sql: &str, params: &[Value]) -> (String, Vec<Value>) {
+    let mut out = String::with_capacity(sql.len());
+    let mut ordered = Vec::with_capacity(params.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '?' {
+            out.push(c);
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+            digits.push(*d);
+            chars.next();
+        }
+        match digits.parse::<usize>() {
+            Ok(n) if (1..=params.len()).contains(&n) => {
+                out.push('?');
+                ordered.push(params[n - 1].clone());
+            }
+            // A bare `?` or an out-of-range index: copy verbatim and bind nothing.
+            // Unreachable for compiler output, which always numbers in range.
+            _ => {
+                out.push('?');
+                out.push_str(&digits);
+            }
+        }
+    }
+    (out, ordered)
+}
+
 /// Compile an `INSERT` of one or more rows.
 ///
 /// Every row must offer the same columns, which `bulk_create` guarantees by
@@ -1015,7 +1177,9 @@ pub fn compile_insert(meta: &'static ModelMeta, rows: &[Vec<(String, Value)>]) -
     compile_insert_on(meta, rows, Dialect::Postgres)
 }
 
-/// Compile an `INSERT … RETURNING *` for `dialect`.
+/// Compile an `INSERT` for `dialect`, with `RETURNING *` on a backend that has it
+/// (PostgreSQL, SQLite) and a bare `INSERT` on one that does not (MySQL), whose
+/// create path reads the written rows back by key instead (ADR 0018 Inc. 2b).
 pub fn compile_insert_on(
     meta: &'static ModelMeta,
     rows: &[Vec<(String, Value)>],
@@ -1060,20 +1224,26 @@ pub fn compile_insert_on(
         .map(|f| quote(f.column))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    // Everything comes back, so the caller gets database-generated columns —
-    // the serial primary key, `auto_now_add` defaults — without a second query.
-    let returning = meta
-        .columns()
-        .map(quote)
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
+    let table = quote(meta.table)?;
+    let values = tuples.join(", ");
+    // With `RETURNING` everything comes back, so the caller gets database-generated
+    // columns — the serial primary key, `auto_now_add` defaults — without a second
+    // query. A backend that lacks it (MySQL) gets a bare `INSERT`; the create path
+    // then reloads the written rows by their generated key in the same transaction
+    // (ADR 0018 Inc. 2b), which is why it must still carry `StatementKind::Write`.
+    let text = if dialect.supports(Capability::Returning) {
+        let returning = meta
+            .columns()
+            .map(quote)
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        format!("INSERT INTO {table} ({columns}) VALUES {values} RETURNING {returning}")
+    } else {
+        format!("INSERT INTO {table} ({columns}) VALUES {values}")
+    };
 
     Ok(Sql {
-        text: format!(
-            "INSERT INTO {} ({columns}) VALUES {} RETURNING {returning}",
-            quote(meta.table)?,
-            tuples.join(", ")
-        ),
+        text,
         params: binder.params,
         columns: meta
             .fields
@@ -1083,12 +1253,102 @@ pub fn compile_insert_on(
                 ty: f.ty,
             })
             .collect(),
+        kind: StatementKind::Write,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_supports_every_capability_sqlite_only_a_subset() {
+        use Capability::*;
+        // PostgreSQL (and PG-wire CockroachDB) has them all.
+        for cap in [
+            Returning,
+            Savepoints,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(
+                Dialect::Postgres.supports(cap),
+                "postgres should have {cap:?}"
+            );
+        }
+        // SQLite has RETURNING, savepoints and transactional DDL…
+        assert!(Dialect::Sqlite.supports(Returning));
+        assert!(Dialect::Sqlite.supports(Savepoints));
+        assert!(Dialect::Sqlite.supports(DdlInTransaction));
+        // …but no CONCURRENTLY, no native boolean, no ILIKE keyword.
+        assert!(!Dialect::Sqlite.supports(ConcurrentIndex));
+        assert!(!Dialect::Sqlite.supports(NativeBoolean));
+        assert!(!Dialect::Sqlite.supports(IlikeOperator));
+        // The ILIKE capability and the operator the compiler emits must agree.
+        assert_eq!(
+            Dialect::Sqlite.supports(IlikeOperator),
+            Dialect::Sqlite.ilike() == "ILIKE"
+        );
+        assert_eq!(
+            Dialect::Postgres.supports(IlikeOperator),
+            Dialect::Postgres.ilike() == "ILIKE"
+        );
+    }
+
+    #[test]
+    fn the_mysql_dialect_profile_is_declared_before_its_driver() {
+        use Capability::*;
+        // MySQL's simple dialect choices.
+        assert_eq!(Dialect::MySql.ilike(), "LIKE");
+        assert_eq!(Dialect::MySql.now(), "now()");
+        // It compiles with numbered `?n` (like SQLite) — the bare positional `?`
+        // is produced later by `positionalize`, in the driver — and declares that
+        // it ultimately binds positionally.
+        assert_eq!(Dialect::MySql.placeholder(1), "?1");
+        assert_eq!(Dialect::MySql.placeholder(7), "?7");
+        assert!(Dialect::MySql.positional_unnumbered());
+        assert!(!Dialect::Postgres.positional_unnumbered());
+        assert!(!Dialect::Sqlite.positional_unnumbered());
+        // Its capability profile: savepoints yes; RETURNING, transactional DDL,
+        // CONCURRENTLY, a native boolean and ILIKE all no.
+        assert!(Dialect::MySql.supports(Savepoints));
+        for cap in [
+            Returning,
+            DdlInTransaction,
+            ConcurrentIndex,
+            NativeBoolean,
+            IlikeOperator,
+        ] {
+            assert!(!Dialect::MySql.supports(cap), "mysql should lack {cap:?}");
+        }
+    }
+
+    #[test]
+    fn positionalize_rewrites_numbered_placeholders_to_bare_and_reorders_params() {
+        let p = |n: i64| Value::I64(n);
+        // In textual order: straightforward 1:1.
+        let (sql, params) = positionalize("a = ?1 AND b = ?2", &[p(10), p(20)]);
+        assert_eq!(sql, "a = ? AND b = ?");
+        assert_eq!(params, vec![p(10), p(20)]);
+
+        // Out of order — the shape a HAVING-before-WHERE select binds: the text is
+        // `?2 … ?1`, and the output params must come out in textual order.
+        let (sql, params) = positionalize("where c = ?2 having n = ?1", &[p(1), p(2)]);
+        assert_eq!(sql, "where c = ? having n = ?");
+        assert_eq!(params, vec![p(2), p(1)], "reordered to textual order");
+
+        // A repeated placeholder repeats its value.
+        let (sql, params) = positionalize("?1 or ?1", &[p(5)]);
+        assert_eq!(sql, "? or ?");
+        assert_eq!(params, vec![p(5), p(5)]);
+
+        // No placeholders: unchanged, empty params.
+        let (sql, params) = positionalize("SELECT 1", &[p(9)]);
+        assert_eq!(sql, "SELECT 1");
+        assert!(params.is_empty());
+    }
 
     #[test]
     fn like_metacharacters_in_the_value_are_escaped() {

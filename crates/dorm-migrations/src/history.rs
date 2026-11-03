@@ -33,6 +33,12 @@ pub struct StoredMigration {
     /// `"postgres"` or `"sqlite"` — the dialect `statements` were generated for.
     pub backend: String,
     pub statements: Vec<String>,
+    /// The inverse statements, or empty when the migration is irreversible (ADR
+    /// 0014). `#[serde(default)]` so a history written before reversibility —
+    /// whose files have no `down` — loads with an empty one, i.e. as irreversible,
+    /// which is the safe reading.
+    #[serde(default)]
+    pub down: Vec<String>,
     /// The schema state this migration leaves behind.
     pub snapshot: Snapshot,
 }
@@ -44,6 +50,7 @@ impl StoredMigration {
             version: self.version,
             name: self.name.clone(),
             statements: self.statements.clone(),
+            down: self.down.clone(),
         }
     }
 }
@@ -158,6 +165,7 @@ impl History {
             name: name.to_string(),
             backend: want.to_string(),
             statements: migration.statements,
+            down: migration.down,
             snapshot,
         };
         self.write(&stored)?;
@@ -181,11 +189,12 @@ impl History {
     }
 }
 
-/// `"postgres"` or `"sqlite"` for a backend.
+/// The directory tag for a backend's migration history.
 fn backend_str(backend: Backend) -> &'static str {
     match backend {
         Backend::Postgres => "postgres",
         Backend::Sqlite => "sqlite",
+        Backend::MySql => "mysql",
     }
 }
 

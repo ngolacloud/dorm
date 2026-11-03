@@ -31,6 +31,12 @@ members = [
     "crates/dorm-studio",
     # The SQLite executor: run the ORM's SQLite-dialect compiled SQL (ADR 0002).
     "crates/dorm-sqlite",
+    # Optional RAG: a model marked #[derive(Rag)] is indexed in pgvector and gains
+    # semantic/hybrid search (ADR 0019). dorm-core never depends on it.
+    "crates/dorm-rag",
+    # Optional MCP server: expose the registry as tools/resources to an agent
+    # (ADR 0020). Depends on dorm-core + dorm-rag; neither depends back on it.
+    "crates/dorm-mcp",
 ]
 
 [workspace.package]

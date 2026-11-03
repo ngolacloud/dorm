@@ -428,6 +428,20 @@ model Post {
     }
 
     #[test]
+    fn rag_block_attribute_survives_formatting() {
+        // `@@rag(..)` is a block-level attribute the AST now models, but the
+        // formatter still works on text — so it must survive a format round-trip
+        // verbatim and stay a fixed point (ADR 0019).
+        let input = "model Ticket {\n  id    Int    @id @default(autoincrement())\n  title String @db.VarChar(200)\n  body  String @db.Text\n  @@rag(fields: [title, body], embedder: \"default\")\n}\n";
+        let out = format(input);
+        assert!(
+            out.contains("@@rag(fields: [title, body], embedder: \"default\")"),
+            "@@rag lost or mangled: {out}"
+        );
+        assert_eq!(format(&out), out);
+    }
+
+    #[test]
     fn url_double_slash_is_not_a_comment() {
         let input = "datasource db {\n  provider = \"postgresql\"\n  url      = \"postgres://u:p@h/db?sslmode=require\"\n}\n";
         let out = format(input);

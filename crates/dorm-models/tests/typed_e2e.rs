@@ -653,3 +653,179 @@ e2e!(
         app.delete().await.expect("cleanup");
     }
 );
+
+// Regression for DBA-01/H3: a unique violation inside `get_or_create` must not
+// poison the transaction the caller wrapped around it. Before the fix, the
+// doomed `INSERT` aborted the whole `atomic` block and the recovery read came
+// back with `25P02 current transaction is aborted`; after it, the insert runs
+// in its own `SAVEPOINT`, so the outer transaction stays usable.
+//
+// Deterministic (no concurrency): the lookup slug never exists, so
+// `get_or_create` always reaches the `INSERT`, and the inserted slug collides
+// with a row committed *before* the block — a guaranteed `23505`.
+e2e!(
+    get_or_create_unique_violation_does_not_poison_the_outer_transaction,
+    "acme-savepoint",
+    |t, _p| {
+        let _ = t;
+        let dup_slug = "acme-savepoint-dup";
+        let miss_slug = "acme-savepoint-miss";
+
+        // Seed the conflicting row, committed, outside any transaction.
+        Tenant::objects()
+            .get_or_create(
+                tenant::slug.eq(dup_slug),
+                NewTenant {
+                    slug: dup_slug.into(),
+                    name: "Dup".into(),
+                },
+            )
+            .await
+            .expect("the conflicting row is committed");
+
+        let survived: Result<Option<Tenant>> = db::atomic(|_tx| async move {
+            // Lookup misses -> go to INSERT; INSERT collides with the committed
+            // `dup` row -> 23505. The call itself reports an error either way
+            // (the lookup never matches the row that exists); what matters is
+            // whether the transaction is still alive after it.
+            let doomed = Tenant::objects()
+                .get_or_create(
+                    tenant::slug.eq(miss_slug),
+                    NewTenant {
+                        slug: dup_slug.into(),
+                        name: "Doomed".into(),
+                    },
+                )
+                .await;
+            assert!(
+                doomed.is_err(),
+                "the doomed insert must surface an error, got {doomed:?}"
+            );
+
+            // The proof: a further read on the SAME transaction still works.
+            // Before the fix this is `25P02`; after it, `Ok(Some(dup))`.
+            Tenant::objects()
+                .filter(tenant::slug.eq(dup_slug))
+                .first()
+                .await
+        })
+        .await;
+
+        let found = survived.expect("the outer transaction survived the unique violation");
+        assert!(
+            found.is_some(),
+            "the committed dup row is visible from the still-alive transaction"
+        );
+
+        Tenant::objects()
+            .filter(tenant::slug.eq(dup_slug))
+            .delete()
+            .await
+            .expect("cleanup");
+    }
+);
+
+// Regression for PERF-02/H9: `bulk_create` of more rows than a single statement
+// can carry must succeed by chunking. 70 000 tenants × 2 columns = 140 000 bound
+// parameters, well over the protocol's 65 535 `u16` ceiling — one statement
+// overflows and fails; chunked, it is three statements in one transaction.
+e2e!(bulk_create_of_70000_rows_succeeds, "acme-bulk", |_t, _p| {
+    let prefix = "acme-bulk-row-";
+
+    // Clear leftovers from any prior interrupted run (slug is unique).
+    Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .delete()
+        .await
+        .expect("pre-clean");
+
+    let n: usize = 70_000;
+    let rows: Vec<NewTenant> = (0..n)
+        .map(|i| NewTenant {
+            slug: format!("{prefix}{i}"),
+            name: format!("Bulk {i}"),
+        })
+        .collect();
+
+    let created = Tenant::objects()
+        .bulk_create(rows)
+        .await
+        .expect("70k rows insert by chunking under the parameter ceiling");
+    assert_eq!(created.len(), n, "every inserted row is returned");
+
+    let count = Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .count()
+        .await
+        .expect("count the inserted rows");
+    assert_eq!(count as usize, n, "all rows are persisted");
+
+    Tenant::objects()
+        .filter_str("slug__startswith", prefix)
+        .delete()
+        .await
+        .expect("cleanup");
+});
+
+// Regression for SEC-03/H15 and B-12: the read-only flag is per *session*, not
+// per process. Two concurrent sessions — one read-only, one writable — do not
+// leak into each other, which the old process-global `AtomicBool` could not
+// express. Not written with `e2e!` so the two sessions can run under one
+// `tokio::join!`.
+#[test]
+#[ignore = "needs a Postgres (DELONIX_ORM_TEST_DSN)"]
+fn two_sessions_have_independent_read_only_flags() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipped: DELONIX_ORM_TEST_DSN is not set");
+        return;
+    };
+    setup(&dsn);
+    let rt = runtime();
+    rt.block_on(async {
+        let (t, p) = seed("acme-session-iso").await;
+        Application::objects()
+            .filter(application::tenant.eq(t.pk()))
+            .delete()
+            .await
+            .expect("clear the tenant's applications");
+
+        // Run both sessions concurrently. Each wraps its write in its own
+        // `with_read_only` scope; neither touches the process-wide flag.
+        let read_only_session = db::with_read_only(true, async {
+            Application::objects()
+                .create(NewApplication {
+                    tenant: t.as_fk(),
+                    plan: p.as_fk(),
+                    name: "from-the-read-only-session".into(),
+                })
+                .await
+        });
+        let writable_session = db::with_read_only(false, async {
+            Application::objects()
+                .create(NewApplication {
+                    tenant: t.as_fk(),
+                    plan: p.as_fk(),
+                    name: "from-the-writable-session".into(),
+                })
+                .await
+        });
+        let (ro, rw) = tokio::join!(read_only_session, writable_session);
+
+        // The read-only session refuses — while the writable one, running at the
+        // same instant, succeeds. Under the old global flag one would have forced
+        // the other.
+        assert!(
+            matches!(ro, Err(Error::ReadOnly("create"))),
+            "the read-only session must refuse the write, got {ro:?}"
+        );
+        let app = rw.expect("the writable session writes while the other is read-only");
+
+        // No scope leaked into the process-wide default.
+        assert!(
+            !db::is_read_only(),
+            "the per-session scopes did not leak to the process default"
+        );
+
+        app.delete().await.expect("cleanup");
+    });
+}

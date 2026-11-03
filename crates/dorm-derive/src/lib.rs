@@ -1039,6 +1039,241 @@ fn build_new_row(name: &Ident, specs: &[FieldSpec]) -> TokenStream2 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `#[derive(Rag)]` — the optional RAG declaration (ADR 0019), behind the `rag`
+// feature and re-exported as `dorm_rag::Rag`. It is a SEPARATE derive from
+// `Model`, on purpose: a RAG model is a model that *also* carries an independent
+// `&'static RagMeta`, so `#[derive(Model)]` and `ModelMeta` are untouched. The
+// emitted code names `::dorm_rag::…` token paths — this crate takes no Cargo
+// dependency on dorm-rag, so there is no cycle; the user's crate compiles it.
+// ---------------------------------------------------------------------------
+
+/// Derive RAG indexing for a model. Pairs with `#[derive(Model)]` and reads a
+/// `#[rag(..)]` attribute:
+///
+/// ```ignore
+/// #[derive(Model, Rag)]
+/// #[rag(fields = ["title", "body"], template = "{title}\n\n{body}",
+///       embedder = "default", chunk_size = 800, chunk_overlap = 100,
+///       metadata = ["status"], distance = "cosine")]
+/// pub struct Ticket { /* … */ }
+/// ```
+///
+/// Emits one `&'static dorm_rag::meta::RagMeta` and submits it into dorm-rag's
+/// `inventory` slice, tied to the model by its name. `fields` is required; the
+/// rest default (`template` to the fields joined by blank lines, `embedder` to
+/// `"default"`, `chunk_size`/`chunk_overlap` to `800`/`100`, `metadata` to empty,
+/// `distance` to `cosine`).
+#[cfg(feature = "rag")]
+#[proc_macro_derive(Rag, attributes(rag))]
+pub fn derive_rag(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    expand_rag(&ast)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+#[cfg(feature = "rag")]
+struct RagOpts {
+    fields: Vec<String>,
+    template: Option<String>,
+    embedder: String,
+    chunk_size: u32,
+    chunk_overlap: u32,
+    metadata: Vec<String>,
+    /// The `DistanceMetric` variant identifier, already validated.
+    distance: Ident,
+}
+
+#[cfg(feature = "rag")]
+fn expand_rag(ast: &DeriveInput) -> Result<TokenStream2> {
+    let name = &ast.ident;
+    if !ast.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &ast.generics,
+            "a RAG model cannot be generic: its RagMeta is one `static`",
+        ));
+    }
+
+    let opts = parse_rag_opts(ast)?;
+    if opts.fields.is_empty() {
+        return Err(Error::new_spanned(
+            name,
+            "`#[rag(..)]` needs at least one text field: `fields = [\"...\"]`",
+        ));
+    }
+
+    // Default template: each field on its own, separated by blank lines — the
+    // obvious document when the author does not spell one out.
+    let template = opts.template.unwrap_or_else(|| {
+        opts.fields
+            .iter()
+            .map(|f| format!("{{{f}}}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    });
+
+    let model_name = name.to_string();
+    let fields = opts.fields.iter().map(|f| quote!(#f));
+    let metadata = opts.metadata.iter().map(|m| quote!(#m));
+    let embedder = &opts.embedder;
+    let chunk_size = opts.chunk_size;
+    let chunk_overlap = opts.chunk_overlap;
+    let distance = &opts.distance;
+
+    let rag_const = format_ident!("__{}_RAG", name.to_string().to_uppercase());
+
+    Ok(quote! {
+        #[doc(hidden)]
+        const #rag_const: ::dorm_rag::meta::RagMeta = ::dorm_rag::meta::RagMeta {
+            model: #model_name,
+            fields: &[#(#fields),*],
+            template: #template,
+            embedder: #embedder,
+            chunk_size: #chunk_size,
+            chunk_overlap: #chunk_overlap,
+            metadata: &[#(#metadata),*],
+            distance: ::dorm_rag::meta::DistanceMetric::#distance,
+        };
+
+        // The line that makes the model visible to the RAG worker and search.
+        ::dorm_rag::inventory::submit! { #rag_const }
+    })
+}
+
+#[cfg(feature = "rag")]
+fn parse_rag_opts(ast: &DeriveInput) -> Result<RagOpts> {
+    let mut fields = Vec::new();
+    let mut template = None;
+    let mut embedder = "default".to_string();
+    let mut chunk_size: u32 = 800;
+    let mut chunk_overlap: u32 = 100;
+    let mut metadata = Vec::new();
+    let mut distance = format_ident!("Cosine");
+    let mut seen_rag = false;
+
+    for attr in &ast.attrs {
+        if !attr.path().is_ident("rag") {
+            continue;
+        }
+        seen_rag = true;
+        attr.parse_nested_meta(|meta| {
+            let key = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            match key.as_str() {
+                "fields" => fields = parse_str_list(&meta)?,
+                "metadata" => metadata = parse_str_list(&meta)?,
+                "template" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    template = Some(s.value());
+                }
+                "embedder" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    embedder = s.value();
+                }
+                "chunk_size" => {
+                    let n: LitInt = meta.value()?.parse()?;
+                    chunk_size = n.base10_parse()?;
+                }
+                "chunk_overlap" => {
+                    let n: LitInt = meta.value()?.parse()?;
+                    chunk_overlap = n.base10_parse()?;
+                }
+                "distance" => {
+                    let s: LitStr = meta.value()?.parse()?;
+                    distance = distance_ident(&s)?;
+                }
+                other => {
+                    return Err(meta.error(format!(
+                        "unknown `rag` option `{other}`; known: fields, template, embedder, \
+                         chunk_size, chunk_overlap, metadata, distance"
+                    )))
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    if !seen_rag {
+        return Err(Error::new_spanned(
+            &ast.ident,
+            "`#[derive(Rag)]` needs a `#[rag(fields = [\"...\"], ...)]` attribute",
+        ));
+    }
+
+    if chunk_overlap >= chunk_size {
+        return Err(Error::new_spanned(
+            &ast.ident,
+            "`chunk_overlap` must be smaller than `chunk_size`, or chunking never advances",
+        ));
+    }
+
+    Ok(RagOpts {
+        fields,
+        template,
+        embedder,
+        chunk_size,
+        chunk_overlap,
+        metadata,
+        distance,
+    })
+}
+
+/// Parse `= ["a", "b"]` into `["a", "b"]`. Accepts string literals (what
+/// `dorm generate` emits) and bare identifiers (convenient when hand-written),
+/// so `fields = ["title", body]` both work.
+#[cfg(feature = "rag")]
+fn parse_str_list(meta: &syn::meta::ParseNestedMeta) -> Result<Vec<String>> {
+    let arr: syn::ExprArray = meta.value()?.parse()?;
+    let mut out = Vec::new();
+    for elem in &arr.elems {
+        match elem {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => out.push(s.value()),
+            syn::Expr::Path(p) => {
+                let ident = p.path.get_ident().ok_or_else(|| {
+                    Error::new_spanned(elem, "expected a field name or a string literal")
+                })?;
+                out.push(ident.to_string());
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    elem,
+                    "expected a string literal or a field name",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map the `distance = "…"` string to the `DistanceMetric` variant identifier,
+/// failing with a named message on an unknown spelling — the compile-time half
+/// of `DistanceMetric::parse`.
+#[cfg(feature = "rag")]
+fn distance_ident(s: &LitStr) -> Result<Ident> {
+    let variant = match s.value().as_str() {
+        "cosine" => "Cosine",
+        "l2" | "euclidean" => "L2",
+        "inner_product" | "ip" | "dot" => "InnerProduct",
+        other => {
+            return Err(Error::new(
+                s.span(),
+                format!(
+                    "unknown distance `{other}`; known: cosine, l2 (euclidean), \
+                     inner_product (ip, dot)"
+                ),
+            ))
+        }
+    };
+    Ok(format_ident!("{}", variant))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1318,19 @@ mod tests {
         assert_eq!(parse("jsonb").as_deref(), Some("Json"));
         assert_eq!(parse("timestamptz").as_deref(), Some("Timestamp"));
         assert_eq!(parse("blob"), None);
+    }
+
+    #[cfg(feature = "rag")]
+    #[test]
+    fn distance_accepts_the_known_spellings_and_rejects_the_rest() {
+        let parse = |s: &str| {
+            distance_ident(&LitStr::new(s, Span::call_site()))
+                .map(|i| i.to_string())
+                .ok()
+        };
+        assert_eq!(parse("cosine").as_deref(), Some("Cosine"));
+        assert_eq!(parse("euclidean").as_deref(), Some("L2"));
+        assert_eq!(parse("dot").as_deref(), Some("InnerProduct"));
+        assert_eq!(parse("cosone"), None);
     }
 }

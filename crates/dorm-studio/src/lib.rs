@@ -331,11 +331,14 @@ fn value_to_cell(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::I32(n) => n.to_string(),
         Value::I64(n) => n.to_string(),
+        Value::F64(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Decimal(d) => d.to_string(),
         Value::Timestamp(t) => t.to_rfc3339(),
         Value::Uuid(u) => u.to_string(),
         Value::Json(j) => j.to_string(),
+        // `\x`-prefixed hex, as the REPL and PostgreSQL render a blob.
+        Value::Bytes(_) => v.to_string(),
     }
 }
 
@@ -553,11 +556,14 @@ fn value_to_json(v: &Value) -> JsonValue {
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::I32(n) => JsonValue::from(*n),
         Value::I64(n) => JsonValue::from(*n),
+        Value::F64(x) => JsonValue::from(*x),
         Value::Text(s) => JsonValue::String(s.clone()),
         Value::Decimal(d) => JsonValue::String(d.to_string()),
         Value::Timestamp(t) => JsonValue::String(t.to_rfc3339()),
         Value::Uuid(u) => JsonValue::String(u.to_string()),
         Value::Json(j) => j.clone(),
+        // Bytes as `\x`-prefixed hex — a JSON string the grid shows and round-trips.
+        Value::Bytes(_) => JsonValue::String(v.to_string()),
     }
 }
 

@@ -49,6 +49,11 @@ tracing = { workspace = true }
 # compiles SQLite in, so a user who turns the feature on needs no system
 # library; a user who leaves it off pulls neither this crate nor SQLite.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# The MySQL driver, opt-in behind the `mysql` feature (ADR 0018). `minimal` drops
+# TLS and compression (added later); the non-scalar types (Decimal, Timestamp,
+# Uuid, Json) travel as text, so no chrono/bigdecimal feature of the driver is
+# needed — the same choice the SQLite backend makes.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"], optional = true }
 
 # TLS for the PostgreSQL connection (ADR 0004). Both optional; `tls-rustls` is in
 # the default set. Each is pulled only when its feature is on.
@@ -68,6 +73,7 @@ openssl = { workspace = true, optional = true }
 default = ["postgres", "tls-rustls"]
 postgres = []
 sqlite = ["dep:rusqlite"]
+mysql = ["dep:mysql_async"]
 tls-rustls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 tls-openssl = ["dep:postgres-openssl", "dep:openssl"]
 

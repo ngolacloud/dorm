@@ -27,12 +27,17 @@ use crate::error::{Error, Result};
 pub enum FieldType {
     I32,
     I64,
+    /// A 64-bit IEEE float (`DOUBLE PRECISION`/`REAL`). For money use
+    /// [`Decimal`](FieldType::Decimal): a float silently loses cents (ADR 0016).
+    F64,
     Text,
     Bool,
     Decimal,
     Timestamp,
     Uuid,
     Json,
+    /// Raw bytes (`BYTEA`/`BLOB`) — a hash, a key, a small binary blob.
+    Bytes,
 }
 
 impl FieldType {
@@ -41,6 +46,7 @@ impl FieldType {
         match self {
             FieldType::I32 => "INTEGER",
             FieldType::I64 => "BIGINT",
+            FieldType::F64 => "DOUBLE PRECISION",
             FieldType::Text => "TEXT",
             FieldType::Bool => "BOOLEAN",
             // NUMERIC without precision, on purpose: money columns get their
@@ -50,6 +56,7 @@ impl FieldType {
             FieldType::Timestamp => "TIMESTAMPTZ",
             FieldType::Uuid => "UUID",
             FieldType::Json => "JSONB",
+            FieldType::Bytes => "BYTEA",
         }
     }
 
@@ -65,12 +72,14 @@ impl FieldType {
         match self {
             FieldType::I32 => "integer",
             FieldType::I64 => "bigint",
+            FieldType::F64 => "float",
             FieldType::Text => "text",
             FieldType::Bool => "boolean",
             FieldType::Decimal => "decimal",
             FieldType::Timestamp => "timestamp",
             FieldType::Uuid => "uuid",
             FieldType::Json => "json",
+            FieldType::Bytes => "bytes",
         }
     }
 }
@@ -87,11 +96,13 @@ pub enum Value {
     Bool(bool),
     I32(i32),
     I64(i64),
+    F64(f64),
     Text(String),
     Decimal(Decimal),
     Timestamp(DateTime<Utc>),
     Uuid(Uuid),
     Json(serde_json::Value),
+    Bytes(Vec<u8>),
 }
 
 impl Value {
@@ -103,11 +114,13 @@ impl Value {
             Value::Bool(_) => FieldType::Bool,
             Value::I32(_) => FieldType::I32,
             Value::I64(_) => FieldType::I64,
+            Value::F64(_) => FieldType::F64,
             Value::Text(_) => FieldType::Text,
             Value::Decimal(_) => FieldType::Decimal,
             Value::Timestamp(_) => FieldType::Timestamp,
             Value::Uuid(_) => FieldType::Uuid,
             Value::Json(_) => FieldType::Json,
+            Value::Bytes(_) => FieldType::Bytes,
         })
     }
 
@@ -163,6 +176,15 @@ impl Value {
                 Value::Json(serde_json::from_str(&s).map_err(|_| mismatch("json"))?)
             }
 
+            // Numbers widen into a float (a REPL `1` or `19.99` into a `DOUBLE`
+            // column). The reverse is never implicit: a float into an integer or a
+            // decimal could lose information, so it stays an error.
+            (Value::I32(n), FieldType::F64) => Value::F64(f64::from(n)),
+            (Value::I64(n), FieldType::F64) => Value::F64(n as f64),
+            (Value::Text(s), FieldType::F64) => {
+                Value::F64(s.parse().map_err(|_| mismatch("float"))?)
+            }
+
             (_, w) => return Err(mismatch(w.describe())),
         })
     }
@@ -178,11 +200,21 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::I32(n) => write!(f, "{n}"),
             Value::I64(n) => write!(f, "{n}"),
+            Value::F64(x) => write!(f, "{x}"),
             Value::Text(s) => f.write_str(s),
             Value::Decimal(d) => write!(f, "{d}"),
             Value::Timestamp(t) => write!(f, "{}", t.to_rfc3339()),
             Value::Uuid(u) => write!(f, "{u}"),
             Value::Json(j) => write!(f, "{j}"),
+            // A blob is shown `\x`-prefixed hex, PostgreSQL's own rendering, so a
+            // REPL cell is unambiguous and copy-pasteable rather than raw bytes.
+            Value::Bytes(b) => {
+                f.write_str("\\x")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -201,11 +233,13 @@ impl ToSql for Value {
             Value::Bool(v) => v.to_sql(ty, out),
             Value::I32(v) => v.to_sql(ty, out),
             Value::I64(v) => v.to_sql(ty, out),
+            Value::F64(v) => v.to_sql(ty, out),
             Value::Text(v) => v.to_sql(ty, out),
             Value::Decimal(v) => v.to_sql(ty, out),
             Value::Timestamp(v) => v.to_sql(ty, out),
             Value::Uuid(v) => v.to_sql(ty, out),
             Value::Json(v) => v.to_sql(ty, out),
+            Value::Bytes(v) => v.to_sql(ty, out),
         }
     }
 
@@ -264,11 +298,13 @@ macro_rules! to_value {
 to_value!(bool, Bool, Bool, |v| *v);
 to_value!(i32, I32, I32, |v| *v);
 to_value!(i64, I64, I64, |v| *v);
+to_value!(f64, F64, F64, |v| *v);
 to_value!(String, Text, Text, |v| v.clone());
 to_value!(Decimal, Decimal, Decimal, |v| *v);
 to_value!(DateTime<Utc>, Timestamp, Timestamp, |v| *v);
 to_value!(Uuid, Uuid, Uuid, |v| *v);
 to_value!(serde_json::Value, Json, Json, |v| v.clone());
+to_value!(Vec<u8>, Bytes, Bytes, |v| v.clone());
 
 impl ToValue for &str {
     fn to_value(&self) -> Value {
@@ -320,6 +356,10 @@ pub fn read_column(
         crate::row::Row::Sqlite(row) => {
             return crate::row::cell_to_value(row.cell(idx), ty, column)
         }
+        #[cfg(feature = "mysql")]
+        crate::row::Row::MySql(row) => {
+            return crate::row::mysql_cell_to_value(crate::row::mysql_cell(row, idx), ty, column)
+        }
     };
     let fail = |want: &'static str| Error::UnexpectedColumnType {
         column: column.to_string(),
@@ -337,6 +377,10 @@ pub fn read_column(
             .try_get::<_, Option<i64>>(idx)
             .map_err(|_| fail("bigint"))?
             .map_or(Value::Null, Value::I64),
+        FieldType::F64 => row
+            .try_get::<_, Option<f64>>(idx)
+            .map_err(|_| fail("float"))?
+            .map_or(Value::Null, Value::F64),
         FieldType::Text => row
             .try_get::<_, Option<String>>(idx)
             .map_err(|_| fail("text"))?
@@ -361,6 +405,10 @@ pub fn read_column(
             .try_get::<_, Option<serde_json::Value>>(idx)
             .map_err(|_| fail("json"))?
             .map_or(Value::Null, Value::Json),
+        FieldType::Bytes => row
+            .try_get::<_, Option<Vec<u8>>>(idx)
+            .map_err(|_| fail("bytes"))?
+            .map_or(Value::Null, Value::Bytes),
     })
 }
 
@@ -421,6 +469,51 @@ mod tests {
         let none: Option<i64> = None;
         assert_eq!(none.to_value(), Value::Null);
         assert_eq!(<Option<i64> as ColumnType>::field_type(), FieldType::I64);
+    }
+
+    #[test]
+    fn numbers_widen_into_a_float_but_never_the_other_way() {
+        assert_eq!(
+            Value::I32(3).coerce(FieldType::F64, "x").unwrap(),
+            Value::F64(3.0)
+        );
+        assert_eq!(
+            Value::I64(5).coerce(FieldType::F64, "x").unwrap(),
+            Value::F64(5.0)
+        );
+        assert_eq!(
+            Value::Text("19.5".into())
+                .coerce(FieldType::F64, "x")
+                .unwrap(),
+            Value::F64(19.5)
+        );
+        // A float is never silently narrowed into an integer or a decimal.
+        assert!(Value::F64(1.5).coerce(FieldType::I64, "x").is_err());
+        assert!(Value::F64(1.5).coerce(FieldType::Decimal, "x").is_err());
+        assert!(Value::Text("not-a-float".into())
+            .coerce(FieldType::F64, "x")
+            .is_err());
+    }
+
+    #[test]
+    fn the_new_types_map_to_their_sql_and_rust_shapes() {
+        assert_eq!(FieldType::F64.sql_type(), "DOUBLE PRECISION");
+        assert_eq!(FieldType::Bytes.sql_type(), "BYTEA");
+        assert_eq!(<f64 as ColumnType>::field_type(), FieldType::F64);
+        assert_eq!(<Vec<u8> as ColumnType>::field_type(), FieldType::Bytes);
+        assert_eq!(1.5_f64.to_value(), Value::F64(1.5));
+        assert_eq!(vec![1u8, 2, 255].to_value(), Value::Bytes(vec![1, 2, 255]));
+        assert_eq!(Value::F64(2.5).field_type(), Some(FieldType::F64));
+        assert_eq!(Value::Bytes(vec![0]).field_type(), Some(FieldType::Bytes));
+    }
+
+    #[test]
+    fn a_blob_renders_as_backslash_x_hex() {
+        assert_eq!(
+            Value::Bytes(vec![0x00, 0x0f, 0xff]).to_string(),
+            "\\x000fff"
+        );
+        assert_eq!(Value::Bytes(vec![]).to_string(), "\\x");
     }
 
     #[test]

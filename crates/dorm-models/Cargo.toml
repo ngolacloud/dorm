@@ -25,3 +25,7 @@ sqlite = ["dorm-core/sqlite"]
 [dev-dependencies]
 insta = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+# The prefetch live test installs a capturing subscriber to count statements
+# (the N+1 witness). Test-only — the library never installs a subscriber.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

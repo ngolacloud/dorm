@@ -49,6 +49,11 @@ fn imports(schema: &Schema) -> String {
     out.push_str("use dorm_core::meta::ModelMeta;\n");
     out.push_str("use dorm_core::model::Model;\n");
     out.push_str("use dorm_derive::Model;\n");
+    // Only when some model opts into RAG: a schema with no `@@rag` imports
+    // nothing from `dorm-rag` and so pulls in no dependency on it (ADR 0019).
+    if schema.models.iter().any(|m| m.rag.is_some()) {
+        out.push_str("use dorm_rag::Rag;\n");
+    }
     if has_decimal {
         out.push_str("use rust_decimal::Decimal;\n");
     }
@@ -57,8 +62,17 @@ fn imports(schema: &Schema) -> String {
 
 fn model(schema: &Schema, m: &Model) -> String {
     let mut out = String::new();
-    out.push_str("#[derive(Model, Debug, Clone)]\n");
+    // A RAG model carries a second, independent derive — `ModelMeta` is untouched
+    // (ADR 0019); the `@@rag(..)` block compiles to `#[derive(Rag)]` + `#[rag(..)]`.
+    if m.rag.is_some() {
+        out.push_str("#[derive(Model, Rag, Debug, Clone)]\n");
+    } else {
+        out.push_str("#[derive(Model, Debug, Clone)]\n");
+    }
     let _ = writeln!(out, "#[model(table = \"{}\")]", m.table);
+    if let Some(rag) = &m.rag {
+        out.push_str(&rag_attr(rag));
+    }
     let _ = writeln!(out, "pub struct {} {{", m.name);
     for f in &m.fields {
         match f {
@@ -70,6 +84,47 @@ fn model(schema: &Schema, m: &Model) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// Render a model's `@@rag(..)` as the `#[rag(..)]` attribute the `Rag` derive
+/// reads. Field and metadata names are snake_cased to match the generated struct
+/// fields and columns; `fields` is always emitted, the rest only when given.
+fn rag_attr(rag: &crate::RagBlock) -> String {
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|f| format!("\"{}\"", snake(f)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = vec![format!("fields = [{}]", list(&rag.fields))];
+    if let Some(t) = &rag.template {
+        parts.push(format!("template = \"{}\"", rust_escape(t)));
+    }
+    if let Some(e) = &rag.embedder {
+        parts.push(format!("embedder = \"{}\"", rust_escape(e)));
+    }
+    if let Some(n) = rag.chunk_size {
+        parts.push(format!("chunk_size = {n}"));
+    }
+    if let Some(n) = rag.chunk_overlap {
+        parts.push(format!("chunk_overlap = {n}"));
+    }
+    if !rag.metadata.is_empty() {
+        parts.push(format!("metadata = [{}]", list(&rag.metadata)));
+    }
+    if let Some(d) = &rag.distance {
+        parts.push(format!("distance = \"{}\"", rust_escape(d)));
+    }
+    format!("#[rag({})]\n", parts.join(", "))
+}
+
+/// Escape a schema string so it is a valid Rust string literal with the **same
+/// byte value**. Lossless: a `\` in the schema stays a `\` in the document, never
+/// silently becoming a newline. (A real newline is not expressible in a schema
+/// string anyway — the lexer rejects it — so this cannot drop one.)
+fn rust_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn scalar_field(s: &crate::ScalarField) -> String {
@@ -211,5 +266,53 @@ mod tests {
         // all_models lists both.
         assert!(rust.contains("<Tenant as Model>::meta(),"));
         assert!(rust.contains("<Application as Model>::meta(),"));
+        // No RAG in this schema: no dorm-rag import and no Rag derive.
+        assert!(!rust.contains("use dorm_rag::Rag;"), "{rust}");
+        assert!(!rust.contains("Rag"), "{rust}");
+    }
+
+    const RAG: &str = r#"
+        model Ticket {
+          id        Int      @id @default(autoincrement())
+          title     String   @db.VarChar(200)
+          body      String   @db.Text
+          createdAt DateTime @default(now())
+          @@rag(fields: [title, body], template: "{title}", embedder: "default", chunk_size: 800, chunk_overlap: 100, metadata: [createdAt], distance: "cosine")
+        }
+    "#;
+
+    #[test]
+    fn a_rag_model_emits_the_rag_derive_and_attribute_and_the_import() {
+        let rust = generate_rust(&parse(RAG).expect("parses"));
+        // The second, independent derive — Model is still there and unchanged.
+        assert!(
+            rust.contains("#[derive(Model, Rag, Debug, Clone)]"),
+            "{rust}"
+        );
+        // The import appears exactly because a model opts in.
+        assert!(rust.contains("use dorm_rag::Rag;"), "{rust}");
+        // Field names are snake_cased to match the generated columns.
+        assert!(
+            rust.contains(
+                "#[rag(fields = [\"title\", \"body\"], template = \"{title}\", \
+                 embedder = \"default\", chunk_size = 800, chunk_overlap = 100, \
+                 metadata = [\"created_at\"], distance = \"cosine\")]"
+            ),
+            "{rust}"
+        );
+    }
+
+    #[test]
+    fn a_rag_block_with_only_fields_defaults_the_rest() {
+        let src = r#"
+            model Note {
+              id   Int    @id @default(autoincrement())
+              body String @db.Text
+              @@rag(fields: [body])
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        // Only `fields` is emitted; the derive supplies template/embedder/sizes.
+        assert!(rust.contains("#[rag(fields = [\"body\"])]"), "{rust}");
     }
 }

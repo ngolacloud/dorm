@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use crate::compiler::{self, Plan, Sql};
 use crate::error::{Error, Result};
 use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, Q};
-use crate::model::{run_execute, run_query, Model, NewRow};
+use crate::model::{insert_returning, run_execute, run_query, Model, NewRow};
 use crate::row::Row;
 use crate::value::{read_column, ToValue, Value};
 use crate::{db, registry};
@@ -132,29 +132,59 @@ impl<T: Model> Manager<T> {
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
         db::guard_write("create")?;
         let values = new.column_values();
-        let sql =
-            compiler::compile_insert_on(T::meta(), std::slice::from_ref(&values), db::dialect())?;
-        let rows = run_query(&sql).await?;
+        let batch = std::slice::from_ref(&values);
+        let sql = compiler::compile_insert_on(T::meta(), batch, db::dialect())?;
+        let rows = insert_returning(T::meta(), &sql, batch).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
         })?;
         T::from_row(row, 0)
     }
 
-    /// Insert many rows in one statement.
+    /// Insert many rows, chunked to stay under the wire protocol's parameter
+    /// limit.
     ///
-    /// One statement, not a loop: the round trips are what makes a per-row loop
-    /// slow, and a single `INSERT … VALUES (…), (…)` is also one transaction
-    /// without needing an explicit one.
+    /// One `INSERT … VALUES (…), (…)` per chunk, not a per-row loop: the round
+    /// trips are what make a loop slow. But a single statement carries at most
+    /// **65 535 bound parameters** (the protocol's `u16` parameter count), and a
+    /// row contributes one parameter per column, so one statement tops out at
+    /// `floor(65535 / columns)` rows — past that `tokio-postgres` overflows and
+    /// the insert fails outright. We chunk at that ceiling. When the rows fit in
+    /// a single chunk (the common case) the statement is its own transaction, as
+    /// before; when they span several chunks we wrap them in one `atomic` so the
+    /// call stays all-or-nothing.
     pub async fn bulk_create<N: NewRow<T>>(&self, rows: Vec<N>) -> Result<Vec<T>> {
         db::guard_write("bulk_create")?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
         let values: Vec<Vec<(String, Value)>> = rows.iter().map(NewRow::column_values).collect();
-        let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
-        let returned = run_query(&sql).await?;
-        returned.iter().map(|r| T::from_row(r, 0)).collect()
+        let cols = values[0].len().max(1);
+        let per_chunk = (65_535 / cols).max(1);
+
+        // Single chunk: one statement. On a RETURNING backend that is its own
+        // implicit transaction, as before; on MySQL `insert_returning` wraps the
+        // insert-then-reload in one `atomic` so the two share a connection.
+        if values.len() <= per_chunk {
+            let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
+            let returned = insert_returning(T::meta(), &sql, &values).await?;
+            return returned.iter().map(|r| T::from_row(r, 0)).collect();
+        }
+
+        // Several chunks: one statement each, all in one transaction. On MySQL
+        // each chunk's `insert_returning` nests as a savepoint within it.
+        db::atomic(|_tx| async move {
+            let mut out = Vec::with_capacity(values.len());
+            for chunk in values.chunks(per_chunk) {
+                let sql = compiler::compile_insert_on(T::meta(), chunk, db::dialect())?;
+                let returned = insert_returning(T::meta(), &sql, chunk).await?;
+                for r in &returned {
+                    out.push(T::from_row(r, 0)?);
+                }
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Fetch the row matching `lookup`, inserting `new` if there is none.
@@ -166,11 +196,14 @@ impl<T: Model> Manager<T> {
         if let Some(found) = QuerySet::<T>::new().filter(lookup.clone()).first().await? {
             return Ok((found, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: the row the other caller inserted is the right
-                // answer, and reporting `created = false` is accurate.
+                // answer, and reporting `created = false` is accurate. The insert
+                // ran inside its own savepoint (`create_savepointed`), so the
+                // unique violation rolled back only that attempt — this recovery
+                // read runs on a transaction that is still usable.
                 let found = QuerySet::<T>::new()
                     .filter(lookup)
                     .first()
@@ -180,6 +213,25 @@ impl<T: Model> Manager<T> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Insert `new` so that a unique violation rolls back only its own attempt,
+    /// never a transaction the caller may already be inside.
+    ///
+    /// The bug this closes: `get_or_create`/`update_or_create` run
+    /// `SELECT → INSERT → SELECT`. When the caller wraps the whole thing in
+    /// [`db::atomic`], all three share one dedicated
+    /// connection. A bare `INSERT` that loses the race fails with `23505` and
+    /// **aborts that transaction**, so the recovery `SELECT` comes back with
+    /// `25P02 current transaction is aborted` instead of the winner's row — the
+    /// promised idempotence is false inside a transaction.
+    ///
+    /// Wrapping the insert in a nested `atomic` makes it a `SAVEPOINT` when there
+    /// is an outer transaction: the `23505` only does `ROLLBACK TO SAVEPOINT`,
+    /// leaving the outer transaction usable for the recovery read. With no outer
+    /// transaction it is a trivial `BEGIN`/`COMMIT` around the single insert.
+    async fn create_savepointed<N: NewRow<T>>(&self, new: N) -> Result<T> {
+        db::atomic(|_tx| async move { self.create(new).await }).await
     }
 
     /// Fetch the row matching `lookup` and apply `updates` to it, or insert `new`
@@ -205,10 +257,12 @@ impl<T: Model> Manager<T> {
         {
             return Ok((self.apply_and_fetch(lookup, updates).await?, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: update the row the winner inserted and return it.
+                // The insert ran in its own savepoint, so the outer transaction
+                // (if any) survives the unique violation and this update can run.
                 Ok((self.apply_and_fetch(lookup, updates).await?, false))
             }
             Err(e) => Err(e),
@@ -551,7 +605,7 @@ pub async fn insert_value_rows(
 ) -> Result<Vec<ValueRow>> {
     db::guard_write("insert")?;
     let sql = compiler::compile_insert_on(meta, rows, db::dialect())?;
-    let returned = run_query(&sql).await?;
+    let returned = insert_returning(meta, &sql, rows).await?;
     decode(&sql, &returned)
 }
 
