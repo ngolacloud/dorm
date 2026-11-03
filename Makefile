@@ -36,7 +36,50 @@ doc: ## Build and open the API docs
 shell: ## Run the dynamic REPL (reads DELONIX_ORM_DSN for live queries)
 	cargo run -p dorm-shell
 
+.PHONY: bench
+bench: ## Scale benchmark + regression gate against $(DSN) (ADR 0036). DORM_BENCH_ROWS/BENCH_MIN_SPEEDUP tune it.
+	DSN='$(DSN)' scripts/bench_gate.sh
+
 .PHONY: test-live
 test-live: ## Run the live suites against $(DSN) — needs a throwaway PostgreSQL
 	DELONIX_ORM_DSN='$(DSN)' cargo test -p dorm-models --test migrate_live -- --nocapture
 	DELONIX_ORM_TEST_DSN='$(DSN)' cargo test -p dorm-models --test typed_e2e -- --ignored --nocapture
+
+# ---------------------------------------------------------- compatibility (ADR 0011)
+#
+# Stand a backend up in a throwaway container with `delonix` (the workspace's
+# rootless container engine; Docker/Podman are absent here) and run the typed
+# conformance suite against it. One target per backend; each is self-contained —
+# it (re)creates the container, waits for readiness, makes a fresh database, and
+# runs `typed_e2e`. `CRE` lets you swap `delonix` for `docker`/`podman` if present.
+CRE ?= delonix
+
+.PHONY: compat-cockroach
+compat-cockroach: ## CockroachDB conformance via a delonix-spun container (PG wire)
+	$(CRE) rm -f dorm-cockroach >/dev/null 2>&1 || true
+	$(CRE) run -d --name dorm-cockroach -p 26257:26257 \
+		cockroachdb/cockroach:latest start-single-node --insecure
+	@echo "waiting for CockroachDB to accept SQL…"
+	@for i in $$(seq 1 30); do \
+		$(CRE) exec dorm-cockroach ./cockroach sql --insecure -e "SELECT 1" >/dev/null 2>&1 && break; \
+		sleep 1; done
+	$(CRE) exec dorm-cockroach ./cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS dorm_crdb"
+	DELONIX_ORM_TEST_DSN='host=127.0.0.1 port=26257 user=root dbname=dorm_crdb sslmode=disable' \
+		cargo test -p dorm-models --test typed_e2e -- --ignored --nocapture
+	@echo "CockroachDB: conformance passed. Stop the container with: $(CRE) rm -f dorm-cockroach"
+
+.PHONY: compat-mysql
+compat-mysql: ## MySQL 8 driver round-trip via a delonix-spun container (ADR 0018)
+	$(CRE) rm -f dorm-mysql >/dev/null 2>&1 || true
+	$(CRE) run -d --name dorm-mysql -p 3306:3306 \
+		-e MYSQL_ROOT_PASSWORD=dorm -e MYSQL_DATABASE=dorm mysql:8
+	@echo "waiting for MySQL to accept SQL (ping is not enough — wait for a real query)…"
+	@for i in $$(seq 1 60); do \
+		$(CRE) exec dorm-mysql mysqladmin ping -h127.0.0.1 -uroot -pdorm --silent >/dev/null 2>&1 \
+		&& $(CRE) exec dorm-mysql mysql -uroot -pdorm -e "SELECT 1" >/dev/null 2>&1 && break; \
+		sleep 2; done
+	$(CRE) exec dorm-mysql mysql -uroot -pdorm \
+		-e "CREATE DATABASE IF NOT EXISTS dorm CHARACTER SET utf8mb4"
+	DORM_COMPAT_MYSQL_DSN='mysql://root:dorm@127.0.0.1:3306/dorm' \
+		cargo test -p dorm-core --features mysql --test mysql_live -- --ignored --nocapture
+	@echo "MySQL: driver round-trip passed (typed suite lands with ADR 0018 Inc. 2+). Stop: $(CRE) rm -f dorm-mysql"

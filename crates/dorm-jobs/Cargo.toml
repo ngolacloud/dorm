@@ -1,0 +1,25 @@
+[package]
+name = "dorm-jobs"
+# Independent line: the job queue is an optional product on top of the core
+# (ADR 0027), on its own cadence. Pre-1.0.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Optional durable PostgreSQL job queue for DORM: SKIP LOCKED claiming, scheduling, priorities, retries with backoff, dead-letter, one-active-job-per-resource, and expiring leases for leader election (ADR 0027)."
+readme = "README.md"
+keywords = ["orm", "jobs", "queue", "leader-election", "postgres"]
+categories = ["database"]
+
+# One-way dependency on dorm-core: the core never depends on dorm-jobs, so a
+# project that does not use it sees an unchanged dorm-core graph (ADR 0027).
+[dependencies]
+dorm-core = { version = "0.6", path = "../dorm-core" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

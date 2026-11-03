@@ -2,7 +2,8 @@
 
 use crate::lexer::{lex, Tok};
 use crate::{
-    snake, Auto, Datasource, Field, Model, OnDelete, Relation, Scalar, ScalarField, Schema, Url,
+    snake, Auto, Datasource, EnumDecl, EnumField, Field, Model, OnDelete, RagBlock, Relation,
+    Scalar, ScalarField, Schema, Url,
 };
 
 /// A parse failure, with the 1-based line when known.
@@ -85,6 +86,7 @@ impl Parser {
     fn schema(&mut self) -> R<Schema> {
         let mut datasource = None;
         let mut models = Vec::new();
+        let mut enums = Vec::new();
         while let Some(tok) = self.peek() {
             match tok {
                 Tok::Ident(kw) if kw == "datasource" => {
@@ -95,6 +97,18 @@ impl Parser {
                     self.pos += 1;
                     models.push(self.model()?);
                 }
+                Tok::Ident(kw) if kw == "enum" => {
+                    self.pos += 1;
+                    enums.push(self.enum_decl()?);
+                }
+                Tok::Ident(kw) if kw == "namespace" => {
+                    // `namespace NAME { model… enum… }` (DORM-B2): a PostgreSQL
+                    // schema grouping. Each model inside carries the namespace;
+                    // enums inside are declared normally (a native enum is not
+                    // module-owned data in this cut).
+                    self.pos += 1;
+                    self.namespace_block(&mut models, &mut enums)?;
+                }
                 Tok::Ident(kw) if kw == "generator" => {
                     // Accepted and ignored: DORM generates via `dorm generate`,
                     // not a `generator` block, but tolerating it eases paste-in
@@ -103,10 +117,83 @@ impl Parser {
                     let _ = self.ident();
                     self.skip_block()?;
                 }
-                _ => return self.err("expected `datasource` or `model`"),
+                _ => return self.err("expected `datasource`, `model`, `enum` or `namespace`"),
             }
         }
-        Ok(Schema { datasource, models })
+        // Resolution pass: an enum may be declared after the model that uses it,
+        // so `field()` cannot tell `status OrderStatus` from a relation. Now that
+        // every `enum` is known, rewrite each to-one "relation" whose target is a
+        // declared enum into a `Field::Enum`, preserving its column and nullability.
+        for m in &mut models {
+            for f in &mut m.fields {
+                if let Field::ToOne(r) = f {
+                    if enums.iter().any(|e| e.name == r.target) {
+                        *f = Field::Enum(EnumField {
+                            name: r.name.clone(),
+                            column: r.column.clone(),
+                            enum_name: r.target.clone(),
+                            nullable: r.nullable,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Schema {
+            datasource,
+            models,
+            enums,
+        })
+    }
+
+    /// Parse a `namespace NAME { model… enum… }` block (DORM-B2), pushing its
+    /// models (each tagged with the namespace) and enums into the schema's lists.
+    /// Only `model` and `enum` may appear inside; nesting a namespace is refused.
+    fn namespace_block(&mut self, models: &mut Vec<Model>, enums: &mut Vec<EnumDecl>) -> R<()> {
+        let name = self.ident()?;
+        self.punct('{')?;
+        loop {
+            match self.peek() {
+                Some(Tok::Punct('}')) => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some(Tok::Ident(kw)) if kw == "model" => {
+                    self.pos += 1;
+                    let mut m = self.model()?;
+                    m.namespace = Some(name.clone());
+                    models.push(m);
+                }
+                Some(Tok::Ident(kw)) if kw == "enum" => {
+                    self.pos += 1;
+                    enums.push(self.enum_decl()?);
+                }
+                Some(Tok::Ident(kw)) if kw == "namespace" => {
+                    return self.err("a namespace cannot be nested inside another");
+                }
+                Some(_) => return self.err("expected `model`, `enum` or `}` inside a namespace"),
+                None => return self.err("unterminated namespace"),
+            }
+        }
+    }
+
+    /// Parse an `enum Name { v1 v2 … }` block (ADR 0047). The variants are bare
+    /// idents separated by whitespace or newlines (Prisma style), up to `}`.
+    fn enum_decl(&mut self) -> R<EnumDecl> {
+        let name = self.ident()?;
+        self.punct('{')?;
+        let mut variants = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Tok::Punct('}')) => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(Tok::Ident(_)) => variants.push(self.ident()?),
+                Some(_) => return self.err("expected an enum variant name or `}`"),
+                None => return self.err("unterminated enum"),
+            }
+        }
+        Ok(EnumDecl { name, variants })
     }
 
     fn skip_block(&mut self) -> R<()> {
@@ -193,6 +280,10 @@ impl Parser {
     fn model(&mut self) -> R<Model> {
         let name = self.ident()?;
         let mut table = pluralized_table(&name);
+        let mut rag = None;
+        let mut unique_together: Vec<Vec<String>> = Vec::new();
+        let mut composite_id: Vec<String> = Vec::new();
+        let mut indexes: Vec<Vec<String>> = Vec::new();
         self.punct('{')?;
         let mut fields = Vec::new();
         loop {
@@ -203,8 +294,13 @@ impl Parser {
                 }
                 Some(Tok::AtAt) => {
                     self.pos += 1;
-                    if let Some(t) = self.block_attr()? {
-                        table = t;
+                    match self.block_attr()? {
+                        BlockAttr::Map(t) => table = t,
+                        BlockAttr::Rag(r) => rag = Some(r),
+                        BlockAttr::Unique(cols) => unique_together.push(cols),
+                        BlockAttr::Id(cols) => composite_id = cols,
+                        BlockAttr::Index(cols) => indexes.push(cols),
+                        BlockAttr::Ignored => {}
                     }
                 }
                 Some(_) => fields.push(self.field()?),
@@ -213,18 +309,45 @@ impl Parser {
         }
         Ok(Model {
             name,
+            // Set by the `namespace` block that encloses it, if any; a top-level
+            // model stays `None` (DORM-B2).
+            namespace: None,
             table,
             fields,
+            rag,
+            unique_together,
+            composite_id,
+            indexes,
         })
     }
 
-    /// A block-level `@@…` attribute. Returns `Some(table)` for `@@map`.
-    fn block_attr(&mut self) -> R<Option<String>> {
+    /// A block-level `@@…` attribute: `@@map` (the table), `@@rag` (ADR 0019), or
+    /// anything else (kept only to stay valid — the formatter preserves it from
+    /// the text, not the AST).
+    fn block_attr(&mut self) -> R<BlockAttr> {
         let name = self.ident()?;
-        let mut table = None;
+        if name == "rag" {
+            return Ok(BlockAttr::Rag(self.rag_block()?));
+        }
+        // `@@unique([a, b])`, `@@id([a, b])` and `@@index([a, b])` carry a column
+        // list the AST models (ADR 0043/0044); anything else is still parsed and
+        // dropped.
+        if matches!(name.as_str(), "unique" | "id" | "index")
+            && self.peek() == Some(&Tok::Punct('('))
+        {
+            self.punct('(')?;
+            let cols = self.ident_list()?;
+            self.punct(')')?;
+            return Ok(match name.as_str() {
+                "unique" => BlockAttr::Unique(cols),
+                "id" => BlockAttr::Id(cols),
+                _ => BlockAttr::Index(cols),
+            });
+        }
+        let mut result = BlockAttr::Ignored;
         if self.eat_punct('(') {
             if name == "map" {
-                table = Some(self.string()?);
+                result = BlockAttr::Map(self.string()?);
             }
             // Consume the rest of the args (e.g. `@@index([a, b])`).
             let mut depth = 1;
@@ -237,7 +360,78 @@ impl Parser {
                 }
             }
         }
-        Ok(table)
+        Ok(result)
+    }
+
+    /// A bracketed list of identifiers: `[a, b, c]` — the shape `@@unique`/`@@id`
+    /// take.
+    fn ident_list(&mut self) -> R<Vec<String>> {
+        self.punct('[')?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_punct(']') {
+                break;
+            }
+            out.push(self.ident()?);
+            if !self.eat_punct(',') {
+                self.punct(']')?;
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse the args of `@@rag(fields: [title, body], embedder: "default", …)`.
+    /// Consumes its own enclosing `( … )`.
+    fn rag_block(&mut self) -> R<RagBlock> {
+        self.punct('(')?;
+        let mut rb = RagBlock::default();
+        loop {
+            if self.eat_punct(')') {
+                break;
+            }
+            let key = self.ident()?;
+            self.punct(':')?;
+            match key.as_str() {
+                "fields" => rb.fields = self.ident_or_str_list()?,
+                "metadata" => rb.metadata = self.ident_or_str_list()?,
+                "template" => rb.template = Some(self.string()?),
+                "embedder" => rb.embedder = Some(self.string()?),
+                "distance" => rb.distance = Some(self.string()?),
+                "chunk_size" => rb.chunk_size = Some(self.int()? as u32),
+                "chunk_overlap" => rb.chunk_overlap = Some(self.int()? as u32),
+                other => {
+                    return self.err(format!(
+                        "unknown @@rag option `{other}`; known: fields, template, embedder, \
+                         chunk_size, chunk_overlap, metadata, distance"
+                    ))
+                }
+            }
+            // A comma between entries is optional, like Prisma's attribute args.
+            self.eat_punct(',');
+        }
+        Ok(rb)
+    }
+
+    /// A `[a, b]` list whose elements are field names or strings — the shape
+    /// `fields`/`metadata` take.
+    fn ident_or_str_list(&mut self) -> R<Vec<String>> {
+        self.punct('[')?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_punct(']') {
+                break;
+            }
+            match self.next() {
+                Some(Tok::Ident(s)) | Some(Tok::Str(s)) => out.push(s),
+                _ => {
+                    self.pos -= 1;
+                    return self.err("expected a field name or a string in the list");
+                }
+            }
+            self.eat_punct(',');
+        }
+        Ok(out)
     }
 
     fn field(&mut self) -> R<Field> {
@@ -429,6 +623,149 @@ enum FieldAttr {
     Ignored,
 }
 
+/// A block-level `@@…` attribute's parsed meaning.
+enum BlockAttr {
+    /// `@@map("table")` — the table name.
+    Map(String),
+    /// `@@rag(..)` — the RAG declaration (ADR 0019).
+    Rag(RagBlock),
+    /// `@@unique([a, b])` — a composite-unique group (ADR 0043).
+    Unique(Vec<String>),
+    /// `@@id([a, b])` — a composite primary key (ADR 0043).
+    Id(Vec<String>),
+    /// `@@index([a, b])` — a composite index (ADR 0044).
+    Index(Vec<String>),
+    /// Anything else: valid, but not modelled by the AST.
+    Ignored,
+}
+
 fn pluralized_table(model: &str) -> String {
     crate::pluralize(&snake(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn namespace_blocks_tag_their_models_and_leave_top_level_models_untagged() {
+        let src = r#"
+            model Global { id Int @id }
+            namespace identity {
+              model User { id Int @id }
+            }
+            namespace notes {
+              model Note { id Int @id }
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let ns = |name: &str| {
+            schema
+                .models
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap()
+                .namespace
+                .clone()
+        };
+        assert_eq!(ns("Global"), None, "a top-level model has no namespace");
+        assert_eq!(ns("User"), Some("identity".to_string()));
+        assert_eq!(ns("Note"), Some("notes".to_string()));
+    }
+
+    #[test]
+    fn a_nested_namespace_is_refused() {
+        let err = parse("namespace a {\n  namespace b { model M { id Int @id } }\n}\n");
+        assert!(err.is_err(), "nesting a namespace must not parse");
+    }
+
+    #[test]
+    fn a_rag_block_parses_into_every_field() {
+        let src = r#"
+            model Ticket {
+              id    Int    @id @default(autoincrement())
+              title String
+              body  String
+              @@rag(fields: [title, body], template: "{title}", embedder: "e1", chunk_size: 500, chunk_overlap: 50, metadata: [status], distance: "l2")
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let rag = schema.models[0].rag.as_ref().expect("has rag");
+        assert_eq!(rag.fields, vec!["title", "body"]);
+        assert_eq!(rag.template.as_deref(), Some("{title}"));
+        assert_eq!(rag.embedder.as_deref(), Some("e1"));
+        assert_eq!(rag.chunk_size, Some(500));
+        assert_eq!(rag.chunk_overlap, Some(50));
+        assert_eq!(rag.metadata, vec!["status"]);
+        assert_eq!(rag.distance.as_deref(), Some("l2"));
+    }
+
+    #[test]
+    fn a_model_without_rag_has_none_and_an_unknown_rag_key_is_an_error() {
+        let plain = parse("model T {\n  id Int @id\n}\n").expect("parses");
+        assert!(plain.models[0].rag.is_none());
+
+        let bad = parse("model T {\n  id Int @id\n  @@rag(fyelds: [id])\n}\n");
+        assert!(bad.is_err());
+        assert!(bad.unwrap_err().0.contains("unknown @@rag option"));
+    }
+
+    #[test]
+    fn a_top_level_enum_resolves_the_field_that_uses_it() {
+        use crate::Field;
+        // The enum is declared *after* the model that uses it, to prove the
+        // resolution pass runs once the whole schema is known.
+        let src = r#"
+            model Order {
+              id     Int         @id @default(autoincrement())
+              status OrderStatus
+            }
+
+            enum OrderStatus { pending paid shipped }
+        "#;
+        let schema = parse(src).expect("parses");
+        assert_eq!(schema.enums.len(), 1);
+        assert_eq!(schema.enums[0].name, "OrderStatus");
+        assert_eq!(schema.enums[0].variants, vec!["pending", "paid", "shipped"]);
+        // The `status` field is an enum field, not a relation.
+        let status = &schema.models[0].fields[1];
+        match status {
+            Field::Enum(e) => {
+                assert_eq!(e.name, "status");
+                assert_eq!(e.column, "status");
+                assert_eq!(e.enum_name, "OrderStatus");
+                assert!(!e.nullable);
+            }
+            other => panic!("expected Field::Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nullable_enum_field_keeps_its_nullability() {
+        use crate::Field;
+        let src = r#"
+            enum OrderStatus { pending paid }
+            model Order {
+              id     Int          @id @default(autoincrement())
+              status OrderStatus? @map("order_status")
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        match &schema.models[0].fields[1] {
+            Field::Enum(e) => {
+                assert!(e.nullable);
+                assert_eq!(e.column, "order_status");
+            }
+            other => panic!("expected Field::Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_double_at_attribute_is_still_ignored() {
+        // `@@index` is not modelled; it must parse (and be dropped) as before.
+        let schema = parse("model T {\n  id Int @id\n  name String\n  @@index([name])\n}\n")
+            .expect("parses");
+        assert!(schema.models[0].rag.is_none());
+        assert_eq!(schema.models[0].fields.len(), 2);
+    }
 }

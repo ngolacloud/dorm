@@ -12,13 +12,72 @@ use std::marker::PhantomData;
 use crate::compiler::{self, Plan, Sql};
 use crate::error::{Error, Result};
 use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, Q};
-use crate::model::{run_execute, run_query, Model, NewRow};
+use crate::model::{insert_returning, run_execute, run_query, Model, NewRow};
 use crate::row::Row;
 use crate::value::{read_column, ToValue, Value};
-use crate::{db, registry};
+use crate::{cursor, db, registry, scope};
 
 /// One row of a `values()` query: column name to value, in a stable order.
 pub type ValueRow = BTreeMap<String, Value>;
+
+/// One page of a keyset-paginated query (ADR 0024): the rows, and an opaque
+/// signed cursor for the next page — `None` when this page was not full, i.e. the
+/// end was reached.
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next: Option<String>,
+}
+
+/// A stable fingerprint of the query a cursor belongs to (model, ordering,
+/// filters) — **not** including the keyset state or limit, so the cursor minted
+/// by one page validates on the next. A cursor whose fingerprint does not match is
+/// refused by [`cursor::decode`].
+fn keyset_fingerprint(plan: &Plan) -> String {
+    let order: Vec<String> = if plan.order.is_empty() {
+        plan.model
+            .ordering
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        plan.order
+            .iter()
+            .map(|t| format!("{}{}", if t.descending { "-" } else { "" }, t.path))
+            .collect()
+    };
+    format!(
+        "m={};o={};f={:?};x={:?}",
+        plan.model.name,
+        order.join(","),
+        plan.filters,
+        plan.excludes
+    )
+}
+
+/// The ordering-key values of `row`, in effective-order order (the order terms,
+/// then the primary key) — what the next page's cursor encodes. Keyset keys must
+/// be direct columns of the model, so each is read at its own position in the
+/// select list (which is the model's field order).
+fn keyset_boundary(plan: &Plan, row: &Row) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for term in plan.effective_order() {
+        let (idx, field) = plan
+            .model
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.name == term.path)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "keyset pagination orders by `{}`, which is not a direct column of `{}`",
+                    term.path, plan.model.name
+                ))
+            })?;
+        out.push(read_column(row, idx, field.ty, field.column)?);
+    }
+    Ok(out)
+}
 
 /// The entry point for a model — `Tenant::objects()`.
 #[derive(Debug)]
@@ -132,29 +191,59 @@ impl<T: Model> Manager<T> {
     pub async fn create<N: NewRow<T>>(&self, new: N) -> Result<T> {
         db::guard_write("create")?;
         let values = new.column_values();
-        let sql =
-            compiler::compile_insert_on(T::meta(), std::slice::from_ref(&values), db::dialect())?;
-        let rows = run_query(&sql).await?;
+        let batch = std::slice::from_ref(&values);
+        let sql = scope::compile_insert(T::meta(), batch)?;
+        let rows = insert_returning(T::meta(), &sql, batch).await?;
         let row = rows.first().ok_or_else(|| {
             Error::Db("the insert returned no row, so the new key is unknown".into())
         })?;
         T::from_row(row, 0)
     }
 
-    /// Insert many rows in one statement.
+    /// Insert many rows, chunked to stay under the wire protocol's parameter
+    /// limit.
     ///
-    /// One statement, not a loop: the round trips are what makes a per-row loop
-    /// slow, and a single `INSERT … VALUES (…), (…)` is also one transaction
-    /// without needing an explicit one.
+    /// One `INSERT … VALUES (…), (…)` per chunk, not a per-row loop: the round
+    /// trips are what make a loop slow. But a single statement carries at most
+    /// **65 535 bound parameters** (the protocol's `u16` parameter count), and a
+    /// row contributes one parameter per column, so one statement tops out at
+    /// `floor(65535 / columns)` rows — past that `tokio-postgres` overflows and
+    /// the insert fails outright. We chunk at that ceiling. When the rows fit in
+    /// a single chunk (the common case) the statement is its own transaction, as
+    /// before; when they span several chunks we wrap them in one `atomic` so the
+    /// call stays all-or-nothing.
     pub async fn bulk_create<N: NewRow<T>>(&self, rows: Vec<N>) -> Result<Vec<T>> {
         db::guard_write("bulk_create")?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
         let values: Vec<Vec<(String, Value)>> = rows.iter().map(NewRow::column_values).collect();
-        let sql = compiler::compile_insert_on(T::meta(), &values, db::dialect())?;
-        let returned = run_query(&sql).await?;
-        returned.iter().map(|r| T::from_row(r, 0)).collect()
+        let cols = values[0].len().max(1);
+        let per_chunk = (65_535 / cols).max(1);
+
+        // Single chunk: one statement. On a RETURNING backend that is its own
+        // implicit transaction, as before; on MySQL `insert_returning` wraps the
+        // insert-then-reload in one `atomic` so the two share a connection.
+        if values.len() <= per_chunk {
+            let sql = scope::compile_insert(T::meta(), &values)?;
+            let returned = insert_returning(T::meta(), &sql, &values).await?;
+            return returned.iter().map(|r| T::from_row(r, 0)).collect();
+        }
+
+        // Several chunks: one statement each, all in one transaction. On MySQL
+        // each chunk's `insert_returning` nests as a savepoint within it.
+        db::atomic(|_tx| async move {
+            let mut out = Vec::with_capacity(values.len());
+            for chunk in values.chunks(per_chunk) {
+                let sql = scope::compile_insert(T::meta(), chunk)?;
+                let returned = insert_returning(T::meta(), &sql, chunk).await?;
+                for r in &returned {
+                    out.push(T::from_row(r, 0)?);
+                }
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Fetch the row matching `lookup`, inserting `new` if there is none.
@@ -166,11 +255,14 @@ impl<T: Model> Manager<T> {
         if let Some(found) = QuerySet::<T>::new().filter(lookup.clone()).first().await? {
             return Ok((found, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: the row the other caller inserted is the right
-                // answer, and reporting `created = false` is accurate.
+                // answer, and reporting `created = false` is accurate. The insert
+                // ran inside its own savepoint (`create_savepointed`), so the
+                // unique violation rolled back only that attempt — this recovery
+                // read runs on a transaction that is still usable.
                 let found = QuerySet::<T>::new()
                     .filter(lookup)
                     .first()
@@ -180,6 +272,25 @@ impl<T: Model> Manager<T> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Insert `new` so that a unique violation rolls back only its own attempt,
+    /// never a transaction the caller may already be inside.
+    ///
+    /// The bug this closes: `get_or_create`/`update_or_create` run
+    /// `SELECT → INSERT → SELECT`. When the caller wraps the whole thing in
+    /// [`db::atomic`], all three share one dedicated
+    /// connection. A bare `INSERT` that loses the race fails with `23505` and
+    /// **aborts that transaction**, so the recovery `SELECT` comes back with
+    /// `25P02 current transaction is aborted` instead of the winner's row — the
+    /// promised idempotence is false inside a transaction.
+    ///
+    /// Wrapping the insert in a nested `atomic` makes it a `SAVEPOINT` when there
+    /// is an outer transaction: the `23505` only does `ROLLBACK TO SAVEPOINT`,
+    /// leaving the outer transaction usable for the recovery read. With no outer
+    /// transaction it is a trivial `BEGIN`/`COMMIT` around the single insert.
+    async fn create_savepointed<N: NewRow<T>>(&self, new: N) -> Result<T> {
+        db::atomic(|_tx| async move { self.create(new).await }).await
     }
 
     /// Fetch the row matching `lookup` and apply `updates` to it, or insert `new`
@@ -205,10 +316,12 @@ impl<T: Model> Manager<T> {
         {
             return Ok((self.apply_and_fetch(lookup, updates).await?, false));
         }
-        match self.create(new).await {
+        match self.create_savepointed(new).await {
             Ok(created) => Ok((created, true)),
             Err(e) if crate::error::is_unique_violation(&e) => {
                 // Lost the race: update the row the winner inserted and return it.
+                // The insert ran in its own savepoint, so the outer transaction
+                // (if any) survives the unique violation and this update can run.
                 Ok((self.apply_and_fetch(lookup, updates).await?, false))
             }
             Err(e) => Err(e),
@@ -357,7 +470,11 @@ impl<T: Model> QuerySet<T> {
         self
     }
 
-    /// The SQL this query would run, for `--sql` and for tests.
+    /// The SQL this query would run, as a **preview** — the plan as built, before
+    /// tenant scoping. Kept pure (and so deterministic for snapshot tests): the
+    /// ambient tenant is not read here, where no rows are returned. The execution
+    /// terminals (`all`, `rows`, `count`, `update`, …) apply the tenant predicate;
+    /// this shows the base query a `--sql` preview is asking to see.
     pub fn sql(&self) -> Result<Sql> {
         compiler::compile_select(&self.plan)
     }
@@ -369,7 +486,7 @@ impl<T: Model> QuerySet<T> {
                 "this query was projected with values(); call rows() instead of all()".into(),
             ));
         }
-        let sql = compiler::compile_select_on(&self.plan, db::dialect())?;
+        let sql = scope::compile_select(&self.plan)?;
         let rows = run_query(&sql).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -451,7 +568,7 @@ impl<T: Model> QuerySet<T> {
 
     /// How many rows match.
     pub async fn count(self) -> Result<i64> {
-        let sql = compiler::compile_count_on(&self.plan, db::dialect())?;
+        let sql = scope::compile_count(&self.plan)?;
         let rows = run_query(&sql).await?;
         let row = rows
             .first()
@@ -465,7 +582,7 @@ impl<T: Model> QuerySet<T> {
 
     /// Whether anything matches, without counting.
     pub async fn exists(self) -> Result<bool> {
-        let sql = compiler::compile_exists_on(&self.plan, db::dialect())?;
+        let sql = scope::compile_exists(&self.plan)?;
         let rows = run_query(&sql).await?;
         let row = rows
             .first()
@@ -479,22 +596,87 @@ impl<T: Model> QuerySet<T> {
 
     /// Rows as name-to-value maps. The counterpart of `values()`.
     pub async fn rows(self) -> Result<Vec<ValueRow>> {
-        let sql = compiler::compile_select_on(&self.plan, db::dialect())?;
+        let sql = scope::compile_select(&self.plan)?;
         let rows = run_query(&sql).await?;
         decode(&sql, &rows)
+    }
+
+    /// Continue a keyset-paginated query from `cursor` (ADR 0024) — the opaque
+    /// token [`Page::next`] handed back. The cursor is verified against this
+    /// query's fingerprint, so one minted for a different query (different
+    /// ordering or filters) is refused rather than paging the wrong rows.
+    pub fn after(mut self, cursor: &str) -> Result<Self> {
+        let boundary = cursor::decode(&keyset_fingerprint(&self.plan), cursor)?;
+        self.plan.keyset = Some(boundary);
+        Ok(self)
+    }
+
+    /// Fetch one keyset page of `size` rows in a single query — no `OFFSET`, so
+    /// the cost is constant however deep the pagination goes (ADR 0024). The
+    /// ordering is made total by a primary-key tiebreak; [`Page::next`] carries a
+    /// signed cursor for the following page, or `None` at the end.
+    ///
+    /// Start with no `after`; continue with [`after`](Self::after).
+    pub async fn fetch_page(mut self, size: i64) -> Result<Page<T>> {
+        if !self.plan.values.is_empty() {
+            return Err(Error::Config(
+                "fetch_page() returns models; do not combine it with values()".into(),
+            ));
+        }
+        if size <= 0 {
+            return Err(Error::Config("page size must be positive".into()));
+        }
+        self.plan.paginate = true;
+        self.plan.limit = Some(size);
+        self.plan.offset = None;
+
+        let sql = scope::compile_select(&self.plan)?;
+        let rows = run_query(&sql).await?;
+
+        // Decode each row to a model, attaching any `select_related` parents just
+        // as `all()` does.
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut obj = T::from_row(row, 0)?;
+            let mut offset = T::meta().fields.len();
+            for rel in &self.plan.select_related {
+                obj.attach_related(rel, row, offset)?;
+                let field = T::meta().field(rel).ok_or_else(|| Error::UnknownField {
+                    model: T::meta().name.to_string(),
+                    field: rel.clone(),
+                })?;
+                let relation = field.relation.ok_or_else(|| Error::NotARelation {
+                    path: rel.clone(),
+                    segment: rel.clone(),
+                })?;
+                offset += registry::model(relation.model)?.fields.len();
+            }
+            items.push(obj);
+        }
+
+        // A full page means there may be more: mint the next cursor from the last
+        // row's ordering-key values. A short page is the end.
+        let next = if rows.len() as i64 == size {
+            let last = rows.last().expect("a full page has a last row");
+            let boundary = keyset_boundary(&self.plan, last)?;
+            Some(cursor::encode(&keyset_fingerprint(&self.plan), &boundary)?)
+        } else {
+            None
+        };
+        Ok(Page { items, next })
     }
 
     /// Apply a set of assignments to every matching row.
     pub async fn update(self, assignments: Vec<Assignment>) -> Result<u64> {
         db::guard_write("update")?;
-        let sql = compiler::compile_update_on(&self.plan, &assignments, db::dialect())?;
+        let sql = scope::compile_update(&self.plan, &assignments)?;
         run_execute(&sql).await
     }
 
     /// Delete every matching row.
     pub async fn delete(self) -> Result<u64> {
         db::guard_write("delete")?;
-        let sql = compiler::compile_delete_on(&self.plan, db::dialect())?;
+        let sql = scope::compile_delete(&self.plan)?;
         run_execute(&sql).await
     }
 
@@ -505,7 +687,7 @@ impl<T: Model> QuerySet<T> {
                 "aggregate() was given nothing to compute".into(),
             ));
         }
-        let sql = compiler::compile_aggregate_on(&self.plan, &aggregates, db::dialect())?;
+        let sql = scope::compile_aggregate(&self.plan, &aggregates)?;
         let rows = run_query(&sql).await?;
         let mut decoded = decode(&sql, &rows)?;
         // An aggregate with no GROUP BY always returns exactly one row.
@@ -531,7 +713,7 @@ impl<T: Model> QuerySet<T> {
 /// is unchanged: every identifier in the plan still came from the registry, and
 /// every value is still a bound parameter.
 pub async fn fetch_value_rows(plan: &Plan) -> Result<Vec<ValueRow>> {
-    let sql = compiler::compile_select_on(plan, db::dialect())?;
+    let sql = scope::compile_select(plan)?;
     let rows = run_query(&sql).await?;
     decode(&sql, &rows)
 }
@@ -550,8 +732,8 @@ pub async fn insert_value_rows(
     rows: &[Vec<(String, Value)>],
 ) -> Result<Vec<ValueRow>> {
     db::guard_write("insert")?;
-    let sql = compiler::compile_insert_on(meta, rows, db::dialect())?;
-    let returned = run_query(&sql).await?;
+    let sql = scope::compile_insert(meta, rows)?;
+    let returned = insert_returning(meta, &sql, rows).await?;
     decode(&sql, &returned)
 }
 
@@ -559,14 +741,14 @@ pub async fn insert_value_rows(
 /// of rows changed.
 pub async fn update_value_rows(plan: &Plan, assignments: &[Assignment]) -> Result<u64> {
     db::guard_write("update")?;
-    let sql = compiler::compile_update_on(plan, assignments, db::dialect())?;
+    let sql = scope::compile_update(plan, assignments)?;
     run_execute(&sql).await
 }
 
 /// Delete the rows `plan` selects; returns the number removed.
 pub async fn delete_value_rows(plan: &Plan) -> Result<u64> {
     db::guard_write("delete")?;
-    let sql = compiler::compile_delete_on(plan, db::dialect())?;
+    let sql = scope::compile_delete(plan)?;
     run_execute(&sql).await
 }
 

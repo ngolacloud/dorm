@@ -45,17 +45,36 @@ mod codegen_api;
 mod format;
 mod lexer;
 mod parser;
+mod validate;
 
 pub use codegen::generate_rust;
 pub use codegen_api::generate_axum;
 pub use format::format;
 pub use parser::{parse, ParseError};
+pub use validate::{validate, Issue, Severity};
 
 /// A parsed `dorm.schema`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub datasource: Option<Datasource>,
     pub models: Vec<Model>,
+    /// Top-level `enum` blocks (ADR 0047). A model field typed as one of these
+    /// becomes a [`Field::Enum`], compiled to a native database enum (ADR 0046).
+    pub enums: Vec<EnumDecl>,
+}
+
+/// A top-level `enum Name { v1 v2 … }` block (ADR 0047).
+///
+/// It declares a named set of string variants. A `String`-shaped field typed as
+/// the enum (`status OrderStatus`) is compiled by [`generate_rust`] into the
+/// native `#[field(enum_type = …, enum_variants = …)]` the `Model` derive turns
+/// into a `CREATE TYPE … AS ENUM` (ADR 0046).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDecl {
+    /// The schema name, e.g. `OrderStatus` (snake_cased to the SQL type name).
+    pub name: String,
+    /// The variants, in declaration order, spelled exactly as written.
+    pub variants: Vec<String>,
 }
 
 /// The `datasource` block. Only `provider` and `url` are read today.
@@ -78,9 +97,49 @@ pub enum Url {
 pub struct Model {
     /// The Rust type name, e.g. `Tenant`.
     pub name: String,
+    /// The PostgreSQL schema (`namespace`) this model belongs to, or `None` for a
+    /// top-level model (ADR: namespaces, DORM-B2). The namespace — not the file —
+    /// is a model's identity: moving a `namespace` block between files changes
+    /// nothing. A relation may not cross namespaces; [`validate()`] enforces that
+    /// boundary.
+    pub namespace: Option<String>,
     /// The table, defaulting to the snake_case plural of `name`.
     pub table: String,
     pub fields: Vec<Field>,
+    /// The `@@rag(..)` block, when the model opts into RAG (ADR 0019). `None`
+    /// for an ordinary model — and a schema with no `@@rag` anywhere generates
+    /// byte-for-byte what it did before, pulling in no `dorm-rag` dependency.
+    pub rag: Option<RagBlock>,
+    /// `@@unique([a, b])` groups — composite-unique constraints (ADR 0043).
+    pub unique_together: Vec<Vec<String>>,
+    /// `@@id([a, b])` — the composite primary key's columns, empty for a simple
+    /// or absent key (ADR 0043).
+    pub composite_id: Vec<String>,
+    /// `@@index([a, b])` groups — composite indexes (ADR 0044).
+    pub indexes: Vec<Vec<String>>,
+}
+
+/// A model's `@@rag(..)` declaration, parsed from the schema.
+///
+/// Compiled by [`generate_rust`] into `#[derive(Rag)]` + `#[rag(..)]` and checked
+/// by [`validate()`]. The field names are the schema spellings; the generator
+/// snake_cases them to match the generated Rust fields and columns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RagBlock {
+    /// The source fields to embed (`fields: [title, body]`).
+    pub fields: Vec<String>,
+    /// The document template (`template: "{title}\n\n{body}"`), if given.
+    pub template: Option<String>,
+    /// The embedder id (`embedder: "default"`), if given.
+    pub embedder: Option<String>,
+    /// `chunk_size: 800`, if given.
+    pub chunk_size: Option<u32>,
+    /// `chunk_overlap: 100`, if given.
+    pub chunk_overlap: Option<u32>,
+    /// Filterable metadata columns (`metadata: [status]`).
+    pub metadata: Vec<String>,
+    /// `distance: "cosine"`, if given.
+    pub distance: Option<String>,
 }
 
 impl Model {
@@ -105,6 +164,21 @@ pub enum Field {
         name: String,
         target: String,
     },
+    /// A field typed as a top-level `enum` (ADR 0047): a `String` column backed
+    /// by a native database enum (ADR 0046). Produced by the parser's resolution
+    /// pass from a field whose declared type names a declared `enum`.
+    Enum(EnumField),
+}
+
+/// A model field typed as a top-level `enum` (ADR 0047).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumField {
+    /// The schema field name (Rust field and column are its snake_case form).
+    pub name: String,
+    pub column: String,
+    /// The name of the referenced [`EnumDecl`], e.g. `OrderStatus`.
+    pub enum_name: String,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,10 +219,22 @@ pub enum Scalar {
     Decimal,
     Json,
     Uuid,
+    /// A host address, `INET` (ADR 0040). PostgreSQL only.
+    Inet,
+    /// A network block, `CIDR` (ADR 0048). PostgreSQL only.
+    Cidr,
+    /// A MAC address, `MACADDR` (ADR 0048). PostgreSQL only.
+    MacAddr,
 }
 
 impl Scalar {
     /// The Rust type the column decodes as.
+    ///
+    /// Fully-qualified for the network types so the generated file needs no new
+    /// `use`: the `Model` derive infers the `FieldType` from the path's last
+    /// segment (`IpAddr`→INET, `IpCidr`→CIDR, `MacAddress`→MACADDR), so these
+    /// resolve with no import even though a project that uses them must depend on
+    /// the `cidr`/`eui48` crates (as a `Decimal` project depends on `rust_decimal`).
     pub fn rust_type(self) -> &'static str {
         match self {
             Scalar::Int => "i32",
@@ -159,6 +245,9 @@ impl Scalar {
             Scalar::Decimal => "Decimal",
             Scalar::Json => "serde_json::Value",
             Scalar::Uuid => "uuid::Uuid",
+            Scalar::Inet => "std::net::IpAddr",
+            Scalar::Cidr => "cidr::IpCidr",
+            Scalar::MacAddr => "eui48::MacAddress",
         }
     }
 
@@ -172,6 +261,9 @@ impl Scalar {
             "Decimal" => Scalar::Decimal,
             "Json" => Scalar::Json,
             "Uuid" => Scalar::Uuid,
+            "Inet" => Scalar::Inet,
+            "Cidr" => Scalar::Cidr,
+            "MacAddr" => Scalar::MacAddr,
             _ => return None,
         })
     }

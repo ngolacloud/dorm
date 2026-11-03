@@ -56,6 +56,18 @@ use dorm_core::value::FieldType;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub tables: Vec<Table>,
+    /// Native enum types the models declare (ADR 0046/0053). `#[serde(default)]`
+    /// so a snapshot written before enums existed still deserialises.
+    #[serde(default)]
+    pub enum_types: Vec<EnumType>,
+}
+
+/// One native enum type in a [`Snapshot`] — its name and ordered labels. A new
+/// type is a `CREATE TYPE`; a type that gained labels is `ALTER TYPE … ADD VALUE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumType {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 /// One table in a [`Snapshot`].
@@ -100,6 +112,13 @@ impl Snapshot {
     pub fn from_models(models: &[&'static ModelMeta]) -> Self {
         Snapshot {
             tables: models.iter().map(|m| table_of(m)).collect(),
+            enum_types: dorm_core::meta::enum_types_of(models)
+                .into_iter()
+                .map(|(name, variants)| EnumType {
+                    name: name.to_string(),
+                    variants: variants.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -138,12 +157,22 @@ fn type_tag(ty: FieldType) -> &'static str {
     match ty {
         FieldType::I32 => "i32",
         FieldType::I64 => "i64",
+        FieldType::F64 => "f64",
         FieldType::Text => "text",
         FieldType::Bool => "bool",
         FieldType::Decimal => "decimal",
         FieldType::Timestamp => "timestamp",
+        FieldType::Inet => "inet",
+        FieldType::TextArray => "text[]",
+        FieldType::IntArray => "bigint[]",
         FieldType::Uuid => "uuid",
         FieldType::Json => "json",
+        FieldType::Bytes => "bytes",
+        FieldType::Cidr => "cidr",
+        FieldType::MacAddr => "macaddr",
+        // The enum type's own name is its tag — a change of type is a change of
+        // this string (ADR 0046).
+        FieldType::Enum(name) => name,
     }
 }
 
@@ -174,6 +203,37 @@ pub fn autodetect(
     models: &[&'static ModelMeta],
     backend: Backend,
 ) -> Result<Vec<String>> {
+    autodetect_with_renames(previous, models, backend, &[])
+}
+
+/// A column rename declared by the migration author (B-24).
+///
+/// Without it, a column that changed name reads as a drop of the old column plus
+/// an add of the new one — and the data in the old column is lost. Because a
+/// rename cannot be inferred safely (two unrelated drop+add pairs look the same),
+/// the author declares it, exactly as Django's `makemigrations` prompts for it;
+/// the autodetector then emits `ALTER TABLE … RENAME COLUMN`, which preserves the
+/// data, and treats the column as matched by its new name for the rest of the
+/// diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRename {
+    /// The table (not the model) the column belongs to.
+    pub table: String,
+    /// The column's name in the previous snapshot.
+    pub from: String,
+    /// The column's name in the current models.
+    pub to: String,
+}
+
+/// Like [`autodetect`], with a set of author-declared column renames applied
+/// before the diff — so a renamed column is a data-preserving `RENAME COLUMN`
+/// instead of a drop-then-add (B-24).
+pub fn autodetect_with_renames(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Vec<String>> {
     let current = Snapshot::from_models(models);
     let prev_tables: BTreeMap<&str, &Table> = previous
         .tables
@@ -185,15 +245,40 @@ pub fn autodetect(
 
     let mut b = Buckets::default();
 
+    // Enum types the models declare, diffed against the snapshot: a new type is a
+    // `CREATE TYPE`, a type that gained labels is `ALTER TYPE … ADD VALUE`
+    // (ADR 0046/0053). Postgres-only — SQLite/MySQL store the column as TEXT.
+    b.enum_ddl
+        .extend(enum_type_ddl(previous, &current, backend));
+
     // Tables the models declare: new ones get a full CREATE; existing ones get a
-    // column-, index- and alteration-level diff.
+    // column-, index- and alteration-level diff — after any renames for that
+    // table are applied to the previous snapshot.
     for (cur_table, meta) in current.tables.iter().zip(models.iter()) {
         match prev_tables.get(cur_table.name.as_str()) {
             None => {
                 b.creates.push(ddl::create_table_on(meta, backend)?);
                 b.creates.extend(ddl::indexes(meta));
             }
-            Some(prev) => diff_table(prev, cur_table, meta, backend, &mut b)?,
+            Some(prev) => {
+                let table_renames: Vec<&ColumnRename> = renames
+                    .iter()
+                    .filter(|r| r.table == cur_table.name)
+                    .collect();
+                if table_renames.is_empty() {
+                    diff_table(prev, cur_table, meta, backend, &mut b)?;
+                } else {
+                    let renamed_prev = apply_renames(prev, cur_table, &table_renames)?;
+                    // The `RENAME COLUMN`s run first, so the rest of the diff
+                    // (alters, adds, drops, the SQLite rebuild) sees the column
+                    // under its new name and matches it instead of dropping it.
+                    for r in &table_renames {
+                        b.renames
+                            .push(ddl::rename_column(&cur_table.name, &r.from, &r.to));
+                    }
+                    diff_table(&renamed_prev, cur_table, meta, backend, &mut b)?;
+                }
+            }
         }
     }
 
@@ -207,10 +292,224 @@ pub fn autodetect(
     Ok(b.into_ordered())
 }
 
+/// The forward enum DDL between two snapshots (ADR 0046/0053): a `CREATE TYPE`
+/// (idempotent `DO`-block guard) for each type new in `current`, and an
+/// `ALTER TYPE … ADD VALUE IF NOT EXISTS` for each label a kept type gained. Empty
+/// off PostgreSQL. `ADD VALUE` runs fine inside the migration transaction on
+/// PostgreSQL 12+ as long as the new label is not *used* in the same migration,
+/// which a schema migration never does.
+fn enum_type_ddl(previous: &Snapshot, current: &Snapshot, backend: Backend) -> Vec<String> {
+    if backend != Backend::Postgres {
+        return Vec::new();
+    }
+    let prev: BTreeMap<&str, &EnumType> = previous
+        .enum_types
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let mut out = Vec::new();
+    for e in &current.enum_types {
+        match prev.get(e.name.as_str()) {
+            None => {
+                let labels = e
+                    .variants
+                    .iter()
+                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push(format!(
+                    "DO $$ BEGIN \
+                     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN \
+                     CREATE TYPE {} AS ENUM ({labels}); \
+                     END IF; END $$",
+                    e.name, e.name
+                ));
+            }
+            Some(old) => {
+                for v in &e.variants {
+                    if !old.variants.contains(v) {
+                        let label = v.replace('\'', "''");
+                        out.push(format!(
+                            "ALTER TYPE {} ADD VALUE IF NOT EXISTS '{label}'",
+                            e.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The inverse of the migration [`autodetect_with_renames`] produces — the
+/// statements that undo it — or **empty when the change is not losslessly
+/// reversible**. A drop (table or column), a type change, or a removed index
+/// cannot be undone without the data or definition it discarded, so rather than
+/// fabricate a wrong inverse DORM records no `down` and [`revert`](crate::revert)
+/// refuses to cross it. An additive change — new tables, columns, indexes,
+/// renames — is inverted by dropping what it added and renaming back what it
+/// renamed, computed from the two snapshots directly.
+pub fn down_for(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Vec<String>> {
+    let current = Snapshot::from_models(models);
+    let cur_tables: BTreeMap<&str, &Table> = current
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+
+    // Reversibility: every previous table and column (under its post-rename name)
+    // must still be present and unchanged. A removal or alteration anywhere makes
+    // the whole migration irreversible — there is no partial `down`.
+    for prev in &previous.tables {
+        let Some(cur) = cur_tables.get(prev.name.as_str()) else {
+            return Ok(Vec::new()); // a table the models dropped
+        };
+        let prev_cols = renamed(prev, cur, prev.name.as_str(), renames)?;
+        let cur_by_name: BTreeMap<&str, &Column> =
+            cur.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        for pc in &prev_cols.columns {
+            match cur_by_name.get(pc.name.as_str()) {
+                None => return Ok(Vec::new()), // dropped column
+                Some(cc) if !same_except_index(pc, cc) => return Ok(Vec::new()), // altered
+                Some(cc) if pc.index && !cc.index => return Ok(Vec::new()), // dropped index
+                _ => {}
+            }
+        }
+    }
+
+    // An enum that gained a label is irreversible (PostgreSQL has no way to remove
+    // an enum value), so the whole migration has no `down` — like an altered column.
+    let prev_enums: BTreeMap<&str, &EnumType> = previous
+        .enum_types
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    if backend == Backend::Postgres {
+        for e in &current.enum_types {
+            if let Some(old) = prev_enums.get(e.name.as_str()) {
+                if e.variants.iter().any(|v| !old.variants.contains(v)) {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+
+    // Purely additive: invert it.
+    let prev_tables: BTreeMap<&str, &Table> = previous
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    let (mut drop_tables, mut drop_cols, mut drop_idx) = (Vec::new(), Vec::new(), Vec::new());
+    for cur in &current.tables {
+        match prev_tables.get(cur.name.as_str()) {
+            None => drop_tables.push(ddl::drop_table(&cur.name)), // a new table
+            Some(prev) => {
+                let prev_cols = renamed(prev, cur, cur.name.as_str(), renames)?;
+                let prev_by_name: BTreeMap<&str, &Column> = prev_cols
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c))
+                    .collect();
+                for cc in &cur.columns {
+                    match prev_by_name.get(cc.name.as_str()) {
+                        None => drop_cols.push(ddl::drop_column(&cur.name, &cc.name, backend)),
+                        // An index added to a column that already existed; a
+                        // brand-new column's index goes with the column it drops.
+                        Some(pc) if cc.index && !pc.index => {
+                            drop_idx.push(ddl::drop_index(&cur.name, &cc.name))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    // Drop new tables child-first, mirroring the parent-first create order.
+    drop_tables.reverse();
+
+    // A type new in this migration is dropped on the way down — after the tables
+    // that referenced it are gone (Postgres only).
+    let drop_types: Vec<String> = if backend == Backend::Postgres {
+        current
+            .enum_types
+            .iter()
+            .filter(|e| !prev_enums.contains_key(e.name.as_str()))
+            .map(|e| format!("DROP TYPE IF EXISTS {}", e.name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Order mirrors the forward migration undone: added indexes, then columns,
+    // then tables, then the enum types, then the renames (which ran first on the
+    // way up, so last here).
+    let mut down = Vec::new();
+    down.extend(drop_idx);
+    down.extend(drop_cols);
+    down.extend(drop_tables);
+    down.extend(drop_types);
+    down.extend(
+        renames
+            .iter()
+            .map(|r| ddl::rename_column(&r.table, &r.to, &r.from)),
+    );
+    Ok(down)
+}
+
+/// `prev`'s columns under their post-rename names for `table`, or `prev`
+/// unchanged when the table has no renames. A thin wrapper over [`apply_renames`].
+fn renamed(prev: &Table, cur: &Table, table: &str, renames: &[ColumnRename]) -> Result<Table> {
+    let table_renames: Vec<&ColumnRename> = renames.iter().filter(|r| r.table == table).collect();
+    if table_renames.is_empty() {
+        Ok(prev.clone())
+    } else {
+        apply_renames(prev, cur, &table_renames)
+    }
+}
+
+/// Rewrite `prev`'s column names per the table's declared renames, returning a
+/// snapshot table the diff can compare under the new names. Each rename is
+/// validated: its source must exist in `prev` and its target in `cur`, or it is
+/// an [`Error::InvalidRename`] — a mistyped rename must fail loudly, never
+/// silently fall back to the data-losing drop+add.
+fn apply_renames(prev: &Table, cur: &Table, renames: &[&ColumnRename]) -> Result<Table> {
+    let mut out = prev.clone();
+    for r in renames {
+        if !prev.columns.iter().any(|c| c.name == r.from) {
+            return Err(Error::InvalidRename(format!(
+                "table `{}`: no column `{}` to rename from",
+                r.table, r.from
+            )));
+        }
+        if !cur.columns.iter().any(|c| c.name == r.to) {
+            return Err(Error::InvalidRename(format!(
+                "table `{}`: no column `{}` to rename to",
+                r.table, r.to
+            )));
+        }
+        for c in &mut out.columns {
+            if c.name == r.from {
+                c.name = r.to.clone();
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The statement buckets, kept apart so the whole migration can be emitted
 /// additive-before-destructive regardless of the order tables are visited in.
 #[derive(Default)]
 struct Buckets {
+    /// `CREATE TYPE`/`ALTER TYPE … ADD VALUE` — first, so a type exists before any
+    /// `CREATE TABLE` that references it (ADR 0046/0053).
+    enum_ddl: Vec<String>,
+    renames: Vec<String>,
     creates: Vec<String>,
     adds: Vec<String>,
     index_adds: Vec<String>,
@@ -223,7 +522,14 @@ struct Buckets {
 
 impl Buckets {
     fn into_ordered(self) -> Vec<String> {
-        let mut out = self.creates;
+        // Enum types first of all: a `CREATE TABLE` with an enum column needs the
+        // type to exist already.
+        let mut out = self.enum_ddl;
+        // Renames run next: the rest of the diff was computed against a snapshot
+        // already rewritten to the new names, so the database must carry them by
+        // the time an alter/add/drop/rebuild for that table runs.
+        out.extend(self.renames);
+        out.extend(self.creates);
         out.extend(self.adds);
         out.extend(self.index_adds);
         out.extend(self.pg_alters);
@@ -233,6 +539,49 @@ impl Buckets {
         out.extend(self.table_drops);
         out
     }
+}
+
+/// Refuse a same-type drop+add that could be an undeclared rename (B-24). A
+/// column dropped here alongside one added of the same type reads exactly like a
+/// rename; emitting DROP + ADD would silently lose the old column's data. A
+/// declared rename never reaches here (it is resolved upstream), so any such
+/// pair is undeclared — refuse and name the candidates. Types that differ are
+/// not rename candidates and pass through.
+fn refuse_ambiguous_rename(
+    prev: &Table,
+    cur: &Table,
+    prev_cols: &BTreeMap<&str, &Column>,
+    cur_cols: &BTreeMap<&str, &Column>,
+) -> Result<()> {
+    let dropped = prev
+        .columns
+        .iter()
+        .filter(|c| !cur_cols.contains_key(c.name.as_str()));
+    let added: Vec<&Column> = cur
+        .columns
+        .iter()
+        .filter(|c| !prev_cols.contains_key(c.name.as_str()))
+        .collect();
+
+    let mut pairs = Vec::new();
+    for d in dropped {
+        for a in &added {
+            if d.ty == a.ty {
+                pairs.push(format!("`{}` → `{}` ({})", d.name, a.name, d.ty));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    Err(Error::AmbiguousColumnChange(format!(
+        "table `{}`: dropping and adding columns of the same type looks like a \
+         rename and would lose data — {}. Declare the rename (a ColumnRename, or \
+         `@map` in the schema) to emit RENAME COLUMN instead; if the columns are \
+         unrelated, make the drop and the add in separate migrations.",
+        cur.name,
+        pairs.join(", ")
+    )))
 }
 
 /// Diff one table that exists in both the previous snapshot and the current
@@ -253,6 +602,16 @@ fn diff_table(
         cur.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let field_by_col: BTreeMap<&str, &FieldMeta> =
         meta.fields.iter().map(|f| (f.column, f)).collect();
+
+    // Data-loss guard (B-24): a column dropped here alongside a column added of
+    // the **same type** looks exactly like a rename, and emitting DROP + ADD
+    // would silently lose the old column's data. A declared rename is already
+    // resolved upstream (the previous snapshot was rewritten to the new name, so
+    // the column matches and is neither dropped nor added); so anything that
+    // reaches here as a same-type drop+add is an *undeclared* rename candidate.
+    // Refuse rather than guess — the SQLite rebuild would drop it too, since it
+    // only copies columns shared by name.
+    refuse_ambiguous_rename(prev, cur, &prev_cols, &cur_cols)?;
 
     // Columns present in both whose definition (ignoring the index flag) changed.
     let altered: Vec<(&Column, &Column)> = cur
@@ -477,14 +836,29 @@ pub fn make_migration(
     name: &str,
     backend: Backend,
 ) -> Result<Option<(Migration, Snapshot)>> {
-    let statements = autodetect(previous, models, backend)?;
+    make_migration_with_renames(previous, models, version, name, backend, &[])
+}
+
+/// Like [`make_migration`], with author-declared column renames (B-24) so a
+/// renamed column is a `RENAME COLUMN`, not a data-losing drop+add.
+pub fn make_migration_with_renames(
+    previous: &Snapshot,
+    models: &[&'static ModelMeta],
+    version: i64,
+    name: &str,
+    backend: Backend,
+    renames: &[ColumnRename],
+) -> Result<Option<(Migration, Snapshot)>> {
+    let statements = autodetect_with_renames(previous, models, backend, renames)?;
     if statements.is_empty() {
         return Ok(None);
     }
+    let down = down_for(previous, models, backend, renames)?;
     let migration = Migration {
         version,
         name: name.to_string(),
         statements,
+        down,
     };
     Ok(Some((migration, Snapshot::from_models(models))))
 }
@@ -892,5 +1266,256 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialise");
         let back: Snapshot = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(snap, back, "the snapshot survives a JSON round trip");
+    }
+
+    // ---- B-24: column rename detection ----
+
+    // `notes` with `title` renamed to `headline` (same type).
+    const HEADLINE: FieldMeta = col("headline", FieldType::Text);
+    const NOTE_RENAMED: &[FieldMeta] = &[ID, HEADLINE];
+    const NOTE_RENAMED_META: ModelMeta = ModelMeta {
+        name: "Note",
+        table: "notes",
+        fields: NOTE_RENAMED,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    fn rename(from: &str, to: &str) -> ColumnRename {
+        ColumnRename {
+            table: "notes".to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn without_a_hint_a_same_type_rename_is_refused_not_a_data_losing_drop_and_add() {
+        // title (TEXT) → headline (TEXT): same type, so a plain DROP+ADD would
+        // silently lose the data. B-24 refuses rather than guess.
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let err = autodetect(&prev, &[&NOTE_RENAMED_META], Backend::Postgres).unwrap_err();
+        assert!(
+            matches!(err, Error::AmbiguousColumnChange(_)),
+            "an undeclared same-type rename must be refused, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("headline"),
+            "the message names the candidate columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_different_type_drop_and_add_is_allowed_not_a_rename_candidate() {
+        // Drop `title` (TEXT) and add `count` (I64): different types, so it cannot
+        // be a rename — the plain DROP + ADD is emitted, not refused.
+        const COUNT: FieldMeta = col("count", FieldType::I64);
+        const FIELDS: &[FieldMeta] = &[ID, COUNT];
+        const META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: FIELDS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect(&prev, &[&META], Backend::Postgres).unwrap();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("ADD COLUMN") && s.contains("count")),
+            "the new column is added: {stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("DROP COLUMN") && s.contains("title")),
+            "the unrelated column is dropped: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn a_hinted_rename_is_a_data_preserving_rename_column_on_postgres() {
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Postgres,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"],
+            "a pure rename is exactly one RENAME COLUMN, no drop, no add"
+        );
+    }
+
+    #[test]
+    fn a_hinted_rename_works_on_sqlite_too() {
+        // SQLite ≥ 3.25 supports RENAME COLUMN, so a pure rename needs no rebuild.
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Sqlite,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert_eq!(
+            stmts,
+            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"]
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_source_is_missing_is_a_loud_error() {
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let err = autodetect_with_renames(
+            &prev,
+            &[&NOTE_RENAMED_META],
+            Backend::Postgres,
+            &[rename("nonexistent", "headline")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRename(_)),
+            "a mistyped rename must fail loudly, not fall back to drop+add: {err}"
+        );
+    }
+
+    #[test]
+    fn the_rename_runs_before_any_other_change_to_the_table() {
+        // `title` -> `headline` AND a new `body` column: the RENAME must come
+        // first so the later statements see the new name.
+        const BODY2: FieldMeta = col("body", FieldType::Text);
+        const RENAMED_PLUS_BODY: &[FieldMeta] = &[ID, HEADLINE, BODY2];
+        const META: ModelMeta = ModelMeta {
+            name: "Note",
+            table: "notes",
+            fields: RENAMED_PLUS_BODY,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let prev = Snapshot::from_models(&[&NOTE_V1_META]);
+        let stmts = autodetect_with_renames(
+            &prev,
+            &[&META],
+            Backend::Postgres,
+            &[rename("title", "headline")],
+        )
+        .unwrap();
+        assert!(
+            stmts[0].contains("RENAME COLUMN title TO headline"),
+            "{stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("ADD COLUMN") && s.contains("body")),
+            "the new column is still added: {stmts:?}"
+        );
+        assert!(
+            !stmts.iter().any(|s| s.contains("DROP COLUMN")),
+            "nothing is dropped — the rename replaced the drop: {stmts:?}"
+        );
+    }
+
+    // A model with a native enum column (ADR 0046/0053). The variants live in the
+    // `EnumMeta` slice, submitted here the way the derive does it.
+    dorm_core::inventory::submit! {
+        dorm_core::meta::EnumMeta { type_name: "ticket_status", variants: &["open", "closed", "archived"] }
+    }
+    const STATUS: FieldMeta = col("status", FieldType::Enum("ticket_status"));
+    const TICKET_FIELDS: &[FieldMeta] = &[ID, STATUS];
+    const TICKET_META: ModelMeta = ModelMeta {
+        name: "Ticket",
+        table: "tickets",
+        fields: TICKET_FIELDS,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    /// The snapshot `TICKET_META` gives, with its one enum type's variants trimmed
+    /// to the first `keep` — the state before the model grew the rest.
+    fn ticket_snapshot_with(keep: usize) -> Snapshot {
+        let mut s = Snapshot::from_models(&[&TICKET_META]);
+        s.enum_types[0].variants.truncate(keep);
+        s
+    }
+
+    #[test]
+    fn a_new_enum_type_is_created_before_its_table() {
+        let stmts = autodetect(&Snapshot::empty(), &[&TICKET_META], Backend::Postgres).unwrap();
+        let create_type = stmts
+            .iter()
+            .position(|s| {
+                s.contains("CREATE TYPE ticket_status AS ENUM ('open', 'closed', 'archived')")
+            })
+            .expect("a CREATE TYPE is emitted");
+        let create_table = stmts
+            .iter()
+            .position(|s| s.contains("CREATE TABLE") && s.contains("tickets"))
+            .expect("the table is created");
+        assert!(
+            create_type < create_table,
+            "the type must precede the table that uses it: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn a_grown_enum_emits_add_value_and_no_type_or_table_change() {
+        // Previous knew only {open, closed}; the model now declares a third label.
+        let prev = ticket_snapshot_with(2);
+        let stmts = autodetect(&prev, &[&TICKET_META], Backend::Postgres).unwrap();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s == "ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'archived'"),
+            "the added label is emitted: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| s.contains("CREATE TYPE") || s.contains("CREATE TABLE")),
+            "an existing type and table are not recreated: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn down_drops_a_newly_created_enum_type_but_a_grown_one_is_irreversible() {
+        // A fresh type is dropped on the way down, after its table.
+        let down = down_for(&Snapshot::empty(), &[&TICKET_META], Backend::Postgres, &[]).unwrap();
+        let drop_table = down
+            .iter()
+            .position(|s| s.contains("DROP TABLE") && s.contains("tickets"));
+        let drop_type = down
+            .iter()
+            .position(|s| s == "DROP TYPE IF EXISTS ticket_status");
+        assert!(
+            drop_table.is_some() && drop_type.is_some(),
+            "both drops present: {down:?}"
+        );
+        assert!(
+            drop_table < drop_type,
+            "the table is dropped before its type: {down:?}"
+        );
+
+        // Growing an enum has no inverse (PostgreSQL cannot remove a value).
+        let prev = ticket_snapshot_with(2);
+        let down = down_for(&prev, &[&TICKET_META], Backend::Postgres, &[]).unwrap();
+        assert!(
+            down.is_empty(),
+            "a grown enum makes the migration irreversible: {down:?}"
+        );
     }
 }

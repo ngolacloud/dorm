@@ -10,10 +10,13 @@
 //! accept a value typed by a human.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
+use cidr::IpCidr;
+use eui48::MacAddress;
 use rust_decimal::Decimal;
-use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+use tokio_postgres::types::{to_sql_checked, IsNull, Kind, ToSql, Type};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -27,12 +30,37 @@ use crate::error::{Error, Result};
 pub enum FieldType {
     I32,
     I64,
+    /// A 64-bit IEEE float (`DOUBLE PRECISION`/`REAL`). For money use
+    /// [`Decimal`](FieldType::Decimal): a float silently loses cents (ADR 0016).
+    F64,
     Text,
     Bool,
     Decimal,
     Timestamp,
     Uuid,
     Json,
+    /// Raw bytes (`BYTEA`/`BLOB`) — a hash, a key, a small binary blob.
+    Bytes,
+    /// An IP address, `INET` (PostgreSQL only). The IPAM building block: a host
+    /// address stored natively, with network-containment lookups (ADR 0040).
+    Inet,
+    /// `TEXT[]` — a text array (tags), with set lookups `@>`/`&&`/`<@` (ADR 0041).
+    TextArray,
+    /// `BIGINT[]` — an integer array (id lists), same set lookups (ADR 0041).
+    IntArray,
+    /// A native PostgreSQL `ENUM` type, named by its `&'static str` type name
+    /// (ADR 0046). The value travels as text — a `Value::Text` label — so `Value`
+    /// gains no variant; this only tells the DDL the column is `CREATE TYPE … AS
+    /// ENUM (…)` and that a read decodes as a string. SQLite/MySQL store it as
+    /// `TEXT`.
+    Enum(&'static str),
+    /// A network block, `CIDR` (PostgreSQL only) — `10.0.0.0/24`. The IPAM
+    /// companion to [`Inet`](FieldType::Inet): a host is `INET`, a subnet is
+    /// `CIDR`, and the same containment lookups span both (ADR 0048).
+    Cidr,
+    /// A MAC address, `MACADDR` (PostgreSQL only) — `08:00:2b:01:02:03`
+    /// (ADR 0048).
+    MacAddr,
 }
 
 impl FieldType {
@@ -41,6 +69,7 @@ impl FieldType {
         match self {
             FieldType::I32 => "INTEGER",
             FieldType::I64 => "BIGINT",
+            FieldType::F64 => "DOUBLE PRECISION",
             FieldType::Text => "TEXT",
             FieldType::Bool => "BOOLEAN",
             // NUMERIC without precision, on purpose: money columns get their
@@ -50,6 +79,14 @@ impl FieldType {
             FieldType::Timestamp => "TIMESTAMPTZ",
             FieldType::Uuid => "UUID",
             FieldType::Json => "JSONB",
+            FieldType::Bytes => "BYTEA",
+            FieldType::Inet => "INET",
+            FieldType::TextArray => "TEXT[]",
+            FieldType::IntArray => "BIGINT[]",
+            // The column's SQL type *is* the enum type's name.
+            FieldType::Enum(name) => name,
+            FieldType::Cidr => "CIDR",
+            FieldType::MacAddr => "MACADDR",
         }
     }
 
@@ -65,12 +102,20 @@ impl FieldType {
         match self {
             FieldType::I32 => "integer",
             FieldType::I64 => "bigint",
+            FieldType::F64 => "float",
             FieldType::Text => "text",
             FieldType::Bool => "boolean",
             FieldType::Decimal => "decimal",
             FieldType::Timestamp => "timestamp",
             FieldType::Uuid => "uuid",
             FieldType::Json => "json",
+            FieldType::Bytes => "bytes",
+            FieldType::Inet => "inet",
+            FieldType::TextArray => "text[]",
+            FieldType::IntArray => "bigint[]",
+            FieldType::Enum(name) => name,
+            FieldType::Cidr => "cidr",
+            FieldType::MacAddr => "macaddr",
         }
     }
 }
@@ -87,11 +132,18 @@ pub enum Value {
     Bool(bool),
     I32(i32),
     I64(i64),
+    F64(f64),
     Text(String),
     Decimal(Decimal),
     Timestamp(DateTime<Utc>),
     Uuid(Uuid),
     Json(serde_json::Value),
+    Bytes(Vec<u8>),
+    Inet(IpAddr),
+    Cidr(IpCidr),
+    MacAddr(MacAddress),
+    TextArray(Vec<String>),
+    IntArray(Vec<i64>),
 }
 
 impl Value {
@@ -103,11 +155,18 @@ impl Value {
             Value::Bool(_) => FieldType::Bool,
             Value::I32(_) => FieldType::I32,
             Value::I64(_) => FieldType::I64,
+            Value::F64(_) => FieldType::F64,
             Value::Text(_) => FieldType::Text,
             Value::Decimal(_) => FieldType::Decimal,
             Value::Timestamp(_) => FieldType::Timestamp,
             Value::Uuid(_) => FieldType::Uuid,
             Value::Json(_) => FieldType::Json,
+            Value::Bytes(_) => FieldType::Bytes,
+            Value::Inet(_) => FieldType::Inet,
+            Value::Cidr(_) => FieldType::Cidr,
+            Value::MacAddr(_) => FieldType::MacAddr,
+            Value::TextArray(_) => FieldType::TextArray,
+            Value::IntArray(_) => FieldType::IntArray,
         })
     }
 
@@ -121,6 +180,16 @@ impl Value {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Read this value as an `i64`, widening an `i32`. Used by the optimistic-lock
+    /// seam, whose version column may be `INTEGER` or `BIGINT` (ADR 0023).
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::I64(n) => Some(*n),
+            Value::I32(n) => Some(*n as i64),
             _ => None,
         }
     }
@@ -163,6 +232,31 @@ impl Value {
                 Value::Json(serde_json::from_str(&s).map_err(|_| mismatch("json"))?)
             }
 
+            // Numbers widen into a float (a REPL `1` or `19.99` into a `DOUBLE`
+            // column). The reverse is never implicit: a float into an integer or a
+            // decimal could lose information, so it stays an error.
+            (Value::I32(n), FieldType::F64) => Value::F64(f64::from(n)),
+            (Value::I64(n), FieldType::F64) => Value::F64(n as f64),
+            (Value::Text(s), FieldType::F64) => {
+                Value::F64(s.parse().map_err(|_| mismatch("float"))?)
+            }
+
+            // A host address typed as text in the REPL (`"10.0.0.1"`).
+            (Value::Text(s), FieldType::Inet) => {
+                Value::Inet(s.parse().map_err(|_| mismatch("inet address"))?)
+            }
+            // A subnet / MAC typed as text (`"10.0.0.0/24"`, `"08:00:2b:01:02:03"`).
+            (Value::Text(s), FieldType::Cidr) => {
+                Value::Cidr(s.parse().map_err(|_| mismatch("cidr network"))?)
+            }
+            (Value::Text(s), FieldType::MacAddr) => {
+                Value::MacAddr(s.parse().map_err(|_| mismatch("mac address"))?)
+            }
+
+            // An enum column takes its label as text; the database validates the
+            // label against the type's variants (ADR 0046).
+            (Value::Text(s), FieldType::Enum(_)) => Value::Text(s),
+
             (_, w) => return Err(mismatch(w.describe())),
         })
     }
@@ -178,11 +272,33 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::I32(n) => write!(f, "{n}"),
             Value::I64(n) => write!(f, "{n}"),
+            Value::F64(x) => write!(f, "{x}"),
             Value::Text(s) => f.write_str(s),
             Value::Decimal(d) => write!(f, "{d}"),
             Value::Timestamp(t) => write!(f, "{}", t.to_rfc3339()),
             Value::Uuid(u) => write!(f, "{u}"),
             Value::Json(j) => write!(f, "{j}"),
+            // A blob is shown `\x`-prefixed hex, PostgreSQL's own rendering, so a
+            // REPL cell is unambiguous and copy-pasteable rather than raw bytes.
+            Value::Bytes(b) => {
+                f.write_str("\\x")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+            Value::Inet(ip) => write!(f, "{ip}"),
+            Value::Cidr(c) => write!(f, "{c}"),
+            Value::MacAddr(m) => write!(f, "{}", m.to_hex_string()),
+            Value::TextArray(v) => write!(f, "{{{}}}", v.join(",")),
+            Value::IntArray(v) => write!(
+                f,
+                "{{{}}}",
+                v.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         }
     }
 }
@@ -197,22 +313,65 @@ impl ToSql for Value {
             // No type is named: the server infers it from where the placeholder
             // sits. Every path that could produce an untyped NULL in a bare
             // comparison compiles to `IS NULL` instead, so this stays unambiguous.
+            // Each arm delegates to the inner type's `to_sql_checked`, **not** its
+            // `to_sql`: `to_sql_checked` consults that type's own `accepts` first,
+            // so a variant bound where the server inferred an incompatible type
+            // (an `i64` into a `numeric`/`interval`/`pg_lsn` parameter) fails with a
+            // clean type error instead of writing the native bytes into the wrong
+            // type — the silent-corruption trap ADRs 0025/0030 worked around. The
+            // bare `to_sql` skips that check, which is exactly what let the bytes
+            // through.
             Value::Null => Ok(IsNull::Yes),
-            Value::Bool(v) => v.to_sql(ty, out),
-            Value::I32(v) => v.to_sql(ty, out),
-            Value::I64(v) => v.to_sql(ty, out),
-            Value::Text(v) => v.to_sql(ty, out),
-            Value::Decimal(v) => v.to_sql(ty, out),
-            Value::Timestamp(v) => v.to_sql(ty, out),
-            Value::Uuid(v) => v.to_sql(ty, out),
-            Value::Json(v) => v.to_sql(ty, out),
+            Value::Bool(v) => v.to_sql_checked(ty, out),
+            Value::I32(v) => v.to_sql_checked(ty, out),
+            Value::I64(v) => v.to_sql_checked(ty, out),
+            Value::F64(v) => v.to_sql_checked(ty, out),
+            // A native enum's binary wire format is simply its label as UTF-8.
+            // `String`'s own `accepts` rejects a custom enum type — its OID is not
+            // one of the built-ins it knows — so the label is written directly for
+            // an enum parameter; the database still rejects a label outside the
+            // type's variants (ADR 0046). Any other type keeps the checked path.
+            Value::Text(v) => {
+                if matches!(ty.kind(), Kind::Enum(_)) {
+                    out.extend_from_slice(v.as_bytes());
+                    Ok(IsNull::No)
+                } else {
+                    v.to_sql_checked(ty, out)
+                }
+            }
+            Value::Decimal(v) => v.to_sql_checked(ty, out),
+            Value::Timestamp(v) => v.to_sql_checked(ty, out),
+            Value::Uuid(v) => v.to_sql_checked(ty, out),
+            Value::Json(v) => v.to_sql_checked(ty, out),
+            Value::Bytes(v) => v.to_sql_checked(ty, out),
+            Value::Inet(v) => v.to_sql_checked(ty, out),
+            // A bare parameter next to a `cidr` column is inferred as `inet` by
+            // PostgreSQL (cidr is implicitly castable to inet), so `cidr_col = $1`
+            // hands us `Type::INET`. `cidr` and `inet` share a wire format, so the
+            // same network is serialized as an `IpInet` to satisfy that inference;
+            // the comparison is still equal. A genuine `cidr` slot keeps the
+            // checked path (ADR 0048).
+            Value::Cidr(v) => {
+                if *ty == Type::INET {
+                    match cidr::IpInet::new(v.first_address(), v.network_length()) {
+                        Ok(inet) => inet.to_sql_checked(ty, out),
+                        Err(_) => v.to_sql_checked(ty, out),
+                    }
+                } else {
+                    v.to_sql_checked(ty, out)
+                }
+            }
+            Value::MacAddr(v) => v.to_sql_checked(ty, out),
+            Value::TextArray(v) => v.to_sql_checked(ty, out),
+            Value::IntArray(v) => v.to_sql_checked(ty, out),
         }
     }
 
     fn accepts(_ty: &Type) -> bool {
-        // The variant decides, not the declared column type: `accepts` runs
-        // before the variant is known. A genuine mismatch still fails, inside
-        // `to_sql` above, with the driver's own message.
+        // The variant decides, not the declared column type: `accepts` runs before
+        // the variant is known, so it must admit any type a `Value` could hold. The
+        // real per-variant check happens in `to_sql` above, via each inner type's
+        // `to_sql_checked`.
         true
     }
 
@@ -264,11 +423,24 @@ macro_rules! to_value {
 to_value!(bool, Bool, Bool, |v| *v);
 to_value!(i32, I32, I32, |v| *v);
 to_value!(i64, I64, I64, |v| *v);
+to_value!(f64, F64, F64, |v| *v);
 to_value!(String, Text, Text, |v| v.clone());
 to_value!(Decimal, Decimal, Decimal, |v| *v);
 to_value!(DateTime<Utc>, Timestamp, Timestamp, |v| *v);
 to_value!(Uuid, Uuid, Uuid, |v| *v);
 to_value!(serde_json::Value, Json, Json, |v| v.clone());
+to_value!(Vec<u8>, Bytes, Bytes, |v| v.clone());
+// An `IpAddr` field maps to `INET`; the derive infers `FieldType::Inet` from it,
+// and the typed API binds it natively (ADR 0040).
+to_value!(IpAddr, Inet, Inet, |v| *v);
+// A `cidr::IpCidr`/`eui48::MacAddress` field maps to `CIDR`/`MACADDR`; the derive
+// infers the `FieldType` from the Rust type (ADR 0048).
+to_value!(IpCidr, Cidr, Cidr, |v| *v);
+to_value!(MacAddress, MacAddr, MacAddr, |v| *v);
+// Arrays map to `TEXT[]`/`BIGINT[]` and bind as one native array parameter
+// (ADR 0041).
+to_value!(Vec<String>, TextArray, TextArray, |v| v.clone());
+to_value!(Vec<i64>, IntArray, IntArray, |v| v.clone());
 
 impl ToValue for &str {
     fn to_value(&self) -> Value {
@@ -320,6 +492,10 @@ pub fn read_column(
         crate::row::Row::Sqlite(row) => {
             return crate::row::cell_to_value(row.cell(idx), ty, column)
         }
+        #[cfg(feature = "mysql")]
+        crate::row::Row::MySql(row) => {
+            return crate::row::mysql_cell_to_value(crate::row::mysql_cell(row, idx), ty, column)
+        }
     };
     let fail = |want: &'static str| Error::UnexpectedColumnType {
         column: column.to_string(),
@@ -337,6 +513,10 @@ pub fn read_column(
             .try_get::<_, Option<i64>>(idx)
             .map_err(|_| fail("bigint"))?
             .map_or(Value::Null, Value::I64),
+        FieldType::F64 => row
+            .try_get::<_, Option<f64>>(idx)
+            .map_err(|_| fail("float"))?
+            .map_or(Value::Null, Value::F64),
         FieldType::Text => row
             .try_get::<_, Option<String>>(idx)
             .map_err(|_| fail("text"))?
@@ -361,12 +541,72 @@ pub fn read_column(
             .try_get::<_, Option<serde_json::Value>>(idx)
             .map_err(|_| fail("json"))?
             .map_or(Value::Null, Value::Json),
+        FieldType::Bytes => row
+            .try_get::<_, Option<Vec<u8>>>(idx)
+            .map_err(|_| fail("bytes"))?
+            .map_or(Value::Null, Value::Bytes),
+        FieldType::Inet => row
+            .try_get::<_, Option<IpAddr>>(idx)
+            .map_err(|_| fail("inet"))?
+            .map_or(Value::Null, Value::Inet),
+        FieldType::Cidr => row
+            .try_get::<_, Option<IpCidr>>(idx)
+            .map_err(|_| fail("cidr"))?
+            .map_or(Value::Null, Value::Cidr),
+        FieldType::MacAddr => row
+            .try_get::<_, Option<MacAddress>>(idx)
+            .map_err(|_| fail("macaddr"))?
+            .map_or(Value::Null, Value::MacAddr),
+        FieldType::TextArray => row
+            .try_get::<_, Option<Vec<String>>>(idx)
+            .map_err(|_| fail("text[]"))?
+            .map_or(Value::Null, Value::TextArray),
+        FieldType::IntArray => row
+            .try_get::<_, Option<Vec<i64>>>(idx)
+            .map_err(|_| fail("bigint[]"))?
+            .map_or(Value::Null, Value::IntArray),
+        // An enum column decodes as its text label. `String`'s `FromSql` rejects a
+        // custom enum type, so a small wrapper reads the raw UTF-8 bytes — the
+        // enum's wire format (ADR 0046).
+        FieldType::Enum(_) => row
+            .try_get::<_, Option<crate::row::PgEnumLabel>>(idx)
+            .map_err(|_| fail("enum"))?
+            .map_or(Value::Null, |l| Value::Text(l.0)),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_bound_to_an_incompatible_type_is_refused_not_corrupted() {
+        // The hardening (ADR 0037): delegating to each inner type's
+        // `to_sql_checked` makes a type mismatch a clean error, instead of writing
+        // the native bytes into a server-inferred type that does not match — the
+        // silent-corruption trap that recurred as `::numeric`/`::interval`/`::pg_lsn`.
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        assert!(
+            Value::I64(5)
+                .to_sql_checked(&Type::NUMERIC, &mut buf)
+                .is_err(),
+            "an i64 must not serialize into a numeric parameter"
+        );
+        buf.clear();
+        assert!(
+            Value::Text("x".into())
+                .to_sql_checked(&Type::INT8, &mut buf)
+                .is_err(),
+            "text must not serialize into a bigint parameter"
+        );
+        buf.clear();
+        // The matching cases still work.
+        assert!(Value::I64(5).to_sql_checked(&Type::INT8, &mut buf).is_ok());
+        buf.clear();
+        assert!(Value::Text("x".into())
+            .to_sql_checked(&Type::TEXT, &mut buf)
+            .is_ok());
+    }
 
     #[test]
     fn widening_an_integer_is_allowed_and_narrowing_only_when_it_fits() {
@@ -421,6 +661,51 @@ mod tests {
         let none: Option<i64> = None;
         assert_eq!(none.to_value(), Value::Null);
         assert_eq!(<Option<i64> as ColumnType>::field_type(), FieldType::I64);
+    }
+
+    #[test]
+    fn numbers_widen_into_a_float_but_never_the_other_way() {
+        assert_eq!(
+            Value::I32(3).coerce(FieldType::F64, "x").unwrap(),
+            Value::F64(3.0)
+        );
+        assert_eq!(
+            Value::I64(5).coerce(FieldType::F64, "x").unwrap(),
+            Value::F64(5.0)
+        );
+        assert_eq!(
+            Value::Text("19.5".into())
+                .coerce(FieldType::F64, "x")
+                .unwrap(),
+            Value::F64(19.5)
+        );
+        // A float is never silently narrowed into an integer or a decimal.
+        assert!(Value::F64(1.5).coerce(FieldType::I64, "x").is_err());
+        assert!(Value::F64(1.5).coerce(FieldType::Decimal, "x").is_err());
+        assert!(Value::Text("not-a-float".into())
+            .coerce(FieldType::F64, "x")
+            .is_err());
+    }
+
+    #[test]
+    fn the_new_types_map_to_their_sql_and_rust_shapes() {
+        assert_eq!(FieldType::F64.sql_type(), "DOUBLE PRECISION");
+        assert_eq!(FieldType::Bytes.sql_type(), "BYTEA");
+        assert_eq!(<f64 as ColumnType>::field_type(), FieldType::F64);
+        assert_eq!(<Vec<u8> as ColumnType>::field_type(), FieldType::Bytes);
+        assert_eq!(1.5_f64.to_value(), Value::F64(1.5));
+        assert_eq!(vec![1u8, 2, 255].to_value(), Value::Bytes(vec![1, 2, 255]));
+        assert_eq!(Value::F64(2.5).field_type(), Some(FieldType::F64));
+        assert_eq!(Value::Bytes(vec![0]).field_type(), Some(FieldType::Bytes));
+    }
+
+    #[test]
+    fn a_blob_renders_as_backslash_x_hex() {
+        assert_eq!(
+            Value::Bytes(vec![0x00, 0x0f, 0xff]).to_string(),
+            "\\x000fff"
+        );
+        assert_eq!(Value::Bytes(vec![]).to_string(), "\\x");
     }
 
     #[test]

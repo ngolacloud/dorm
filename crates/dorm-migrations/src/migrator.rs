@@ -12,14 +12,25 @@ use dorm_core::db;
 use dorm_core::meta::ModelMeta;
 use dorm_core::value::Value;
 
-/// A versioned migration: a monotonically increasing version, a name, and the
-/// statements to run. The statements are expected to be idempotent
-/// (`IF NOT EXISTS`), which is what lets [`migrate`] adopt a pre-existing schema.
+/// A versioned migration: a monotonically increasing version, a name, the
+/// statements to apply, and the statements to undo it. The `statements` are
+/// expected to be idempotent (`IF NOT EXISTS`), which is what lets [`migrate`]
+/// adopt a pre-existing schema.
+///
+/// `down` is the inverse — what [`revert`] runs to roll the migration back. It is
+/// **empty when the migration is not losslessly reversible**: a migration that
+/// drops a column or changes a type cannot be undone without the data it
+/// discarded, so rather than fabricate a wrong inverse, DORM records no `down`
+/// and [`revert`] refuses to cross it (the same honesty Django's
+/// non-reversible migrations keep). An additive migration — new tables, columns,
+/// indexes, renames — has a full `down`.
 #[derive(Debug, Clone)]
 pub struct Migration {
     pub version: i64,
     pub name: String,
     pub statements: Vec<String>,
+    /// The inverse statements, or empty when the migration is irreversible.
+    pub down: Vec<String>,
 }
 
 /// The initial migration (version 1): create every table and index for `models`.
@@ -36,21 +47,41 @@ pub fn initial(models: &[&'static ModelMeta]) -> Result<Migration> {
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .collect();
+    // The inverse of "create every table" is "drop every table", in reverse
+    // declaration order so a child table goes before the parent it references.
+    let down = models
+        .iter()
+        .rev()
+        .map(|m| ddl::drop_table(m.table))
+        .collect();
     Ok(Migration {
         version: 1,
         name: "initial".to_string(),
         statements,
+        down,
     })
 }
 
 /// The migrations ledger. Separate from `delonix-api`'s `schema_migrations` on
 /// purpose: while the two migrators coexist (ADR 0072 transition) they must not
 /// write the same table. The `contract` step folds them.
-const LEDGER: &str = "orm_schema_migrations";
+pub(crate) const LEDGER: &str = "orm_schema_migrations";
 
 /// A fixed, arbitrary advisory-lock key. Every process applying migrations takes
 /// it, so two `migrate` calls serialise instead of racing on `CREATE TABLE`.
 const MIGRATE_LOCK: i64 = 0x0072_0d61;
+
+/// The per-migration `lock_timeout`, in milliseconds (ADR 0022).
+pub const MIGRATE_LOCK_TIMEOUT_ENV: &str = "DELONIX_ORM_MIGRATE_LOCK_TIMEOUT_MS";
+
+/// The configured migration `lock_timeout` as a GUC string, or `None` to leave
+/// PostgreSQL's wait-forever default. `0` and empty both mean "no timeout".
+fn migrate_lock_timeout_ms() -> Option<String> {
+    std::env::var(MIGRATE_LOCK_TIMEOUT_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0")
+}
 
 /// Apply the migrations not yet recorded in `orm_schema_migrations`, in order,
 /// each inside the transaction that records it — the `prisma migrate deploy` /
@@ -81,6 +112,13 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
                 &[Value::I64(MIGRATE_LOCK)],
             )
             .await?;
+            // A migration that waits on a lock should fail fast rather than pile
+            // up connections behind a long-running transaction (ADR 0022). The
+            // `lock_timeout` is transaction-local via the safe `set_local` of ADR
+            // 0023; `0`/unset keeps PostgreSQL's wait-forever default.
+            if let Some(ms) = migrate_lock_timeout_ms() {
+                db::set_local("lock_timeout", &ms).await?;
+            }
         }
         db::run(
             &format!(
@@ -131,6 +169,83 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
     Ok(applied)
 }
 
+/// Roll the schema back to `to_version`, undoing every migration applied after it
+/// in reverse order. Pass `0` to undo everything. This is Django's `migrate <app>
+/// <version>` run backwards; Prisma has no exact twin.
+///
+/// Each crossed migration's [`down`](Migration::down) is run and its ledger row
+/// removed, newest first, all in one transaction under the same advisory lock as
+/// [`migrate`]. A migration that is **not reversible** — empty `down`, because it
+/// dropped a column or changed a type — stops the revert with a named error
+/// *before* anything past it is undone: DORM will not fabricate an inverse that
+/// loses data. Idempotent: a version already absent from the ledger is skipped.
+///
+/// Returns the versions reverted, newest-first.
+pub async fn revert(migrations: &[Migration], to_version: i64) -> Result<Vec<i64>> {
+    db::guard_write("revert")?;
+    let is_postgres = db::backend_of(&db::dsn()?) == db::Backend::Postgres;
+
+    // Only migrations strictly above the target, newest first.
+    let mut to_undo: Vec<&Migration> = migrations
+        .iter()
+        .filter(|m| m.version > to_version)
+        .collect();
+    to_undo.sort_by_key(|m| std::cmp::Reverse(m.version));
+
+    let reverted = db::atomic(|_tx| async move {
+        if is_postgres {
+            db::run(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[Value::I64(MIGRATE_LOCK)],
+            )
+            .await?;
+        }
+        db::run(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {LEDGER} (\
+                 version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_unix BIGINT NOT NULL)"
+            ),
+            &[],
+        )
+        .await?;
+
+        let done: std::collections::HashSet<i64> =
+            db::fetch(&format!("SELECT version FROM {LEDGER}"), &[])
+                .await?
+                .iter()
+                .map(|r| r.try_get::<i64>(0))
+                .collect::<dorm_core::Result<_>>()?;
+
+        let delete = if is_postgres {
+            format!("DELETE FROM {LEDGER} WHERE version = $1")
+        } else {
+            format!("DELETE FROM {LEDGER} WHERE version = ?1")
+        };
+
+        let mut undone = Vec::new();
+        for m in &to_undo {
+            if !done.contains(&m.version) {
+                continue; // not applied — nothing to undo
+            }
+            if m.down.is_empty() && !m.statements.is_empty() {
+                return Err(dorm_core::Error::Config(format!(
+                    "migration {} (`{}`) is not reversible: it has no `down` (it dropped data \
+                     or changed a type), so revert stops before undoing it",
+                    m.version, m.name
+                )));
+            }
+            for stmt in &m.down {
+                db::run(stmt, &[]).await?;
+            }
+            db::run(&delete, &[Value::I64(m.version)]).await?;
+            undone.push(m.version);
+        }
+        Ok(undone)
+    })
+    .await?;
+    Ok(reverted)
+}
+
 /// Bring the live schema in line with `models`, **additively**: create any table
 /// that is missing (with its indexes), and add any column a model declares that
 /// its table does not yet have. Returns the DDL it actually ran, in order.
@@ -147,24 +262,56 @@ pub async fn migrate(migrations: &[Migration]) -> Result<Vec<i64>> {
 pub async fn sync(models: &[&'static ModelMeta]) -> Result<Vec<String>> {
     db::guard_write("sync")?;
     let plans = build_plans(models)?;
-    db::atomic(|_tx| async move {
+    let backend = ddl::Backend::of_dsn(&db::dsn()?);
+
+    // Indexes build `CONCURRENTLY` on PostgreSQL (B-22), which PostgreSQL forbids
+    // inside a transaction — so they are collected now and applied *after* the
+    // transactional changes, each on its own connection outside any transaction.
+    // They are idempotent (`IF NOT EXISTS`), so re-running `sync` is safe, and
+    // they are not among the reported changes (as before).
+    let index_stmts: Vec<String> = models
+        .iter()
+        .flat_map(|m| ddl::indexes_concurrent(m, backend))
+        .collect();
+
+    // Transactional part: create missing tables and add missing columns, under
+    // the advisory lock so two concurrent syncs serialise rather than racing on
+    // `ALTER TABLE`.
+    // Native enum types (ADR 0046) are created before the tables — a column
+    // cannot reference a type that does not exist. Idempotent `DO` blocks, so a
+    // re-run is a no-op; not reported as a change (like the indexes).
+    let enum_types = ddl::create_enum_types(models, backend);
+
+    let changes = db::atomic(|_tx| async move {
         db::execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK]).await?;
+        for stmt in &enum_types {
+            db::execute(stmt, &[]).await?;
+        }
         let (tables, columns) = introspect().await?;
         let changes = changes_for(&plans, &tables, &columns);
-        // Apply the changes; then the indexes (idempotent, so run for every table,
-        // and not counted among the reported changes).
         for stmt in &changes {
             db::execute(stmt, &[]).await?;
         }
-        for (_, _, indexes, _) in &plans {
-            for idx in indexes {
-                db::execute(idx, &[]).await?;
-            }
-        }
-        Ok(changes)
+        Ok::<Vec<String>, dorm_core::Error>(changes)
     })
-    .await
-    .map_err(Into::into)
+    .await?;
+
+    // Non-transactional part: the indexes. Outside the transaction so
+    // `CREATE INDEX CONCURRENTLY` is legal and does not block writes to a
+    // populated table.
+    for idx in &index_stmts {
+        db::execute(idx, &[]).await?;
+    }
+
+    // Also non-transactional: evolve any enum that gained a variant (ADR 0046
+    // follow-up). `ALTER TYPE … ADD VALUE` is best run outside a transaction, and
+    // `IF NOT EXISTS` makes emitting it for every declared variant idempotent, so
+    // a pre-existing type simply gains the labels it was missing.
+    for stmt in ddl::alter_enum_types(models, backend) {
+        db::execute(&stmt, &[]).await?;
+    }
+
+    Ok(changes)
 }
 
 /// The additive changes [`sync`] *would* apply, without touching the database —

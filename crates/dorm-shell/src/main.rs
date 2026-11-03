@@ -46,6 +46,23 @@ use dorm_core::{db, registry};
 /// caller asks for one.
 const DEFAULT_LIMIT: i64 = 20;
 
+/// A RAG-indexed model the shell owns, so `search` and `:rag` have something to
+/// work over (`dorm-models` carries no RAG model). `#[derive(Rag)]` is the
+/// separate derive from ADR 0019: it adds a `RagMeta`, leaving `ModelMeta`
+/// untouched, so this does not disturb the models the snapshot tests pin.
+#[derive(dorm_derive::Model, dorm_rag::Rag, Debug, Clone)]
+#[model(table = "shell_notes", tenant_scoped)]
+#[rag(fields = ["title", "body"], template = "{title}\n\n{body}", metadata = ["tenant"])]
+#[allow(dead_code)]
+struct Note {
+    #[field(primary_key)]
+    id: i64,
+    #[field(column_type = "text")]
+    tenant: String,
+    title: String,
+    body: String,
+}
+
 /// Touch each model's metadata so the linker keeps the crate that registers it.
 ///
 /// `dorm-models` is a dependency whose items are otherwise never named here, and
@@ -60,6 +77,7 @@ fn link_models() {
         <Application as Model>::meta(),
         <Deployment as Model>::meta(),
         <Product as Model>::meta(),
+        <Note as Model>::meta(),
     ];
 }
 
@@ -84,6 +102,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Best-effort embedder for `search`/`:rag`: if Ollama is reachable, keep a
+    // concrete handle (the worker needs one) and install a clone as the default
+    // the dynamic `semantic_search` uses. Otherwise those commands say so.
+    let embedder: Option<dorm_rag::embedder::OllamaEmbedder> = rt
+        .block_on(dorm_rag::embedder::OllamaEmbedder::from_env())
+        .ok();
+    if let Some(e) = &embedder {
+        dorm_rag::install_embedder(e.clone());
+    }
 
     println!("dorm — the Delonix ORM shell. `:help` for commands, `:quit` to leave.");
     println!(
@@ -132,6 +160,17 @@ fn main() {
             ":quit" | ":q" | ":exit" => break,
             ":help" | ":h" => print_help(),
             ":models" | ":m" => print_models(),
+            ":rag" => print_rag(&rt),
+            ":rag setup" => {
+                if let Err(e) = rt.block_on(rag_setup(embedder.as_ref(), writable)) {
+                    eprintln!("error: {e}");
+                }
+            }
+            ":rag index" => {
+                if let Err(e) = rt.block_on(rag_index(embedder.as_ref(), writable)) {
+                    eprintln!("error: {e}");
+                }
+            }
             ":begin" | ":begin;" => {
                 if open_tx.is_some() {
                     eprintln!("error: already in a transaction; :commit or :rollback first");
@@ -194,6 +233,10 @@ fn print_help() {
     println!(
         "commands:\n\
          \x20 :models                           list models, columns and relations\n\
+         \x20 :rag                               list RAG models and their index health\n\
+         \x20 :rag setup                         create RAG tables/triggers, seed a demo, index (needs Ollama)\n\
+         \x20 :rag index                         drain the outbox once, after your own writes\n\
+         \x20 search <Model> \"query\" [k=v ...]   semantic search over a RAG model (ADR 0019)\n\
          \x20 :sql <command>                    show a command's SQL and params, without running it\n\
          \x20 :raw <sql>                        run raw SQL (ADR 0005); writes need --write\n\
          \x20 :begin / :commit / :rollback      run several writes as one transaction\n\
@@ -283,7 +326,203 @@ async fn dispatch(line: &str) -> dorm_core::Result<()> {
         "insert" => run_insert(line).await,
         "update" => run_update(line).await,
         "delete" => run_delete(line).await,
+        "search" => run_search(line).await,
         _ => run_query(line).await,
+    }
+}
+
+/// `search <Model> "a natural-language query" [k=v ...] [limit=N] [hybrid=W]` —
+/// semantic (or hybrid) retrieval over a RAG model (ADR 0019). The filters are
+/// pre-applied through the compiler, tenant included, exactly like a read.
+async fn run_search(line: &str) -> dorm_core::Result<()> {
+    let rest = line.trim_start()["search".len()..].trim();
+    let (model, rest) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+        dorm_core::Error::Config("usage: search <Model> \"query\" [k=v ...]".into())
+    })?;
+    let rest = rest.trim();
+
+    // The query is a double-quoted string; everything after it is k=v options.
+    let (query, opts_str) = if let Some(after) = rest.strip_prefix('"') {
+        let end = after
+            .find('"')
+            .ok_or_else(|| dorm_core::Error::Config("the query must be in double quotes".into()))?;
+        (after[..end].to_string(), after[end + 1..].trim())
+    } else {
+        return Err(dorm_core::Error::Config(
+            "the query must be in double quotes, e.g. search Note \"sem acesso ao email\"".into(),
+        ));
+    };
+
+    let mut filters: Vec<(String, Value)> = Vec::new();
+    let mut opts = dorm_rag::SearchOptions::default();
+    for tok in opts_str.split_whitespace() {
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
+        match k {
+            "limit" => opts.limit = v.parse().unwrap_or(opts.limit),
+            "hybrid" => opts.weight = v.parse().ok(),
+            "min_score" => opts.min_score = v.parse().ok(),
+            _ => filters.push((k.to_string(), parse_value(v))),
+        }
+    }
+
+    let hits = dorm_rag::semantic_search(model, &query, &filters, &opts).await?;
+    if hits.is_empty() {
+        println!("(no matches)");
+    }
+    for h in hits {
+        let snippet: String = h.chunk.chars().take(80).collect();
+        println!(
+            "  pk={}  score={:.3}  {}",
+            h.pk,
+            h.score,
+            snippet.replace('\n', " ")
+        );
+    }
+    Ok(())
+}
+
+/// `:rag setup` — create the RAG shadow tables and triggers for every registered
+/// RAG model (and the model tables themselves), seed the demo `Note` if empty,
+/// and index it once, so `search` works immediately. Idempotent.
+async fn rag_setup(
+    embedder: Option<&dorm_rag::embedder::OllamaEmbedder>,
+    writable: bool,
+) -> dorm_core::Result<()> {
+    use dorm_core::value::Value;
+    use dorm_migrations::ddl::{self, Backend};
+    use dorm_rag::embedder::Embedder;
+
+    let embedder = embedder.ok_or_else(|| {
+        dorm_core::Error::Config(
+            "no embedder — start Ollama (or set DELONIX_ORM_RAG_*) so the vector dimension is known"
+                .into(),
+        )
+    })?;
+    let dim = embedder.dimension();
+    // Setup and the worker write (DDL, the shadow table, `FOR UPDATE`): enable
+    // writes for the duration, then restore the session's mode. `:rag setup` is an
+    // explicit admin action, so it does not need the session to be `--write`.
+    let _guard = WriteWindow::open(writable);
+
+    // Each RAG model's own table, then the shared RAG objects (extension, shadow
+    // tables, GIN/HNSW indexes, triggers, outbox) sized to the embedder.
+    for rag in dorm_rag::rags() {
+        let meta = registry::model(rag.model)?;
+        let schema =
+            ddl::schema_for(&[meta]).map_err(|e| dorm_core::Error::Config(e.to_string()))?;
+        db::run_ddl(&schema).await?;
+    }
+    let up = dorm_rag::migrations::up_for_registered(dim, Backend::Postgres)?;
+    db::run_ddl(&up.join(";\n")).await?;
+
+    // Seed the demo Note so there is something to find, only if empty.
+    let count = db::fetch("SELECT count(*) FROM shell_notes", &[]).await?[0].try_get::<i64>(0)?;
+    if count == 0 {
+        let demo = [
+            (
+                "acme",
+                "Não consigo aceder ao email",
+                "O webmail recusa a palavra-passe desde a migração.",
+            ),
+            (
+                "acme",
+                "Fatura cobrada em duplicado",
+                "Fui cobrado duas vezes no cartão este mês.",
+            ),
+            (
+                "acme",
+                "Aumento de quota de disco",
+                "Preciso de mais espaço no servidor de ficheiros.",
+            ),
+        ];
+        for (t, ti, bo) in demo {
+            db::run(
+                "INSERT INTO shell_notes (tenant, title, body) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(t.into()),
+                    Value::Text(ti.into()),
+                    Value::Text(bo.into()),
+                ],
+            )
+            .await?;
+        }
+        println!("seeded {} demo notes.", 3);
+    }
+
+    let stats = dorm_rag::run_once(embedder, &dorm_rag::WorkerConfig::default()).await?;
+    println!(
+        "rag setup: ok — indexed {} record(s). Try: search Note \"sem acesso ao email\"",
+        stats.upserts
+    );
+    Ok(())
+}
+
+/// Flip the session to read-write for an admin operation, restoring the prior
+/// mode on drop — so `:rag setup`/`:rag index` can run the worker (which takes
+/// `FOR UPDATE`) without the whole session being `--write`.
+struct WriteWindow {
+    restore_readonly: bool,
+}
+
+impl WriteWindow {
+    fn open(session_writable: bool) -> Self {
+        db::set_read_only(false);
+        WriteWindow {
+            restore_readonly: !session_writable,
+        }
+    }
+}
+
+impl Drop for WriteWindow {
+    fn drop(&mut self) {
+        db::set_read_only(self.restore_readonly);
+    }
+}
+
+/// `:rag index` — drain the outbox once (after your own inserts/updates).
+async fn rag_index(
+    embedder: Option<&dorm_rag::embedder::OllamaEmbedder>,
+    writable: bool,
+) -> dorm_core::Result<()> {
+    let embedder = embedder
+        .ok_or_else(|| dorm_core::Error::Config("no embedder — start Ollama first".into()))?;
+    let _guard = WriteWindow::open(writable);
+    let s = dorm_rag::run_once(embedder, &dorm_rag::WorkerConfig::default()).await?;
+    println!(
+        "rag index: {} upsert(s), {} delete(s), {} failed.",
+        s.upserts, s.deletes, s.failed
+    );
+    Ok(())
+}
+
+/// `:rag` — the RAG models and, if a database is reachable, their index health.
+fn print_rag(rt: &tokio::runtime::Runtime) {
+    let rags: Vec<_> = dorm_rag::rags().collect();
+    if rags.is_empty() {
+        println!("no RAG models registered.");
+        return;
+    }
+    println!("RAG models:");
+    for r in &rags {
+        println!(
+            "  {} — fields [{}], embedder {}",
+            r.model,
+            r.fields.join(", "),
+            r.embedder
+        );
+    }
+    match rt.block_on(dorm_rag::status(5)) {
+        Ok(status) => {
+            for s in status {
+                println!(
+                    "  {} — indexed {}, pending {}, dead-letter {}",
+                    s.model, s.indexed_records, s.pending, s.dead_letter
+                );
+            }
+        }
+        Err(_) => println!("(set {} for index counts)", db::DSN_ENV),
     }
 }
 

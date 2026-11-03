@@ -165,6 +165,11 @@ fn handlers(m: &Model) -> String {
         "\nasync fn create_{lower}(Json(body): Json<Body>) \
          -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {{"
     );
+    // Honour a read-only session. This handler builds the INSERT and runs it
+    // directly (not through `QuerySet::create`), so unlike list/get it must
+    // check the write guard itself — otherwise a read-only deployment still
+    // accepts writes (SEC-01).
+    out.push_str("    dorm_core::db::guard_write(\"create\").map_err(err)?;\n");
     out.push_str(
         "    let values: Vec<(String, Value)> = body.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect();\n",
     );
@@ -351,6 +356,10 @@ fn component_schema(m: &Model) -> J {
                 // The foreign key is exposed as its integer id column.
                 props.insert(r.column.clone(), json!({ "type": "integer" }));
             }
+            // An enum column is a native-enum-backed string (ADR 0046/0047).
+            Field::Enum(e) => {
+                props.insert(e.column.clone(), json!({ "type": "string" }));
+            }
             Field::ToMany { .. } => {}
         }
     }
@@ -366,6 +375,10 @@ fn openapi_scalar(ty: Scalar, nullable: bool) -> J {
         Scalar::Decimal => ("string", None),
         Scalar::Json => ("object", None),
         Scalar::Uuid => ("string", Some("uuid")),
+        // The network scalars are strings in JSON, with a format hint (ADR 0040/0048).
+        Scalar::Inet => ("string", Some("ipv4")),
+        Scalar::Cidr => ("string", Some("cidr")),
+        Scalar::MacAddr => ("string", Some("macaddr")),
     };
     let mut obj = Map::new();
     obj.insert("type".into(), J::String(t.into()));
@@ -406,5 +419,39 @@ mod tests {
         ));
         assert!(rust.contains("\"openapi\": \"3.0.3\""));
         assert!(rust.contains("Tenant::objects()"));
+    }
+
+    // SEC-01 / B-05: the create handler builds the INSERT and runs it directly,
+    // so it must check the write guard itself; otherwise a read-only deployment
+    // still accepts writes. list/get/update/delete go through `QuerySet`, which
+    // guards internally.
+    #[test]
+    fn the_generated_create_handler_honours_the_read_only_guard() {
+        let schema = parse(
+            r#"
+            model Tenant {
+              id   Int    @id @default(autoincrement())
+              slug String @db.VarChar(63)
+            }
+        "#,
+        )
+        .expect("parses");
+        let rust = generate_axum(&schema, "demo_app");
+
+        // The guard appears inside the create handler, before the INSERT is run.
+        let create = rust
+            .split_once("async fn create_tenant(")
+            .expect("a create handler")
+            .1;
+        let body = create.split_once('}').expect("a handler body").0;
+        assert!(
+            body.contains("dorm_core::db::guard_write(\"create\")"),
+            "create handler must guard writes, got:\n{body}"
+        );
+        let guard_at = body
+            .find("guard_write")
+            .expect("guard present in create body");
+        let insert_at = body.find("run_query").expect("the insert runs");
+        assert!(guard_at < insert_at, "the guard must run before the INSERT");
     }
 }

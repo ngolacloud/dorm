@@ -58,7 +58,7 @@ fn ensure_schema(dsn: &str) {
 /// Run the `dorm` binary with `args`, feeding `script` on stdin, and return its
 /// combined stdout and stderr.
 fn drive(dsn: &str, args: &[&str], script: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dorm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dorm-shell"))
         .args(args)
         .env("DELONIX_ORM_DSN", dsn)
         .stdin(Stdio::piped())

@@ -428,6 +428,37 @@ model Post {
     }
 
     #[test]
+    fn rag_block_attribute_survives_formatting() {
+        // `@@rag(..)` is a block-level attribute the AST now models, but the
+        // formatter still works on text — so it must survive a format round-trip
+        // verbatim and stay a fixed point (ADR 0019).
+        let input = "model Ticket {\n  id    Int    @id @default(autoincrement())\n  title String @db.VarChar(200)\n  body  String @db.Text\n  @@rag(fields: [title, body], embedder: \"default\")\n}\n";
+        let out = format(input);
+        assert!(
+            out.contains("@@rag(fields: [title, body], embedder: \"default\")"),
+            "@@rag lost or mangled: {out}"
+        );
+        assert_eq!(format(&out), out);
+    }
+
+    #[test]
+    fn a_top_level_enum_block_survives_formatting() {
+        // The formatter works on text, so a top-level `enum` block (ADR 0047) —
+        // one variant per line, bare idents — survives verbatim and is a fixed
+        // point, like any other block.
+        let input =
+            "enum OrderStatus {\n  pending\n  paid\n  shipped\n}\n\nmodel Order {\n  id     Int         @id @default(autoincrement())\n  status OrderStatus\n}\n";
+        let out = format(input);
+        assert!(
+            out.contains("enum OrderStatus {"),
+            "enum header lost: {out}"
+        );
+        assert!(out.contains("  pending"), "variant lost: {out}");
+        assert!(out.contains("  shipped"), "variant lost: {out}");
+        assert_eq!(format(&out), out, "enum block must be a fixed point");
+    }
+
+    #[test]
     fn url_double_slash_is_not_a_comment() {
         let input = "datasource db {\n  provider = \"postgresql\"\n  url      = \"postgres://u:p@h/db?sslmode=require\"\n}\n";
         let out = format(input);

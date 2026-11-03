@@ -31,6 +31,26 @@ members = [
     "crates/dorm-studio",
     # The SQLite executor: run the ORM's SQLite-dialect compiled SQL (ADR 0002).
     "crates/dorm-sqlite",
+    # Optional RAG: a model marked #[derive(Rag)] is indexed in pgvector and gains
+    # semantic/hybrid search (ADR 0019). dorm-core never depends on it.
+    "crates/dorm-rag",
+    # Optional MCP server: expose the registry as tools/resources to an agent
+    # (ADR 0020). Depends on dorm-core + dorm-rag; neither depends back on it.
+    "crates/dorm-mcp",
+    # Optional generic transactional outbox/inbox: publish events in-transaction,
+    # drain them with independent cursor-tracking consumers (ADR 0026). dorm-core
+    # never depends on it.
+    "crates/dorm-outbox",
+    # Optional durable PostgreSQL job queue + expiring leases (ADR 0027). dorm-core
+    # never depends on it.
+    "crates/dorm-jobs",
+    # Optional messaging: CloudEvents envelope + Publisher/Subscriber, outbox-backed
+    # by default, broker backends behind features (ADR 0031).
+    "crates/dorm-messaging",
+    # Optional PostgreSQL event store: append-only per-aggregate event streams with
+    # optimistic-concurrency append, aggregate snapshots and event-version upcasting
+    # (ADR 0039). dorm-core never depends on it.
+    "crates/dorm-eventstore",
 ]
 
 [workspace.package]
@@ -64,6 +84,10 @@ postgres-openssl = { version = "0.5" }
 openssl = { version = "0.10" }
 inventory = { version = "0.3" }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+# Native PostgreSQL `CIDR`/`MACADDR` value types (ADR 0048); wired to the wire
+# through `tokio-postgres`'s `with-cidr-0_3`/`with-eui48-1` features.
+cidr = { version = "0.3" }
+eui48 = { version = "1" }
 # Observability (ADR 0008). `tracing` is a facade: with no subscriber installed
 # every macro compiles to a cheap disabled check, so an always-on direct
 # dependency costs the ~nothing a library should when nobody is listening — no

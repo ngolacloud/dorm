@@ -49,6 +49,11 @@ fn imports(schema: &Schema) -> String {
     out.push_str("use dorm_core::meta::ModelMeta;\n");
     out.push_str("use dorm_core::model::Model;\n");
     out.push_str("use dorm_derive::Model;\n");
+    // Only when some model opts into RAG: a schema with no `@@rag` imports
+    // nothing from `dorm-rag` and so pulls in no dependency on it (ADR 0019).
+    if schema.models.iter().any(|m| m.rag.is_some()) {
+        out.push_str("use dorm_rag::Rag;\n");
+    }
     if has_decimal {
         out.push_str("use rust_decimal::Decimal;\n");
     }
@@ -57,13 +62,46 @@ fn imports(schema: &Schema) -> String {
 
 fn model(schema: &Schema, m: &Model) -> String {
     let mut out = String::new();
-    out.push_str("#[derive(Model, Debug, Clone)]\n");
-    let _ = writeln!(out, "#[model(table = \"{}\")]", m.table);
+    // A RAG model carries a second, independent derive — `ModelMeta` is untouched
+    // (ADR 0019); the `@@rag(..)` block compiles to `#[derive(Rag)]` + `#[rag(..)]`.
+    if m.rag.is_some() {
+        out.push_str("#[derive(Model, Rag, Debug, Clone)]\n");
+    } else {
+        out.push_str("#[derive(Model, Debug, Clone)]\n");
+    }
+    // `@@unique([a, b])` groups ride in the `#[model(..)]` attribute: the derive
+    // accepts one `unique_together = "a, b"` per group (ADR 0043).
+    // Columns are snake_cased to the generated column names — the derive feeds
+    // these straight into SQL as column names, so `createdAt` must become
+    // `created_at`.
+    let cols = |group: &[String]| {
+        group
+            .iter()
+            .map(|c| snake(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut model_args = format!("table = \"{}\"", m.table);
+    for group in &m.unique_together {
+        let _ = write!(model_args, ", unique_together = \"{}\"", cols(group));
+    }
+    // `@@index([a, b])` groups ride in the same attribute as `index_together`,
+    // one per group (ADR 0044).
+    for group in &m.indexes {
+        let _ = write!(model_args, ", index_together = \"{}\"", cols(group));
+    }
+    let _ = writeln!(out, "#[model({model_args})]");
+    if let Some(rag) = &m.rag {
+        out.push_str(&rag_attr(rag));
+    }
     let _ = writeln!(out, "pub struct {} {{", m.name);
     for f in &m.fields {
         match f {
-            Field::Scalar(s) => out.push_str(&scalar_field(s)),
+            // `@@id([a, b])` has no inline `@id`, so the columns it names are
+            // promoted to `primary_key` here (ADR 0043).
+            Field::Scalar(s) => out.push_str(&scalar_field(s, m.composite_id.contains(&s.name))),
             Field::ToOne(r) => out.push_str(&relation_field(schema, m, r)),
+            Field::Enum(e) => out.push_str(&enum_field(schema, e)),
             // A `Target[]` is a reverse relation: no column, so no struct field.
             Field::ToMany { .. } => {}
         }
@@ -72,9 +110,51 @@ fn model(schema: &Schema, m: &Model) -> String {
     out
 }
 
-fn scalar_field(s: &crate::ScalarField) -> String {
+/// Render a model's `@@rag(..)` as the `#[rag(..)]` attribute the `Rag` derive
+/// reads. Field and metadata names are snake_cased to match the generated struct
+/// fields and columns; `fields` is always emitted, the rest only when given.
+fn rag_attr(rag: &crate::RagBlock) -> String {
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|f| format!("\"{}\"", snake(f)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = vec![format!("fields = [{}]", list(&rag.fields))];
+    if let Some(t) = &rag.template {
+        parts.push(format!("template = \"{}\"", rust_escape(t)));
+    }
+    if let Some(e) = &rag.embedder {
+        parts.push(format!("embedder = \"{}\"", rust_escape(e)));
+    }
+    if let Some(n) = rag.chunk_size {
+        parts.push(format!("chunk_size = {n}"));
+    }
+    if let Some(n) = rag.chunk_overlap {
+        parts.push(format!("chunk_overlap = {n}"));
+    }
+    if !rag.metadata.is_empty() {
+        parts.push(format!("metadata = [{}]", list(&rag.metadata)));
+    }
+    if let Some(d) = &rag.distance {
+        parts.push(format!("distance = \"{}\"", rust_escape(d)));
+    }
+    format!("#[rag({})]\n", parts.join(", "))
+}
+
+/// Escape a schema string so it is a valid Rust string literal with the **same
+/// byte value**. Lossless: a `\` in the schema stays a `\` in the document, never
+/// silently becoming a newline. (A real newline is not expressible in a schema
+/// string anyway — the lexer rejects it — so this cannot drop one.)
+fn rust_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn scalar_field(s: &crate::ScalarField, composite_pk: bool) -> String {
     let mut attrs: Vec<String> = Vec::new();
-    if s.primary_key {
+    // A `@@id([..])` member is a primary key even without an inline `@id`.
+    if s.primary_key || composite_pk {
         attrs.push("primary_key".into());
     }
     if s.unique {
@@ -117,6 +197,34 @@ fn scalar_field(s: &crate::ScalarField) -> String {
         let _ = writeln!(out, "    #[field({})]", attrs.join(", "));
     }
     let _ = writeln!(out, "    pub {}: {ty},", snake(&s.name));
+    out
+}
+
+/// Render an enum-typed field (ADR 0047) as the native enum attribute the
+/// `Model` derive turns into a `CREATE TYPE … AS ENUM` (ADR 0046): a `String`
+/// column (`Option<String>` when nullable) carrying `#[field(enum_type = …,
+/// enum_variants = …)]`. The type name is snake_cased (`OrderStatus` →
+/// `order_status`); the variants are emitted exactly as declared, comma-joined.
+fn enum_field(schema: &Schema, e: &crate::EnumField) -> String {
+    let variants = schema
+        .enums
+        .iter()
+        .find(|d| d.name == e.enum_name)
+        .map(|d| d.variants.join(", "))
+        .unwrap_or_default();
+    let ty = if e.nullable {
+        "Option<String>"
+    } else {
+        "String"
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "    #[field(enum_type = \"{}\", enum_variants = \"{variants}\")]",
+        snake(&e.enum_name)
+    );
+    let _ = writeln!(out, "    pub {}: {ty},", snake(&e.name));
     out
 }
 
@@ -211,5 +319,201 @@ mod tests {
         // all_models lists both.
         assert!(rust.contains("<Tenant as Model>::meta(),"));
         assert!(rust.contains("<Application as Model>::meta(),"));
+        // No RAG in this schema: no dorm-rag import and no Rag derive.
+        assert!(!rust.contains("use dorm_rag::Rag;"), "{rust}");
+        assert!(!rust.contains("Rag"), "{rust}");
+    }
+
+    const RAG: &str = r#"
+        model Ticket {
+          id        Int      @id @default(autoincrement())
+          title     String   @db.VarChar(200)
+          body      String   @db.Text
+          createdAt DateTime @default(now())
+          @@rag(fields: [title, body], template: "{title}", embedder: "default", chunk_size: 800, chunk_overlap: 100, metadata: [createdAt], distance: "cosine")
+        }
+    "#;
+
+    #[test]
+    fn a_rag_model_emits_the_rag_derive_and_attribute_and_the_import() {
+        let rust = generate_rust(&parse(RAG).expect("parses"));
+        // The second, independent derive — Model is still there and unchanged.
+        assert!(
+            rust.contains("#[derive(Model, Rag, Debug, Clone)]"),
+            "{rust}"
+        );
+        // The import appears exactly because a model opts in.
+        assert!(rust.contains("use dorm_rag::Rag;"), "{rust}");
+        // Field names are snake_cased to match the generated columns.
+        assert!(
+            rust.contains(
+                "#[rag(fields = [\"title\", \"body\"], template = \"{title}\", \
+                 embedder = \"default\", chunk_size = 800, chunk_overlap = 100, \
+                 metadata = [\"created_at\"], distance = \"cosine\")]"
+            ),
+            "{rust}"
+        );
+    }
+
+    const ENUM: &str = r#"
+        model Order {
+          id     Int         @id @default(autoincrement())
+          status OrderStatus
+        }
+
+        enum OrderStatus { pending paid shipped }
+    "#;
+
+    #[test]
+    fn an_enum_field_emits_the_native_enum_attribute() {
+        let rust = generate_rust(&parse(ENUM).expect("parses"));
+        // The exact native-enum attribute the Model derive reads (ADR 0046).
+        assert!(
+            rust.contains(
+                "#[field(enum_type = \"order_status\", enum_variants = \"pending, paid, shipped\")]"
+            ),
+            "{rust}"
+        );
+        // The column is a plain `String`, imposed by the database enum type.
+        assert!(rust.contains("pub status: String,"), "{rust}");
+    }
+
+    #[test]
+    fn a_nullable_enum_field_is_option_string() {
+        let src = r#"
+            enum OrderStatus { pending paid }
+            model Order {
+              id     Int          @id @default(autoincrement())
+              status OrderStatus?
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        assert!(
+            rust.contains(
+                "#[field(enum_type = \"order_status\", enum_variants = \"pending, paid\")]"
+            ),
+            "{rust}"
+        );
+        assert!(rust.contains("pub status: Option<String>,"), "{rust}");
+    }
+
+    #[test]
+    fn a_schema_with_no_enum_emits_no_enum_type() {
+        // The blog schema has no enum: generation is unchanged — no `enum_type`.
+        let rust = generate_rust(&parse(BLOG).expect("parses"));
+        assert!(!rust.contains("enum_type"), "{rust}");
+        assert!(!rust.contains("enum_variants"), "{rust}");
+    }
+
+    #[test]
+    fn a_rag_block_with_only_fields_defaults_the_rest() {
+        let src = r#"
+            model Note {
+              id   Int    @id @default(autoincrement())
+              body String @db.Text
+              @@rag(fields: [body])
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        // Only `fields` is emitted; the derive supplies template/embedder/sizes.
+        assert!(rust.contains("#[rag(fields = [\"body\"])]"), "{rust}");
+    }
+
+    /// `@@unique([..])` and `@@id([..])` round-trip to the derive's attributes
+    /// (ADR 0043).
+    #[test]
+    fn composite_unique_and_id_reach_the_derive() {
+        let src = r#"
+            model RegionCode {
+              region String @db.VarChar(20)
+              code   String @db.VarChar(20)
+              label  String @db.VarChar(100)
+              @@id([region, code])
+              @@unique([region, label])
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let model = &schema.models[0];
+        // The AST captures both block attributes.
+        assert_eq!(model.composite_id, vec!["region", "code"]);
+        assert_eq!(model.unique_together, vec![vec!["region", "label"]]);
+
+        let rust = generate_rust(&schema);
+        // `@@unique` rides in the model attribute, one group per `unique_together`.
+        assert!(
+            rust.contains(
+                "#[model(table = \"region_codes\", unique_together = \"region, label\")]"
+            ),
+            "{rust}"
+        );
+        // `@@id` promotes both columns to `primary_key` even without an inline `@id`.
+        assert!(
+            rust.contains("#[field(primary_key, max_length = 20)]\n    pub region: String,"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("#[field(primary_key, max_length = 20)]\n    pub code: String,"),
+            "{rust}"
+        );
+        // A non-key column stays plain.
+        assert!(
+            rust.contains("#[field(max_length = 100)]\n    pub label: String,"),
+            "{rust}"
+        );
+    }
+
+    /// A schema with neither block attribute generates exactly what it did before:
+    /// no `unique_together`, no promoted keys (ADR 0043 is opt-in).
+    #[test]
+    fn no_block_attrs_means_no_change() {
+        let rust = generate_rust(&parse(BLOG).expect("parses"));
+        assert!(!rust.contains("unique_together"), "{rust}");
+        assert!(!rust.contains("index_together"), "{rust}");
+    }
+
+    /// The network scalars reach the generated struct as the fully-qualified Rust
+    /// types the `Model` derive infers `FieldType::Inet`/`Cidr`/`MacAddr` from —
+    /// no new `use` in the generated file (ADR 0040/0048).
+    #[test]
+    fn network_scalars_generate_fully_qualified_rust_types() {
+        let src = r#"
+            model Host {
+              id   Int     @id @default(autoincrement())
+              addr Inet
+              net  Cidr
+              mac  MacAddr
+            }
+        "#;
+        let rust = generate_rust(&parse(src).expect("parses"));
+        assert!(rust.contains("pub addr: std::net::IpAddr,"), "{rust}");
+        assert!(rust.contains("pub net: cidr::IpCidr,"), "{rust}");
+        assert!(rust.contains("pub mac: eui48::MacAddress,"), "{rust}");
+    }
+
+    /// `@@index([a, b])` round-trips to `index_together`, one per group (ADR 0044).
+    #[test]
+    fn composite_indexes_reach_the_derive() {
+        let src = r#"
+            model Event {
+              id        Int      @id @default(autoincrement())
+              tenant    String   @db.VarChar(40)
+              status    String   @db.VarChar(20)
+              createdAt DateTime @default(now())
+              @@index([tenant, createdAt])
+              @@index([status])
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        assert_eq!(
+            schema.models[0].indexes,
+            vec![vec!["tenant", "createdAt"], vec!["status"]]
+        );
+        let rust = generate_rust(&schema);
+        // Field names are snake_cased into the model attribute, one per group.
+        assert!(
+            rust.contains("index_together = \"tenant, created_at\""),
+            "{rust}"
+        );
+        assert!(rust.contains("index_together = \"status\""), "{rust}");
     }
 }

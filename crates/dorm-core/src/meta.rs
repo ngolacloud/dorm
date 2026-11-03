@@ -126,8 +126,21 @@ impl ModelMeta {
 
     /// The primary key field. A model without one cannot be saved or deleted by
     /// instance, so the rest of the code asks for it rather than assuming `id`.
+    /// For a composite key this is the first key column — use
+    /// [`primary_keys`](Self::primary_keys) when all of them are needed.
     pub fn primary_key(&self) -> Option<&'static FieldMeta> {
         self.fields.iter().find(|f| f.primary_key)
+    }
+
+    /// Every primary-key column, in declaration order — one for a simple key,
+    /// several for a composite one (ADR 0042).
+    pub fn primary_keys(&self) -> impl Iterator<Item = &'static FieldMeta> + '_ {
+        self.fields.iter().filter(|f| f.primary_key)
+    }
+
+    /// Whether this model has a composite (multi-column) primary key.
+    pub fn is_composite_pk(&self) -> bool {
+        self.primary_keys().count() > 1
     }
 
     /// The field holding the tenant, for `tenant_scoped` models.
@@ -158,6 +171,140 @@ impl ModelMeta {
 // The distributed slice. Each `#[derive(Model)]` emits one `inventory::submit!`,
 // and the linker gathers them; nothing enumerates models by hand.
 inventory::collect!(ModelMeta);
+
+/// Marks one field of one model as its optimistic-locking version column.
+///
+/// Kept in a slice of its own rather than as a flag on [`FieldMeta`]: the version
+/// is read only by the write seam (`save`/`update_if_version`), never by the pure
+/// compiler, so it does not belong in the metadata the compiler reads — the same
+/// discipline `dorm-rag` uses for `RagMeta`. `#[field(version)]` emits one of
+/// these; [`ModelMeta::version_field`] resolves it back to the column (ADR 0023).
+#[derive(Debug, Clone, Copy)]
+pub struct VersionMeta {
+    /// The model name, matching [`ModelMeta::name`].
+    pub model: &'static str,
+    /// The Rust field name carrying the version counter.
+    pub field: &'static str,
+}
+
+inventory::collect!(VersionMeta);
+
+impl ModelMeta {
+    /// This model's optimistic-locking version field, if one was declared with
+    /// `#[field(version)]`. Resolved through the [`VersionMeta`] slice, then the
+    /// field looked up by name so the caller gets the full [`FieldMeta`].
+    pub fn version_field(&self) -> Option<&'static FieldMeta> {
+        let name = inventory::iter::<VersionMeta>
+            .into_iter()
+            .find(|v| v.model == self.name)?
+            .field;
+        self.field(name)
+    }
+
+    /// This model's soft-delete timestamp field, if declared with
+    /// `#[model(soft_delete)]`. Resolved through the [`SoftDeleteMeta`] slice
+    /// (ADR 0033), so `FieldMeta`/`ModelMeta` gain no field — the same discipline
+    /// as `version`. A soft-delete model's rows are hidden by `deleted_at IS NULL`
+    /// by default and removed only by a purge.
+    pub fn soft_delete_field(&self) -> Option<&'static FieldMeta> {
+        let name = inventory::iter::<SoftDeleteMeta>
+            .into_iter()
+            .find(|v| v.model == self.name)?
+            .field;
+        self.field(name)
+    }
+
+    /// This model's composite (multi-column) indexes, declared with
+    /// `@@index([a, b])` in the schema or `#[model(index_together = "a, b")]` on
+    /// the struct (ADR 0044). Each item is a group of column names.
+    ///
+    /// Resolved through the [`IndexMeta`] slice rather than a field on
+    /// [`ModelMeta`] — the same discipline as `version`/`soft_delete`: a composite
+    /// index is read only by the migrator (never by the pure compiler), so it does
+    /// not belong in the metadata the compiler reads, and `ModelMeta` gains no
+    /// field (and no ~30 literal constructors need touching).
+    pub fn composite_indexes(&self) -> impl Iterator<Item = &'static [&'static str]> + '_ {
+        inventory::iter::<IndexMeta>
+            .into_iter()
+            .filter(move |v| v.model == self.name)
+            .map(|v| v.columns)
+    }
+}
+
+/// Marks one composite index on a model: a group of column names to index
+/// together (ADR 0044). In its own slice rather than on [`ModelMeta`], so the
+/// metadata the compiler reads is unchanged; only the migrator reads it, the same
+/// way `VersionMeta`/`SoftDeleteMeta` keep write-seam concerns out of the
+/// compiler's view. One `#[model(index_together = "a, b")]` (or `@@index([a, b])`)
+/// emits one of these.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMeta {
+    /// The model name, matching [`ModelMeta::name`].
+    pub model: &'static str,
+    /// The column names of this index, in order.
+    pub columns: &'static [&'static str],
+}
+
+inventory::collect!(IndexMeta);
+
+/// A native enum type declared on a field with
+/// `#[field(enum_type = "…", enum_variants = "…")]` (ADR 0046): the SQL type name
+/// and its ordered variants. Kept in a slice so the migrator can emit
+/// `CREATE TYPE … AS ENUM (…)` and so `FieldType` carries only the type's name
+/// (a `Copy` `&'static str`) rather than a growing list of labels. The same type
+/// may be declared on several fields; [`enum_variants`] dedupes by name.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumMeta {
+    /// The SQL enum type name, matching [`crate::value::FieldType::Enum`].
+    pub type_name: &'static str,
+    /// The variants, in declaration order — the order PostgreSQL stores and sorts.
+    pub variants: &'static [&'static str],
+}
+
+inventory::collect!(EnumMeta);
+
+/// The variants of the native enum type named `type_name`, or `None` if no model
+/// declares it. Resolved through the [`EnumMeta`] slice (ADR 0046).
+pub fn enum_variants(type_name: &str) -> Option<&'static [&'static str]> {
+    inventory::iter::<EnumMeta>
+        .into_iter()
+        .find(|e| e.type_name == type_name)
+        .map(|e| e.variants)
+}
+
+/// Every distinct native enum type declared across the given models, as
+/// `(type_name, variants)`, deduped by name — what the migrator iterates to emit
+/// `CREATE TYPE` once per type (ADR 0046).
+pub fn enum_types_of(
+    models: &[&'static ModelMeta],
+) -> Vec<(&'static str, &'static [&'static str])> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut out: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    for m in models {
+        for f in m.fields {
+            if let crate::value::FieldType::Enum(name) = f.ty {
+                if !seen.contains(&name) {
+                    seen.push(name);
+                    if let Some(vs) = enum_variants(name) {
+                        out.push((name, vs));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Marks a model as soft-deleting, naming its `deleted_at`-style timestamp column
+/// (ADR 0033). In its own slice rather than on [`ModelMeta`], so the metadata is
+/// unchanged; the scope seam reads it to hide deleted rows by default.
+#[derive(Debug, Clone, Copy)]
+pub struct SoftDeleteMeta {
+    pub model: &'static str,
+    pub field: &'static str,
+}
+
+inventory::collect!(SoftDeleteMeta);
 
 #[cfg(test)]
 mod tests {
@@ -262,11 +409,84 @@ mod tests {
         assert!(META.tenant_field().is_none());
     }
 
+    // A versioned model, registered the way the derive does it: a `VersionMeta`
+    // in the slice, naming the column. `version_field` resolves it back.
+    inventory::submit! { VersionMeta { model: "Versioned", field: "rev" } }
+
+    const VFIELDS: &[FieldMeta] = &[
+        FieldMeta {
+            name: "id",
+            column: "id",
+            ty: FieldType::I64,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+        FieldMeta {
+            name: "rev",
+            column: "rev",
+            ty: FieldType::I64,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: false,
+            max_length: None,
+            default: Some("0"),
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        },
+    ];
+
+    const VMETA: ModelMeta = ModelMeta {
+        name: "Versioned",
+        table: "versioned",
+        fields: VFIELDS,
+        ordering: &[],
+        tenant_scoped: false,
+        unique_together: &[],
+        checks: &[],
+    };
+
+    #[test]
+    fn the_version_field_resolves_through_the_slice_and_is_absent_otherwise() {
+        assert_eq!(VMETA.version_field().map(|f| f.name), Some("rev"));
+        assert!(META.version_field().is_none());
+    }
+
     #[test]
     fn on_delete_round_trips_through_its_attribute_spelling() {
         assert_eq!(OnDelete::parse("cascade"), Some(OnDelete::Cascade));
         assert_eq!(OnDelete::parse("set_null"), Some(OnDelete::SetNull));
         assert_eq!(OnDelete::parse("explode"), None);
         assert_eq!(OnDelete::SetNull.sql(), "SET NULL");
+    }
+
+    // Two composite indexes on one model, registered the way the derive does it:
+    // one `IndexMeta` per group. `composite_indexes` resolves them back (ADR 0044).
+    inventory::submit! { IndexMeta { model: "Indexed", columns: &["tenant", "created_at"] } }
+    inventory::submit! { IndexMeta { model: "Indexed", columns: &["status"] } }
+
+    #[test]
+    fn composite_indexes_resolve_through_the_slice_and_are_empty_otherwise() {
+        const IMETA: ModelMeta = ModelMeta {
+            name: "Indexed",
+            table: "indexed",
+            fields: &[],
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let groups: Vec<Vec<&str>> = IMETA.composite_indexes().map(|g| g.to_vec()).collect();
+        assert_eq!(groups, vec![vec!["tenant", "created_at"], vec!["status"]]);
+        // A model with no `IndexMeta` submission has no composite indexes.
+        assert_eq!(META.composite_indexes().count(), 0);
     }
 }

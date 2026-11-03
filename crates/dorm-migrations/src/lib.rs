@@ -36,7 +36,10 @@
 pub mod autodetect;
 pub mod ddl;
 pub mod history;
+pub mod lint;
 pub mod migrator;
+pub mod online;
+pub mod partition;
 
 /// What can go wrong building or applying a migration.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +60,19 @@ pub enum Error {
     /// message names the table and what changed; the next version handles these.
     #[error("unsupported schema change: {0}")]
     UnsupportedChange(String),
+    /// A declared column rename does not line up with the schema: its source
+    /// column is not in the previous snapshot, or its target is not in the
+    /// current models. The message names the table and columns.
+    #[error("invalid column rename: {0}")]
+    InvalidRename(String),
+    /// A migration would DROP a column and ADD another of the **same type** in
+    /// the same table — which silently loses the dropped column's data if it is
+    /// really a rename. Rather than guess, DORM refuses: declare the rename (a
+    /// [`ColumnRename`], or `@map` in the schema) so it becomes a data-preserving
+    /// `RENAME COLUMN`; if the columns are genuinely unrelated, make the drop and
+    /// the add in separate migrations. The message names the table and columns.
+    #[error("ambiguous column change (possible rename): {0}")]
+    AmbiguousColumnChange(String),
     /// A problem reading or writing the on-disk migration history: a directory
     /// that cannot be read, a file that is not valid JSON, or a backend that does
     /// not match the migrations already there. The message says which.
@@ -66,6 +82,13 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub use autodetect::{autodetect, make_migration, Snapshot};
+pub use autodetect::{
+    autodetect, autodetect_with_renames, make_migration, make_migration_with_renames, ColumnRename,
+    Snapshot,
+};
 pub use history::{History, StoredMigration};
-pub use migrator::{diff, initial, migrate, sync, Migration};
+pub use migrator::{diff, initial, migrate, revert, sync, Migration};
+pub use online::{
+    backfill, check_compat, is_non_transactional, migrate_online, BackfillReport, BackfillSpec,
+    Incompatibility,
+};

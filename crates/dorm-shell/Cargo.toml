@@ -12,13 +12,13 @@ publish = false
 # proof: the shell never names a column or a table, only reads them back from the
 # registry the derive macro populated.
 
+# The installable CLI (`dorm-cli`) owns the `dorm` binary name; this REPL is an
+# internal/example crate (`publish = false`), so its binary is `dorm-shell` to
+# avoid the output-filename collision that two `dorm` targets caused under
+# `cargo build --workspace` and `cargo doc`.
 [[bin]]
-name = "dorm"
+name = "dorm-shell"
 path = "src/main.rs"
-# Both this REPL and `dorm-cli` build a binary named `dorm`; `cargo doc` writes
-# both to the same path and refuses the collision. The CLI is the one whose docs
-# matter, so the REPL opts out — the binary itself is unaffected.
-doc = false
 
 [dependencies]
 dorm-core = { path = "../dorm-core" }
@@ -26,4 +26,11 @@ dorm-core = { path = "../dorm-core" }
 # model's metadata in `main` is what stops the linker from dropping the crate —
 # and with it the `inventory::submit!` that registers the models.
 dorm-models = { path = "../dorm-models" }
+# RAG in the REPL (ADR 0019, brick 6): the `search` verb and `:rag`. A binary may
+# depend on the optional crates; no shared library gains an edge from this. The
+# derive lets the shell declare its own RAG model to search over.
+dorm-derive = { path = "../dorm-derive", features = ["rag"] }
+dorm-rag = { path = "../dorm-rag", features = ["embed-ollama"] }
+# `:rag setup` creates the RAG shadow tables and triggers so `search` works.
+dorm-migrations = { path = "../dorm-migrations" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
