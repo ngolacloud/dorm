@@ -83,7 +83,7 @@ pub const NO_PREPARE_ENV: &str = "DELONIX_ORM_NO_PREPARE";
 /// (`DISCARD ALL` as well). The resilient default costs one empty round trip per
 /// checkout; `fast` is the opt-out for a latency-critical, stable deployment.
 pub const POOL_RECYCLING_ENV: &str = "DELONIX_ORM_POOL_RECYCLING";
-/// How many times [`acquire`] retries a transient connection failure — a database
+/// How many times `acquire` retries a transient connection failure — a database
 /// restarting, or a momentarily exhausted pool — before giving up. `0` disables
 /// retry. **Only the acquire is retried**, never a statement already in flight:
 /// a connection breaking mid-write could have committed, so retrying it might
@@ -119,7 +119,7 @@ static DEFAULT_DB: OnceLock<Database> = OnceLock::new();
 
 tokio::task_local! {
     /// The [`Database`] in scope for this task, if any. Set by [`with_session`]
-    /// and consulted by every statement before it falls back to [`DEFAULT_DB`].
+    /// and consulted by every statement before it falls back to `DEFAULT_DB`.
     /// This is what carries a per-session database — a tenant's, or a
     /// primary/replica pair — down to the `db::*` calls without threading a
     /// handle through every `QuerySet` method (the same task-local shape the
@@ -387,7 +387,7 @@ pub fn guard_write(op: &'static str) -> Result<()> {
 /// This is the handle that replaced the single process-wide pool. A process can
 /// hold as many as it needs — one per tenant, a primary/replica pair — and reach
 /// one for a unit of work with [`with_session`], instead of every `db::*` call
-/// implicitly meaning the one global pool. The [`DEFAULT_DB`] built from the
+/// implicitly meaning the one global pool. The `DEFAULT_DB` built from the
 /// environment is just the most common case of this, kept so the embedded
 /// single-database path needs no session at all.
 ///
@@ -524,7 +524,7 @@ where
 ///
 /// Kept for callers that want the process pool directly — the pool-stats gauge,
 /// chiefly. It is deliberately the *default*: a statement does not go through
-/// here, it goes through [`acquire`], which honours the session in scope. This
+/// here, it goes through `acquire`, which honours the session in scope. This
 /// returns the global so the embedded single-database path is unchanged.
 pub fn pool() -> Result<&'static Pool> {
     Ok(&default_db()?.primary)
@@ -937,7 +937,7 @@ pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRo
 /// Run a read on a read replica when the active [`Database`] has one — otherwise
 /// identical to [`query`]. This is the entry the typed read funnel uses for a
 /// `StatementKind::Read`; a transaction in scope keeps it on the primary (a
-/// transaction must read its own writes), as [`Database::pool_for`] enforces.
+/// transaction must read its own writes), as `Database::pool_for` enforces.
 pub async fn query_read(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
     query_routed(sql, params, Route::ReadReplica).await
 }
@@ -1191,7 +1191,7 @@ impl Driver for MySqlDriver {
     }
 }
 
-/// Run a row-returning statement on the active backend's [`Driver`], taking ORM
+/// Run a row-returning statement on the active backend's `Driver`, taking ORM
 /// values and handing back backend-agnostic [`Row`]s. Keeps the
 /// transaction-in-scope routing (PostgreSQL via `CURRENT_TX`; SQLite via its own
 /// task-local), and always runs on the primary.
@@ -1221,7 +1221,7 @@ async fn fetch_routed(sql: &str, params: &[Value], route: Route) -> Result<Vec<R
     }
 }
 
-/// Run a statement for its row count on the active backend's [`Driver`].
+/// Run a statement for its row count on the active backend's `Driver`.
 pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
     match backend()? {
         Backend::Postgres => PostgresDriver.run(sql, params).await,

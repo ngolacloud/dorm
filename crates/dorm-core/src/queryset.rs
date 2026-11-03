@@ -217,7 +217,7 @@ impl<T: Model> Manager<T> {
     ///
     /// The bug this closes: `get_or_create`/`update_or_create` run
     /// `SELECT → INSERT → SELECT`. When the caller wraps the whole thing in
-    /// [`db::atomic`](crate::db::atomic), all three share one dedicated
+    /// [`db::atomic`], all three share one dedicated
     /// connection. A bare `INSERT` that loses the race fails with `23505` and
     /// **aborts that transaction**, so the recovery `SELECT` comes back with
     /// `25P02 current transaction is aborted` instead of the winner's row — the
