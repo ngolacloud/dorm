@@ -473,6 +473,57 @@ pub async fn set_local(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------- read-your-writes (L8)
+//
+// A read-your-writes token is the primary's WAL write position (`pg_lsn`)
+// captured right after a write. A read that must see that write asks a replica
+// whether it has replayed at least that far ([`replica_caught_up`]); if not, the
+// caller waits or falls back to the primary (ADR 0030). The LSN is opaque text;
+// its only operation is the `>=` comparison PostgreSQL defines on `pg_lsn`.
+
+/// The primary's current WAL write position — the token to pass to a later read
+/// that must see this write (ADR 0030). Call it right after the write. Errors on
+/// a standby (where the equivalent is the replay LSN, not the write LSN).
+pub async fn write_lsn() -> Result<String> {
+    let rows = fetch("SELECT pg_current_wal_lsn()::text", &[]).await?;
+    rows.first()
+        .ok_or_else(|| Error::Db("pg_current_wal_lsn returned no row".into()))?
+        .try_get::<String>(0)
+}
+
+/// Whether the connection this runs on has replayed WAL up to `token` — the
+/// check a read-your-writes read makes against a replica before trusting it.
+/// `token` is a [`write_lsn`] value. On a server that is not in recovery (a
+/// primary) `pg_last_wal_replay_lsn()` is `NULL`, so this is `false`: the caller
+/// should route such a read to the primary, which trivially has its own writes.
+pub async fn replica_caught_up(token: &str) -> Result<bool> {
+    // `($1 || '')::pg_lsn`, not `$1::pg_lsn`: the concatenation forces the server
+    // to infer the parameter as text (what we send), where a direct cast would
+    // make it infer `pg_lsn` and misread the text bytes (the parameter-type
+    // inference trap — see ADR 0025).
+    let rows = fetch(
+        "SELECT COALESCE(pg_last_wal_replay_lsn() >= ($1 || '')::pg_lsn, false)",
+        &[Value::Text(token.to_string())],
+    )
+    .await?;
+    rows.first()
+        .ok_or_else(|| Error::Db("the replay-lsn check returned no row".into()))?
+        .try_get::<bool>(0)
+}
+
+/// The replica's replication lag in seconds, or `None` on a server that is not a
+/// streaming standby (a primary has no `pg_last_xact_replay_timestamp()`). The
+/// measurement a lag-aware router uses to eject a replica that has fallen too far
+/// behind (ADR 0030).
+pub async fn replica_lag_seconds() -> Result<Option<f64>> {
+    let rows = fetch(
+        "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::double precision",
+        &[],
+    )
+    .await?;
+    Ok(rows.first().and_then(|r| r.try_get::<f64>(0).ok()))
+}
+
 /// A database: a primary connection pool, an optional read replica, and the
 /// read-only default for sessions that run against it.
 ///
