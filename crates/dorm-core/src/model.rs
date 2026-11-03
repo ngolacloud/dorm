@@ -167,7 +167,7 @@ pub async fn refresh_instance<T: Model>(obj: &mut T) -> Result<()> {
 /// and the reload must see the uncommitted rows.
 ///
 /// How the keys are known depends on who supplies them. A serial/identity key
-/// ([`FieldMeta::is_database_generated`]) the database assigns: `last_insert_id`
+/// ([`FieldMeta::is_database_generated`](crate::meta::FieldMeta::is_database_generated)) the database assigns: `last_insert_id`
 /// is the first and a single `INSERT` lays the block down contiguously, so the
 /// keys are `first .. first + affected`. A caller-supplied key — a `TEXT`
 /// primary key like the DBaaS `tenant_databases.addon_name` — is already in the
