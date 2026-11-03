@@ -1,6 +1,14 @@
-# ADR 0015 — Controlo de concorrência
+# ADR 0060 — Controlo de concorrência
 
-Status: Proposed · 2026-10-31
+Status: **Partially superseded** · see [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0015 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0015](0015-connection-resilience.md).
+> **Partially superseded by [ADR 0023](0023-optimistic-concurrency.md)** (optimistic
+> concurrency + safe `set_local`). The pessimistic-locking primitives — `SELECT …
+> FOR UPDATE`/`SKIP LOCKED`/`NOWAIT`, per-transaction `lock_timeout`, isolation
+> levels and serialization-failure classification — remain a pending ORM roadmap
+> item (transactional primitives any embedder can drive).
 
 ## Context
 
@@ -45,7 +53,7 @@ SQL cru:
   e reserva pessimista.
 - **`set_local(key, value)` seguro.** Para `lock_timeout`,
   `idle_in_transaction_session_timeout` e GUCs de RLS (p. ex. `app.tenant_id`, o
-  mecanismo da RLS do ADR 0014). A **chave** é validada contra uma allow-list de
+  mecanismo da RLS do ADR 0059). A **chave** é validada contra uma allow-list de
   GUCs permitidos (nunca vem livre do cliente); o **valor** é ligado como `$1`.
 - **Optimistic locking por coluna `version`.** Incremento + `WHERE version =
   $old`, com erro se zero linhas forem afectadas.
@@ -71,7 +79,7 @@ SQL cru:
 
 - **Prós:** DORM passa a suportar cargas concorrentes de grau DBA pela abstracção
   — isolamento configurável, retry de serialização, locks pessimistas,
-  optimistic locking e GUCs transaccionais (que também servem a RLS do ADR 0014)
+  optimistic locking e GUCs transaccionais (que também servem a RLS do ADR 0059)
   — em vez de obrigar a cair em SQL cru que não compõe com o `QuerySet`.
 - **Contras / custo:** o retry re-executa o *closure* da transacção, pelo que o
   *closure* tem de ser idempotente/sem efeitos externos; `SERIALIZABLE` traz
@@ -83,6 +91,6 @@ SQL cru:
   e provados live (uma fila de trabalho com `SKIP LOCKED` não bloqueia);
   `set_local` recusa uma chave fora da allow-list e liga o valor; optimistic
   locking falha quando a versão mudou sob os pés.
-- **Dependências:** o `set_local` seguro é o mecanismo do GUC de RLS do ADR 0014;
+- **Dependências:** o `set_local` seguro é o mecanismo do GUC de RLS do ADR 0059;
   independente dos ADRs 0010-0013, mas o retry/isolamento mapeiam-se às sessões
-  transaccionais remotas do ADR 0012 quando expostos por rede.
+  transaccionais remotas do ADR 0057 quando expostos por rede.
