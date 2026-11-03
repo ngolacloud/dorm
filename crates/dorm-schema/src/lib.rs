@@ -100,8 +100,8 @@ pub struct Model {
     /// The PostgreSQL schema (`namespace`) this model belongs to, or `None` for a
     /// top-level model (ADR: namespaces, DORM-B2). The namespace — not the file —
     /// is a model's identity: moving a `namespace` block between files changes
-    /// nothing. A relation may not cross namespaces; [`validate`](crate::validate)
-    /// enforces that boundary.
+    /// nothing. A relation may not cross namespaces; [`validate()`] enforces that
+    /// boundary.
     pub namespace: Option<String>,
     /// The table, defaulting to the snake_case plural of `name`.
     pub table: String,
