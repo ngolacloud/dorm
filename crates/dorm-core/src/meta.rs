@@ -213,7 +213,39 @@ impl ModelMeta {
             .field;
         self.field(name)
     }
+
+    /// This model's composite (multi-column) indexes, declared with
+    /// `@@index([a, b])` in the schema or `#[model(index_together = "a, b")]` on
+    /// the struct (ADR 0044). Each item is a group of column names.
+    ///
+    /// Resolved through the [`IndexMeta`] slice rather than a field on
+    /// [`ModelMeta`] — the same discipline as `version`/`soft_delete`: a composite
+    /// index is read only by the migrator (never by the pure compiler), so it does
+    /// not belong in the metadata the compiler reads, and `ModelMeta` gains no
+    /// field (and no ~30 literal constructors need touching).
+    pub fn composite_indexes(&self) -> impl Iterator<Item = &'static [&'static str]> + '_ {
+        inventory::iter::<IndexMeta>
+            .into_iter()
+            .filter(move |v| v.model == self.name)
+            .map(|v| v.columns)
+    }
 }
+
+/// Marks one composite index on a model: a group of column names to index
+/// together (ADR 0044). In its own slice rather than on [`ModelMeta`], so the
+/// metadata the compiler reads is unchanged; only the migrator reads it, the same
+/// way `VersionMeta`/`SoftDeleteMeta` keep write-seam concerns out of the
+/// compiler's view. One `#[model(index_together = "a, b")]` (or `@@index([a, b])`)
+/// emits one of these.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMeta {
+    /// The model name, matching [`ModelMeta::name`].
+    pub model: &'static str,
+    /// The column names of this index, in order.
+    pub columns: &'static [&'static str],
+}
+
+inventory::collect!(IndexMeta);
 
 /// Marks a model as soft-deleting, naming its `deleted_at`-style timestamp column
 /// (ADR 0033). In its own slice rather than on [`ModelMeta`], so the metadata is
@@ -386,5 +418,27 @@ mod tests {
         assert_eq!(OnDelete::parse("set_null"), Some(OnDelete::SetNull));
         assert_eq!(OnDelete::parse("explode"), None);
         assert_eq!(OnDelete::SetNull.sql(), "SET NULL");
+    }
+
+    // Two composite indexes on one model, registered the way the derive does it:
+    // one `IndexMeta` per group. `composite_indexes` resolves them back (ADR 0044).
+    inventory::submit! { IndexMeta { model: "Indexed", columns: &["tenant", "created_at"] } }
+    inventory::submit! { IndexMeta { model: "Indexed", columns: &["status"] } }
+
+    #[test]
+    fn composite_indexes_resolve_through_the_slice_and_are_empty_otherwise() {
+        const IMETA: ModelMeta = ModelMeta {
+            name: "Indexed",
+            table: "indexed",
+            fields: &[],
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        let groups: Vec<Vec<&str>> = IMETA.composite_indexes().map(|g| g.to_vec()).collect();
+        assert_eq!(groups, vec![vec!["tenant", "created_at"], vec!["status"]]);
+        // A model with no `IndexMeta` submission has no composite indexes.
+        assert_eq!(META.composite_indexes().count(), 0);
     }
 }

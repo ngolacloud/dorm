@@ -92,6 +92,8 @@ pub struct Model {
     /// `@@id([a, b])` — the composite primary key's columns, empty for a simple
     /// or absent key (ADR 0043).
     pub composite_id: Vec<String>,
+    /// `@@index([a, b])` groups — composite indexes (ADR 0044).
+    pub indexes: Vec<Vec<String>>,
 }
 
 /// A model's `@@rag(..)` declaration, parsed from the schema.

@@ -337,7 +337,25 @@ pub fn set_not_null(table: &str, column: &str) -> Result<String> {
 /// one place the index name is spelled, shared by [`indexes`] and the
 /// autodetector so a dropped index names exactly what a created one made.
 pub fn index_on(table: &str, column: &str) -> String {
-    format!("CREATE INDEX IF NOT EXISTS {table}_{column}_idx ON {table} ({column})")
+    index_on_cols(table, &[column])
+}
+
+/// The composite form: `CREATE INDEX IF NOT EXISTS <table>_<c1>_<c2>_idx ON
+/// <table> (<c1>, <c2>)` (ADR 0044). The single-column [`index_on`] is this with
+/// one column, so one naming rule serves both and a dropped index names exactly
+/// what a created one made.
+pub fn index_on_cols(table: &str, columns: &[&str]) -> String {
+    let name = index_name(table, columns);
+    format!(
+        "CREATE INDEX IF NOT EXISTS {name} ON {table} ({})",
+        columns.join(", ")
+    )
+}
+
+/// The one place a (possibly composite) index name is spelled:
+/// `<table>_<c1>_<c2>_idx`.
+pub fn index_name(table: &str, columns: &[&str]) -> String {
+    format!("{table}_{}_idx", columns.join("_"))
 }
 
 /// Like [`index_on`] but non-blocking on PostgreSQL (B-22).
@@ -351,13 +369,20 @@ pub fn index_on(table: &str, column: &str) -> String {
 /// transactional table changes. SQLite has no `CONCURRENTLY`, so it falls back
 /// to the plain form.
 pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> String {
+    index_on_cols_concurrent(table, &[column], backend)
+}
+
+/// The composite form of [`index_on_concurrent`] (ADR 0044).
+pub fn index_on_cols_concurrent(table: &str, columns: &[&str], backend: Backend) -> String {
+    let name = index_name(table, columns);
+    let cols = columns.join(", ");
     match backend {
         // MySQL has no `CREATE INDEX CONCURRENTLY`.
-        Backend::MySql => index_on(table, column),
-        Backend::Postgres => format!(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_{column}_idx ON {table} ({column})"
-        ),
-        Backend::Sqlite => index_on(table, column),
+        Backend::MySql => index_on_cols(table, columns),
+        Backend::Postgres => {
+            format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({cols})")
+        }
+        Backend::Sqlite => index_on_cols(table, columns),
     }
 }
 
@@ -450,11 +475,18 @@ fn relation_target(model: &'static str) -> Result<(&'static str, &'static str)> 
 /// A `unique` column already has an index; this mirrors the hand-written schema,
 /// which declares the explicit index anyway when the field asks for one.
 pub fn indexes(meta: &ModelMeta) -> Vec<String> {
-    meta.fields
+    let mut out: Vec<String> = meta
+        .fields
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on(meta.table, f.column))
-        .collect()
+        .collect();
+    // Composite indexes (`@@index([a, b])`, ADR 0044) come from the `IndexMeta`
+    // slice, not a `ModelMeta` field.
+    for group in meta.composite_indexes() {
+        out.push(index_on_cols(meta.table, group));
+    }
+    out
 }
 
 /// Like [`indexes`] but each index builds `CONCURRENTLY` on PostgreSQL (B-22), so
@@ -462,11 +494,16 @@ pub fn indexes(meta: &ModelMeta) -> Vec<String> {
 /// indexes to a possibly-populated table where a blocking build would stop
 /// writes.
 pub fn indexes_concurrent(meta: &ModelMeta, backend: Backend) -> Vec<String> {
-    meta.fields
+    let mut out: Vec<String> = meta
+        .fields
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on_concurrent(meta.table, f.column, backend))
-        .collect()
+        .collect();
+    for group in meta.composite_indexes() {
+        out.push(index_on_cols_concurrent(meta.table, group, backend));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -856,6 +893,74 @@ mod tests {
         assert_eq!(
             with_ts, 1,
             "the CURRENT_TIMESTAMP default filled created_at"
+        );
+    }
+
+    #[test]
+    fn a_composite_index_names_and_spans_all_its_columns() {
+        // Pure: no database, no registered model — the name is one rule, shared
+        // with the single-column form, and spans every column (ADR 0044).
+        assert_eq!(
+            index_on_cols("events", &["tenant", "created_at"]),
+            "CREATE INDEX IF NOT EXISTS events_tenant_created_at_idx ON events (tenant, created_at)"
+        );
+        // A single column goes through the same path as `index_on`.
+        assert_eq!(
+            index_on("events", "tenant"),
+            index_on_cols("events", &["tenant"])
+        );
+        // Concurrent on PostgreSQL; the fallback on SQLite is the plain form.
+        assert_eq!(
+            index_on_cols_concurrent("events", &["tenant", "created_at"], Backend::Postgres),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS events_tenant_created_at_idx \
+             ON events (tenant, created_at)"
+        );
+        assert_eq!(
+            index_on_cols_concurrent("events", &["a", "b"], Backend::Sqlite),
+            index_on_cols("events", &["a", "b"])
+        );
+    }
+
+    // A model with a composite index, registered the way the derive does it: an
+    // `IndexMeta` in the slice. `indexes()` appends its `CREATE INDEX` after the
+    // per-field ones (ADR 0044).
+    dorm_core::inventory::submit! {
+        dorm_core::meta::IndexMeta { model: "IdxModel", columns: &["tenant", "created_at"] }
+    }
+
+    #[test]
+    fn indexes_include_the_composite_groups_after_the_per_field_ones() {
+        const FS: &[FieldMeta] = &[FieldMeta {
+            name: "slug",
+            column: "slug",
+            ty: FieldType::Text,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            index: true,
+            max_length: None,
+            default: None,
+            auto_now_add: false,
+            auto_now: false,
+            relation: None,
+        }];
+        const M: ModelMeta = ModelMeta {
+            name: "IdxModel",
+            table: "idx_models",
+            fields: FS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+        assert_eq!(
+            indexes(&M),
+            vec![
+                "CREATE INDEX IF NOT EXISTS idx_models_slug_idx ON idx_models (slug)".to_string(),
+                "CREATE INDEX IF NOT EXISTS idx_models_tenant_created_at_idx \
+                 ON idx_models (tenant, created_at)"
+                    .to_string(),
+            ]
         );
     }
 }

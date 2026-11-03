@@ -78,6 +78,16 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
                 }
             }
         }
+        for group in &m.indexes {
+            for col in group {
+                if !has_column(m, col) {
+                    issues.push(Issue::error(
+                        &m.name,
+                        format!("`@@index` column `{col}` is not a column of the model"),
+                    ));
+                }
+            }
+        }
 
         let Some(rag) = &m.rag else { continue };
 

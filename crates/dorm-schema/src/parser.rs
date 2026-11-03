@@ -197,6 +197,7 @@ impl Parser {
         let mut rag = None;
         let mut unique_together: Vec<Vec<String>> = Vec::new();
         let mut composite_id: Vec<String> = Vec::new();
+        let mut indexes: Vec<Vec<String>> = Vec::new();
         self.punct('{')?;
         let mut fields = Vec::new();
         loop {
@@ -212,6 +213,7 @@ impl Parser {
                         BlockAttr::Rag(r) => rag = Some(r),
                         BlockAttr::Unique(cols) => unique_together.push(cols),
                         BlockAttr::Id(cols) => composite_id = cols,
+                        BlockAttr::Index(cols) => indexes.push(cols),
                         BlockAttr::Ignored => {}
                     }
                 }
@@ -226,6 +228,7 @@ impl Parser {
             rag,
             unique_together,
             composite_id,
+            indexes,
         })
     }
 
@@ -237,17 +240,19 @@ impl Parser {
         if name == "rag" {
             return Ok(BlockAttr::Rag(self.rag_block()?));
         }
-        // `@@unique([a, b])` and `@@id([a, b])` carry a column list that the AST
-        // now models (ADR 0043); `@@index([…])` and anything else are still parsed
-        // and dropped (a composite index has no home in `ModelMeta` yet).
-        if (name == "unique" || name == "id") && self.peek() == Some(&Tok::Punct('(')) {
+        // `@@unique([a, b])`, `@@id([a, b])` and `@@index([a, b])` carry a column
+        // list the AST models (ADR 0043/0044); anything else is still parsed and
+        // dropped.
+        if matches!(name.as_str(), "unique" | "id" | "index")
+            && self.peek() == Some(&Tok::Punct('('))
+        {
             self.punct('(')?;
             let cols = self.ident_list()?;
             self.punct(')')?;
-            return Ok(if name == "unique" {
-                BlockAttr::Unique(cols)
-            } else {
-                BlockAttr::Id(cols)
+            return Ok(match name.as_str() {
+                "unique" => BlockAttr::Unique(cols),
+                "id" => BlockAttr::Id(cols),
+                _ => BlockAttr::Index(cols),
             });
         }
         let mut result = BlockAttr::Ignored;
@@ -539,7 +544,9 @@ enum BlockAttr {
     Unique(Vec<String>),
     /// `@@id([a, b])` — a composite primary key (ADR 0043).
     Id(Vec<String>),
-    /// Anything else (`@@index`, …): valid, but not modelled by the AST.
+    /// `@@index([a, b])` — a composite index (ADR 0044).
+    Index(Vec<String>),
+    /// Anything else: valid, but not modelled by the AST.
     Ignored,
 }
 

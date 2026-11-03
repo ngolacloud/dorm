@@ -71,9 +71,24 @@ fn model(schema: &Schema, m: &Model) -> String {
     }
     // `@@unique([a, b])` groups ride in the `#[model(..)]` attribute: the derive
     // accepts one `unique_together = "a, b"` per group (ADR 0043).
+    // Columns are snake_cased to the generated column names — the derive feeds
+    // these straight into SQL as column names, so `createdAt` must become
+    // `created_at`.
+    let cols = |group: &[String]| {
+        group
+            .iter()
+            .map(|c| snake(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut model_args = format!("table = \"{}\"", m.table);
     for group in &m.unique_together {
-        let _ = write!(model_args, ", unique_together = \"{}\"", group.join(", "));
+        let _ = write!(model_args, ", unique_together = \"{}\"", cols(group));
+    }
+    // `@@index([a, b])` groups ride in the same attribute as `index_together`,
+    // one per group (ADR 0044).
+    for group in &m.indexes {
+        let _ = write!(model_args, ", index_together = \"{}\"", cols(group));
     }
     let _ = writeln!(out, "#[model({model_args})]");
     if let Some(rag) = &m.rag {
@@ -374,5 +389,33 @@ mod tests {
     fn no_block_attrs_means_no_change() {
         let rust = generate_rust(&parse(BLOG).expect("parses"));
         assert!(!rust.contains("unique_together"), "{rust}");
+        assert!(!rust.contains("index_together"), "{rust}");
+    }
+
+    /// `@@index([a, b])` round-trips to `index_together`, one per group (ADR 0044).
+    #[test]
+    fn composite_indexes_reach_the_derive() {
+        let src = r#"
+            model Event {
+              id        Int      @id @default(autoincrement())
+              tenant    String   @db.VarChar(40)
+              status    String   @db.VarChar(20)
+              createdAt DateTime @default(now())
+              @@index([tenant, createdAt])
+              @@index([status])
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        assert_eq!(
+            schema.models[0].indexes,
+            vec![vec!["tenant", "createdAt"], vec!["status"]]
+        );
+        let rust = generate_rust(&schema);
+        // Field names are snake_cased into the model attribute, one per group.
+        assert!(
+            rust.contains("index_together = \"tenant, created_at\""),
+            "{rust}"
+        );
+        assert!(rust.contains("index_together = \"status\""), "{rust}");
     }
 }
