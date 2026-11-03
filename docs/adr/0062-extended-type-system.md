@@ -1,6 +1,12 @@
-# ADR 0017 — Sistema de tipos alargado
+# ADR 0062 — Sistema de tipos alargado
 
-Status: Proposed · 2026-10-31
+Status: **Superseded** · see [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0017 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0017](0017-sqlite-reader-pool-wal.md).
+> **Superseded by [ADR 0025](0025-extended-type-system.md)** (extended type
+> system), with [ADR 0040](0040-network-types.md) (network), 0041 (array),
+> [ADR 0046](0046-native-enum-types.md) (native enum) and 0048 (cidr/macaddr).
 
 ## Context
 

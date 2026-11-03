@@ -1,6 +1,14 @@
-# ADR 0012 — Data Plane `dorm-server`: gRPC como caminho crítico, REST/OpenAPI derivados
+# ADR 0057 — Data Plane `dorm-server`: gRPC como caminho crítico, REST/OpenAPI derivados
 
-Status: Proposed · 2026-10-31
+Status: **Rejected** · see [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0012 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0012](0012-native-cqrs.md).
+> **Rejected:** DORM ships no in-repo gRPC data plane (`dorm-server`). Narrow,
+> read-only, one-module tooling access to a module's data — if ever needed — is a
+> consuming project's own binary, never the way services talk to each other
+> (that is contracts and events). This keeps DORM one database, one transaction,
+> one process.
 
 ## Context
 
@@ -22,8 +30,8 @@ Tudo o que não seja um embedder Rust fica sem caminho de produção (H11).
 ## Decision
 
 Criar o Data Plane `dorm-server`, um crate novo sobre `tonic`, como **caminho
-crítico gRPC**, servindo o serviço `dorm.v1.Query` definido no ADR 0010 sobre o
-catálogo em runtime do ADR 0011. O REST/OpenAPI é **derivado da mesma
+crítico gRPC**, servindo o serviço `dorm.v1.Query` definido no ADR 0055 sobre o
+catálogo em runtime do ADR 0056. O REST/OpenAPI é **derivado da mesma
 definição**, não escrito à mão.
 
 - **Streaming de linhas.** RPCs de leitura devolvem `stream QueryRow` em vez de
@@ -50,8 +58,8 @@ SQL: cada RPC desemboca nas funções `compile_*` existentes (`compile_select`/
 
 ### Como preserva os invariantes do `ARCHITECTURE.md`
 
-- **I1 / I2:** cada RPC converte a `Query` do IR (ADR 0010) num `Plan` validado
-  contra o descritor (ADR 0011) e desemboca no compilador → `$n`. O servidor não
+- **I1 / I2:** cada RPC converte a `Query` do IR (ADR 0055) num `Plan` validado
+  contra o descritor (ADR 0056) e desemboca no compilador → `$n`. O servidor não
   constrói identificadores nem interpola valores; limita-se a transportar o IR e
   a gerir a sessão transaccional.
 - **I3 (o compilador não faz I/O):** todo o I/O — pool, transacções, *deadlines*,
@@ -62,9 +70,9 @@ SQL: cada RPC desemboca nas funções `compile_*` existentes (`compile_select`/
 
 - **Prós:** existe pela primeira vez um Data Plane de grau de produção: gRPC com
   *streaming*, transacções remotas seguras e um contrato REST/OpenAPI que não
-  diverge. É o ponto de entrada da segurança/multi-tenancy (ADR 0014), do
-  controlo de concorrência remoto (ADR 0015) e dos objectos de BD remotos
-  (ADR 0013).
+  diverge. É o ponto de entrada da segurança/multi-tenancy (ADR 0059), do
+  controlo de concorrência remoto (ADR 0060) e dos objectos de BD remotos
+  (ADR 0058).
 - **Contras / custo:** um servidor de longa duração traz gestão de sessões,
   TTLs, *idempotency keys* e *backpressure* de *streaming* — superfície
   operacional nova. A tradução transcoding gRPC↔REST tem um custo de manutenção,
@@ -75,5 +83,5 @@ SQL: cada RPC desemboca nas funções `compile_*` existentes (`compile_select`/
   (SQLSTATE `57014`); ciclo de vida de sessão transaccional (Begin/Exec/Commit,
   Rollback, expiração por TTL com `ROLLBACK`, reenvio idempotente); teste de que
   o OpenAPI gerado corresponde aos RPCs (nenhuma rota à mão).
-- **Dependências:** depende do ADR 0010 (Query IR) e do ADR 0011 (catálogo em
+- **Dependências:** depende do ADR 0055 (Query IR) e do ADR 0056 (catálogo em
   runtime); é a fundação dos ADRs 0013, 0014 e do acesso remoto do 0015.

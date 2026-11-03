@@ -1,6 +1,13 @@
-# ADR 0016 — Migrações zero-downtime
+# ADR 0061 — Migrações zero-downtime
 
-Status: Proposed · 2026-10-31
+Status: **Superseded** · see [ADR 0054](0054-orm-boundary.md)
+
+> Renumbered from ADR 0016 — a 2026-10-31 review-branch proposal that collided
+> with the accepted [ADR 0016](0016-wider-value-float-and-bytes.md).
+> **Superseded by [ADR 0022](0022-online-migrations.md)** (online migrations) and
+> [ADR 0038](0038-online-migration-applier.md) (online applier), with
+> [ADR 0046](0046-native-enum-types.md) for `ALTER TYPE … ADD VALUE`. The
+> expand/contract phase classification is a pending ORM roadmap item.
 
 ## Context
 
@@ -38,7 +45,7 @@ Tornar o migrador capaz de operar sem *stop-the-world*:
   separadamente (o padrão `atomic = False`/`AddIndexConcurrently` do Django).
 - **`lock_timeout` por migração.** `SET LOCAL lock_timeout` no início da
   transacção de migração, para que uma espera por lock falhe em vez de empilhar
-  ligações indefinidamente (o `set_local` seguro é o do ADR 0015).
+  ligações indefinidamente (o `set_local` seguro é o do ADR 0060).
 - **Detecção de renomeação.** Heurística (mesmo tipo + posição, uma só coluna
   sumiu e uma só apareceu) com **confirmação do operador**, ou um atributo
   explícito `@@renamed_from`/operação `RenameColumn` na história, emitindo
@@ -82,5 +89,5 @@ Tornar o migrador capaz de operar sem *stop-the-world*:
   pendurar; uma renomeação é detectada/confirmada e emite `RENAME COLUMN`
   (preservando os dados) — e, sem confirmação, é recusada em vez de destrutiva;
   backfill em lotes popula a coluna antes do `SET NOT NULL`.
-- **Dependências:** usa o `set_local` seguro do ADR 0015 (`lock_timeout`);
+- **Dependências:** usa o `set_local` seguro do ADR 0060 (`lock_timeout`);
   independente do eixo gateway (ADRs 0010-0014).

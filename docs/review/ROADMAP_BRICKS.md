@@ -9,6 +9,14 @@
 > Regra de honestidade (roadmap): um backend sem a capacidade devolve **erro
 > explícito**, nunca resultado errado.
 
+
+> **Alignment note (2026-11-03) — [ADR 0054, the ORM boundary](../adr/0054-orm-boundary.md).**
+> These waves predate the boundary. The 2026-10-31 proposals they cite were
+> renumbered to resolve collisions (0010–0017 → 0055–0062). Waves whose work
+> landed now point at the accepted ADR; **Wave 8 (polyglot externalization) is
+> rejected by ADR 0054** — broker/HTTP/data-plane capabilities move to the
+> framework layer, not DORM.
+
 ---
 
 ## Vaga 1 — Correcção (defeitos provados ao vivo; sem desestabilizar o núcleo)
@@ -66,7 +74,7 @@
 
 ---
 
-## Vaga 2 — Concorrência (grau DBA) · ADR 0015
+## Vaga 2 — Concorrência (grau DBA) · ADR 0060 (partially superseded by ADR 0023)
 
 ### B-07 · Nível de isolamento por transacção — Alto · M
 - **Mudança:** `atomic_with(IsolationLevel, read_only)` → `BEGIN ISOLATION LEVEL …`.
@@ -97,7 +105,7 @@
 
 ---
 
-## Vaga 3 — Conexões e sessão (fim do estado global) · ADR 0014 (parte)
+## Vaga 3 — Conexões e sessão (fim do estado global) · ADR 0059 (parte)
 
 ### B-12 · `Database` explícito substitui o pool global — Crítico (habilitador) · L
 - **Achado:** DESIGN-01/H1/H13, SEC-03/H15.
@@ -116,7 +124,7 @@
 
 ---
 
-## Vaga 4 — Sistema de tipos · ADR 0017
+## Vaga 4 — Sistema de tipos · ADR 0062 (superseded by ADR 0025)
 
 ### B-14 · Tipos escalares sem ambiguidade (`f32`/`f64`/`i16`/`date`/`time`/`bytea`) — Médio · M
 - **Achado:** DBA-04/H5.
@@ -145,7 +153,7 @@
 
 ---
 
-## Vaga 6 — Objectos de BD como código · ADR 0016 (parte)
+## Vaga 6 — Objectos de BD como código · ADR 0061 (parte)
 
 ### B-21 · Índices avançados (composto/parcial/expressão/`INCLUDE`/GIN/GiST/BRIN) — Alto · M
 ### B-22 · `CREATE INDEX CONCURRENTLY` fora da transacção — Crítico · M
@@ -160,7 +168,7 @@
 
 ---
 
-## Vaga 7 — Migrações zero-downtime · ADR 0016
+## Vaga 7 — Migrações zero-downtime · ADR 0061 (superseded by ADR 0022/0038)
 
 ### B-24 · Detecção de renomeação (fim da perda de dados) — Crítico · M
 - **Achado:** MIG-02.
@@ -176,7 +184,7 @@
 
 ---
 
-## Vaga 8 — Externalização poliglota · ADRs 0010–0013
+## Vaga 8 — Externalização poliglota · ADRs 0055–0058 (REJECTED — ADR 0054)
 
 ### B-28 · Crate `dorm-ir`: `Plan` ↔ Query IR (`dorm.v1` proto) — Alto · L
 - **Achado:** GW-01/DESIGN-03/H12. **ADR:** 0010.

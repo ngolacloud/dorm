@@ -93,6 +93,13 @@ pub enum Error {
     #[error("model `{0}` is tenant-scoped but no tenant is in scope (use with_tenant or with_system_scope)")]
     TenantScopeMissing(&'static str),
 
+    /// A statement ran with no database session in scope while strict sessions
+    /// are enabled. A framework turns strict sessions on so a statement is never
+    /// run against the process-global default by accident; open a session for
+    /// the unit of work with `with_session` (DORM-B1).
+    #[error("{0}")]
+    SessionMissing(&'static str),
+
     /// An idempotency key was reused with a **different** request — the same key
     /// must mean the same operation, so this is refused rather than replaying a
     /// response that does not belong to this request (ADR 0032).

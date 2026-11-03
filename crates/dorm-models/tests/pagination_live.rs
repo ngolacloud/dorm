@@ -49,6 +49,9 @@ fn setup(dsn: &str) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     const SCHEMA_LOCK: i64 = 0x0024_9a9e;
     ONCE.call_once(|| {
+        // The library no longer defaults the cursor signing key; a consumer
+        // configures it. This test installs the development key.
+        dorm_core::cursor::set_dev_cursor_key();
         std::env::set_var(dorm_core::db::DSN_ENV, dsn);
         runtime().block_on(async {
             db::atomic(|_tx| async {

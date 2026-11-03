@@ -14,22 +14,67 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
+use std::sync::RwLock;
+
 use crate::error::{Error, Result};
 use crate::value::Value;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The env var holding the signing key. A fixed development key is used when it
-/// is unset, so cursors work out of the box; production sets its own so cursors
-/// cannot be forged across deployments.
+/// The environment variable the **CLI** reads to configure the cursor signing
+/// key. The library never reads the environment: a framework or application
+/// passes the key by API with [`set_cursor_key`], and only the `dorm` CLI reads
+/// this name and forwards it. Named here as the canonical variable.
 pub const CURSOR_KEY_ENV: &str = "DELONIX_ORM_CURSOR_KEY";
 
-fn signing_key() -> Vec<u8> {
-    std::env::var(CURSOR_KEY_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(String::into_bytes)
-        .unwrap_or_else(|| b"dorm-dev-cursor-key".to_vec())
+/// The well-known development key. Cursors signed with it are forgeable, so it
+/// is for local development only, installed explicitly via [`set_dev_cursor_key`].
+const DEV_CURSOR_KEY: &[u8] = b"dorm-dev-cursor-key";
+
+/// The process-wide cursor signing key, configured programmatically. `None`
+/// until set: there is deliberately **no default outside development**, so a
+/// production service that forgets to configure a key gets a typed error rather
+/// than silently forgeable cursors.
+static CURSOR_KEY: RwLock<Option<Vec<u8>>> = RwLock::new(None);
+
+/// Sets the HMAC signing key for keyset cursors. A framework or application
+/// calls this once at startup with a secret from its own configuration — never
+/// read from the environment inside a library. The last call wins.
+pub fn set_cursor_key(key: impl Into<Vec<u8>>) {
+    *CURSOR_KEY.write().expect("cursor key lock poisoned") = Some(key.into());
+}
+
+/// Installs the well-known development key, for local use only. The `dorm` CLI
+/// calls this when no real key is configured; a production service must instead
+/// call [`set_cursor_key`] with a real secret.
+pub fn set_dev_cursor_key() {
+    set_cursor_key(DEV_CURSOR_KEY.to_vec());
+}
+
+/// Whether a cursor signing key has been configured.
+pub fn cursor_key_is_configured() -> bool {
+    CURSOR_KEY
+        .read()
+        .expect("cursor key lock poisoned")
+        .is_some()
+}
+
+fn signing_key() -> Result<Vec<u8>> {
+    key_or_error(CURSOR_KEY.read().expect("cursor key lock poisoned").clone())
+}
+
+/// The key-resolution rule, pure so it is testable without the global: a
+/// configured key passes through; its absence is a typed error, never a silent
+/// default.
+fn key_or_error(configured: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    configured.ok_or_else(|| {
+        Error::Config(
+            "keyset cursor signing key is not configured; call \
+             dorm_core::cursor::set_cursor_key(..) with a secret (or \
+             set_dev_cursor_key() for local development)"
+                .into(),
+        )
+    })
 }
 
 /// Encode one boundary value as a tagged, self-describing string. Only the types
@@ -88,7 +133,7 @@ fn payload(fingerprint: &str, boundary: &[Value]) -> Result<String> {
 /// Encode a signed cursor for `boundary`, bound to `fingerprint`.
 pub fn encode(fingerprint: &str, boundary: &[Value]) -> Result<String> {
     let body = payload(fingerprint, boundary)?;
-    let mut mac = HmacSha256::new_from_slice(&signing_key()).expect("HMAC takes any key length");
+    let mut mac = HmacSha256::new_from_slice(&signing_key()?).expect("HMAC takes any key length");
     mac.update(body.as_bytes());
     let sig = mac.finalize().into_bytes();
     Ok(format!(
@@ -112,7 +157,7 @@ pub fn decode(fingerprint: &str, token: &str) -> Result<Vec<Value>> {
         .decode(sig_b64)
         .map_err(|_| Error::Config("cursor is malformed".into()))?;
 
-    let mut mac = HmacSha256::new_from_slice(&signing_key()).expect("HMAC takes any key length");
+    let mut mac = HmacSha256::new_from_slice(&signing_key()?).expect("HMAC takes any key length");
     mac.update(&body);
     mac.verify_slice(&sig)
         .map_err(|_| Error::Config("cursor signature is invalid (tampered or wrong key)".into()))?;
@@ -146,14 +191,23 @@ mod tests {
         ]
     }
 
+    /// Every test that mints or decodes a cursor needs a configured key; the
+    /// dev key is shared by all of them, so setting it is safe under the
+    /// parallel test runner (every call installs the same bytes).
+    fn with_dev_key() {
+        set_dev_cursor_key();
+    }
+
     #[test]
     fn a_cursor_round_trips_under_its_own_fingerprint() {
+        with_dev_key();
         let tok = encode("fp-A", &sample()).unwrap();
         assert_eq!(decode("fp-A", &tok).unwrap(), sample());
     }
 
     #[test]
     fn a_cursor_from_another_query_is_refused() {
+        with_dev_key();
         let tok = encode("fp-A", &sample()).unwrap();
         let err = decode("fp-B", &tok).unwrap_err().to_string();
         assert!(err.contains("different query"), "{err}");
@@ -161,6 +215,7 @@ mod tests {
 
     #[test]
     fn a_tampered_cursor_is_refused() {
+        with_dev_key();
         let tok = encode("fp-A", &sample()).unwrap();
         // Flip a character in the body half.
         let (body, sig) = tok.split_once('.').unwrap();
@@ -172,7 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfigured_key_is_a_typed_error_not_a_default() {
+        // Pure rule, independent of the global: no key -> typed error; a key
+        // passes through. This is the production safety guarantee — no silent
+        // forgeable default outside development.
+        let err = key_or_error(None).unwrap_err().to_string();
+        assert!(err.contains("not configured"), "{err}");
+        assert!(key_or_error(Some(b"secret".to_vec())).is_ok());
+    }
+
+    #[test]
     fn a_timestamp_boundary_survives_the_round_trip() {
+        with_dev_key();
         let now = Utc::now();
         let tok = encode("fp", &[Value::Timestamp(now)]).unwrap();
         match decode("fp", &tok).unwrap().as_slice() {
