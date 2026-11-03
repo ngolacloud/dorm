@@ -37,12 +37,23 @@ ponte — a abstração provou-se completa para o [[0031]].
   at-least-once, com ack do broker; cliente puro-Rust mantém o build sem toolchain
   de C. A escolha de `Publisher` + `forward` acomodou três brokers heterogéneos
   (subject/queue/topic) sem mudar a ponte.
-- **Decisões/limites (honesto):** produz na **partição 0** (chave-based
-  partitioning fica para um `Publisher` que leia o nº de partições); sem
-  compressão (`NoCompression`); auth/TLS/SASL por `ClientBuilder` ou follow-up; a
+- **Decisões/limites (honesto):** sem compressão (`NoCompression`); a
   de-duplicação no consumidor continua a ser o inbox do [[0031]]. O `rskafka` é
   deliberadamente de baixo nível (sem consumer-groups geridos) — o DORM só
   **produz**; consumir é do serviço a jusante.
+
+## Follow-up landed
+
+- **Partitioning por chave:** o `publish` deixou de produzir sempre na partição 0;
+  agora lê a contagem de partições do tópico (cacheada, via `list_topics`) e
+  escolhe a partição por um hash estável da chave (FNV-1a do `id` do evento, o
+  partitioner próprio do DORM, não o murmur2 do Kafka). Eventos da mesma chave
+  mantêm a ordem numa partição; o fluxo espalha-se pelas restantes. Prova live
+  (`kafka_live.rs::distinct_keys_spread_across_partitions`): 30 chaves distintas
+  num tópico de 3 partições espalham-se por 3/3.
+- **Auth/TLS/SASL:** disponíveis pelo `ClientBuilder` do `rskafka`
+  (`tls_config`/`sasl_config`); `KafkaPublisher::from_client` recebe um cliente
+  pré-construído para esse efeito.
 
 ## Proof
 

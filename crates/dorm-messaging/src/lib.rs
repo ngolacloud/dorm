@@ -320,22 +320,30 @@ pub mod amqp {
 /// The Kafka broker backend (ADR 0053), behind the `kafka` feature.
 ///
 /// A [`KafkaPublisher`] carries [`CloudEvent`]s to a Kafka topic as CloudEvents
-/// **structured** JSON (the event `id` is the record key, for log compaction and
-/// partitioning), using the pure-Rust `rskafka` client — no `librdkafka`/C. A
-/// `produce` returns only once the broker has acked, so the relay does not advance
-/// its cursor on an unacknowledged publish. Pair it with [`OutboxBus::forward`] for
-/// the durable, at-least-once path.
+/// **structured** JSON, using the pure-Rust `rskafka` client — no `librdkafka`/C.
+/// The event `id` is the record key, and the publisher hashes it to choose the
+/// partition, so all events with the same key keep their order on one partition
+/// while the stream spreads across the rest (ADR 0053). A `produce` returns only
+/// once the broker has acked, so the relay does not advance its cursor on an
+/// unacknowledged publish. Pair it with [`OutboxBus::forward`] for the durable,
+/// at-least-once path. TLS/SASL are available through `rskafka`'s `ClientBuilder`
+/// (`tls_config`/`sasl_config`); [`KafkaPublisher::from_client`] takes a
+/// pre-built client for that.
 #[cfg(feature = "kafka")]
 pub mod kafka {
     use super::{CloudEvent, Error, Publisher, Result};
     use rskafka::client::partition::{Compression, UnknownTopicHandling};
     use rskafka::client::{Client, ClientBuilder};
     use rskafka::record::Record;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
 
     /// A [`Publisher`] that produces to a Kafka broker.
     pub struct KafkaPublisher {
         client: Client,
+        /// Cached partition count per topic, so the key→partition choice does not
+        /// re-fetch metadata on every publish.
+        partitions: Mutex<HashMap<String, i32>>,
     }
 
     impl KafkaPublisher {
@@ -351,7 +359,38 @@ pub mod kafka {
                 .build()
                 .await
                 .map_err(|e| Error::Db(format!("Kafka connect failed: {e}")))?;
-            Ok(KafkaPublisher { client })
+            Ok(Self::from_client(client))
+        }
+
+        /// Wrap a pre-built `rskafka` [`Client`] — the seam for TLS/SASL, which are
+        /// configured on the `ClientBuilder` before `build()` (ADR 0053).
+        pub fn from_client(client: Client) -> Self {
+            KafkaPublisher {
+                client,
+                partitions: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// The partition count for `topic`, cached. A topic not found yet (not
+        /// created) reads as a single partition and is not cached, so a later
+        /// publish re-checks once it exists.
+        async fn partition_count(&self, topic: &str) -> Result<i32> {
+            if let Some(n) = self.partitions.lock().unwrap().get(topic).copied() {
+                return Ok(n);
+            }
+            let topics = self
+                .client
+                .list_topics()
+                .await
+                .map_err(|e| Error::Db(format!("Kafka list_topics failed: {e}")))?;
+            match topics.iter().find(|t| t.name == topic) {
+                Some(t) => {
+                    let n = (t.partitions.len() as i32).max(1);
+                    self.partitions.lock().unwrap().insert(topic.to_string(), n);
+                    Ok(n)
+                }
+                None => Ok(1),
+            }
         }
 
         /// The underlying client, for a caller that wants to consume or manage
@@ -385,14 +424,25 @@ pub mod kafka {
     }
 
     impl Publisher for KafkaPublisher {
-        /// Produce the CloudEvents-JSON envelope to `topic` (partition 0), the
-        /// event `id` as the record key, and await the broker's ack.
+        /// Produce the CloudEvents-JSON envelope to `topic`, the event `id` as the
+        /// record key and the partition chosen by hashing that key, and await the
+        /// broker's ack. A same-key stream stays ordered on one partition; the keys
+        /// spread across the rest (ADR 0053).
         async fn publish(&self, topic: &str, event: &CloudEvent) -> Result<()> {
             let bytes = serde_json::to_vec(&event.to_json())
                 .map_err(|e| Error::Db(format!("CloudEvent serialize failed: {e}")))?;
-            let partition = self
+            let n = self.partition_count(topic).await?;
+            // A stable key→partition choice (DORM's own, not Kafka's murmur2): the
+            // same key always lands on the same partition, which is what keeps a
+            // key's events ordered; consumers read every partition regardless.
+            let partition = if n <= 1 {
+                0
+            } else {
+                (fnv1a(event.id.as_bytes()) % n as u64) as i32
+            };
+            let pc = self
                 .client
-                .partition_client(topic.to_string(), 0, UnknownTopicHandling::Retry)
+                .partition_client(topic.to_string(), partition, UnknownTopicHandling::Retry)
                 .await
                 .map_err(|e| Error::Db(format!("Kafka partition_client failed: {e}")))?;
             let record = Record {
@@ -401,12 +451,22 @@ pub mod kafka {
                 headers: BTreeMap::new(),
                 timestamp: rskafka::chrono::Utc::now(),
             };
-            partition
-                .produce(vec![record], Compression::NoCompression)
+            pc.produce(vec![record], Compression::NoCompression)
                 .await
                 .map_err(|e| Error::Db(format!("Kafka produce failed: {e}")))?;
             Ok(())
         }
+    }
+
+    /// FNV-1a over the key bytes — a small, deterministic, dependency-free hash so
+    /// the key→partition mapping is stable across processes and builds.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
     }
 }
 

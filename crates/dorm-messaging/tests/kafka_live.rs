@@ -18,6 +18,7 @@ use dorm_core::db;
 use dorm_messaging::kafka::KafkaPublisher;
 use dorm_messaging::{CloudEvent, OutboxBus, Publisher};
 use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
+use std::collections::BTreeSet;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
@@ -141,5 +142,73 @@ async fn outbox_events_are_forwarded_to_kafka_at_least_once() {
 
     eprintln!(
         "ok: 3 outbox events forwarded to Kafka and fetched back intact; cursor is idempotent"
+    );
+}
+
+/// Key-hashed partitioning (ADR 0053 follow-up): events with distinct keys spread
+/// across a multi-partition topic, instead of all landing on partition 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a live Kafka (DORM_KAFKA_BROKERS)"]
+async fn distinct_keys_spread_across_partitions() {
+    let Some(brokers) = var("DORM_KAFKA_BROKERS") else {
+        eprintln!("skipped: DORM_KAFKA_BROKERS is not set");
+        return;
+    };
+    let topic = "l7-kafka-partitioned";
+    let publisher = KafkaPublisher::connect(&brokers).await.expect("connect");
+    publisher
+        .ensure_topic(topic, 3, 1)
+        .await
+        .expect("ensure 3-partition topic");
+
+    // Record each partition's end before publishing, so we count only this run.
+    let mut starts = Vec::new();
+    for p in 0..3i32 {
+        let pc = publisher
+            .client()
+            .partition_client(topic.to_string(), p, UnknownTopicHandling::Retry)
+            .await
+            .expect("partition client");
+        starts.push(pc.get_offset(OffsetAt::Latest).await.expect("offset"));
+    }
+
+    // Publish 30 events with distinct ids directly through the publisher.
+    for i in 0..30i64 {
+        let ev = CloudEvent::new(
+            format!("key-{i}"),
+            "/ngolacloud/compute",
+            "app.deployed",
+            serde_json::json!({ "n": i }),
+        );
+        publisher.publish(topic, &ev).await.expect("publish");
+    }
+
+    // Count the partitions that received records this run.
+    let mut used = BTreeSet::new();
+    let mut total = 0;
+    for p in 0..3i32 {
+        let pc = publisher
+            .client()
+            .partition_client(topic.to_string(), p, UnknownTopicHandling::Retry)
+            .await
+            .expect("partition client");
+        let (recs, _hw) = pc
+            .fetch_records(starts[p as usize], 1..1_000_000, 1_000)
+            .await
+            .expect("fetch");
+        if !recs.is_empty() {
+            used.insert(p);
+            total += recs.len();
+        }
+    }
+    assert_eq!(total, 30, "every event landed somewhere");
+    assert!(
+        used.len() >= 2,
+        "distinct keys must spread across more than one partition, used {used:?}"
+    );
+
+    eprintln!(
+        "ok: 30 distinct keys spread across {} of 3 partitions",
+        used.len()
     );
 }
