@@ -845,6 +845,74 @@ impl Database {
             .await
             .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
     }
+
+    /// Proactively eject read replicas that lag more than `max_lag_secs` behind
+    /// the primary, so reads stop landing on a stale standby *before* a user sees
+    /// old data — the lag-aware companion to the reactive connection-failure
+    /// ejection (ADR 0050 follow-up, over the [`replica_lag_seconds`] primitive of
+    /// ADR 0030).
+    ///
+    /// Measures each replica's `now() - pg_last_xact_replay_timestamp()` on its own
+    /// pool and ejects the laggards for the usual cooldown (so they rejoin
+    /// automatically once caught up and the cooldown passes); a replica that cannot
+    /// even be reached is ejected too. A primary (not a standby) reports `NULL`
+    /// lag, read as `0` — never ejected. Returns how many it ejected.
+    ///
+    /// Caller-driven: an app runs this on a timer (e.g. every few seconds). It is
+    /// not on the read hot path, which must not pay a lag round-trip per query.
+    pub async fn eject_lagging_replicas(&self, max_lag_secs: f64) -> Result<usize> {
+        let now = now_unix();
+        let cooldown = env_u64(REPLICA_EJECT_COOLDOWN_ENV, REPLICA_EJECT_COOLDOWN_DEFAULT);
+        let mut ejected = 0;
+        for (idx, replica) in self.replicas.iter().enumerate() {
+            let conn = match replica.pool.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    // Unreachable → eject, like the reactive path.
+                    replica
+                        .ejected_until
+                        .store(now.saturating_add(cooldown), Ordering::Relaxed);
+                    ejected += 1;
+                    tracing::warn!(
+                        target: "dorm::db", replica = idx, error = %e,
+                        "ejecting an unreachable read replica during a lag check"
+                    );
+                    continue;
+                }
+            };
+            // Caught up (all received WAL replayed) → 0, even on an idle primary
+            // where `pg_last_xact_replay_timestamp()` alone would read stale; only
+            // a real gap (received ≠ replayed) reports the time delta. `NULL` on a
+            // primary (not a standby) → 0, never ejected.
+            let lag: f64 = match conn
+                .query_one(
+                    "SELECT CASE \
+                       WHEN pg_last_wal_receive_lsn() IS NULL THEN 0 \
+                       WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0 \
+                       ELSE COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())), 0) \
+                     END::float8",
+                    &[],
+                )
+                .await
+            {
+                Ok(row) => row.get(0),
+                // Could not measure (a transient error): leave it to the reactive
+                // path rather than ejecting on a measurement blip.
+                Err(_) => continue,
+            };
+            if lag > max_lag_secs {
+                replica
+                    .ejected_until
+                    .store(now.saturating_add(cooldown), Ordering::Relaxed);
+                ejected += 1;
+                tracing::warn!(
+                    target: "dorm::db", replica = idx, lag_secs = lag, max_lag_secs,
+                    "ejecting a read replica that lags too far behind the primary"
+                );
+            }
+        }
+        Ok(ejected)
+    }
 }
 
 /// Unix seconds now, for the replica ejection clock (ADR 0050). Wall-clock

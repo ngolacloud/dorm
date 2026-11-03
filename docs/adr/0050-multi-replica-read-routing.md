@@ -53,6 +53,19 @@ vírgula). `replica_count()` expõe o número configurado.
   round-robin é o primeiro corte). A escolha da réplica não consulta o lag no
   caminho quente (acrescentaria uma ida ao servidor por leitura).
 
+## Follow-up landed
+
+**Ejeção proactiva por lag:** `Database::eject_lagging_replicas(max_lag_secs)` —
+sonda, no pool de cada réplica, `pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()`
+(caught-up → lag 0, mesmo num primário ocioso, evitando o falso-positivo do
+`pg_last_xact_replay_timestamp` isolado) e, com folga, o delta temporal; ejecta as
+réplicas acima do limite (e as inalcançáveis) pelo mesmo cooldown, pelo que
+reentram sozinhas ao apanhar. Conduzido-pelo-chamador (a app corre-o num temporizador),
+fora do caminho quente de leitura. Prova live
+(`replica_lag_ejection_live.rs`): uma réplica caught-up não é ejectada; com o
+replay pausado e uma escrita no primário (received ≠ replayed), passado o limite
+é ejectada e a leitura cai no primário; ao retomar, recupera.
+
 ## Proof
 
 - **Offline:** `make check` verde — `Database` recompila com a frota; o caminho de
