@@ -58,6 +58,27 @@ impl Issue {
 pub fn validate(schema: &Schema) -> Vec<Issue> {
     let mut issues = Vec::new();
     for m in &schema.models {
+        // `@@id([..])`/`@@unique([..])` must name real columns — a typo would
+        // otherwise silently promote nothing to a key (ADR 0043).
+        for col in &m.composite_id {
+            if !has_column(m, col) {
+                issues.push(Issue::error(
+                    &m.name,
+                    format!("`@@id` column `{col}` is not a column of the model"),
+                ));
+            }
+        }
+        for group in &m.unique_together {
+            for col in group {
+                if !has_column(m, col) {
+                    issues.push(Issue::error(
+                        &m.name,
+                        format!("`@@unique` column `{col}` is not a column of the model"),
+                    ));
+                }
+            }
+        }
+
         let Some(rag) = &m.rag else { continue };
 
         if m.primary_key().is_none() {
@@ -214,6 +235,44 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.message.contains("must be smaller than chunk_size")));
+    }
+
+    #[test]
+    fn a_composite_key_or_unique_naming_a_missing_column_is_rejected() {
+        let src = r#"
+            model RegionCode {
+              region String
+              code   String
+              @@id([region, cdoe])
+              @@unique([regino, code])
+            }
+        "#;
+        let issues = validate(&parse(src).expect("parses"));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("`@@id` column `cdoe`")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("`@@unique` column `regino`")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_composite_key_validates_clean() {
+        let src = r#"
+            model RegionCode {
+              region String
+              code   String
+              @@id([region, code])
+              @@unique([region, code])
+            }
+        "#;
+        assert!(validate(&parse(src).expect("parses")).is_empty());
     }
 
     #[test]

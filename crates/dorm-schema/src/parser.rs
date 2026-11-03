@@ -195,6 +195,8 @@ impl Parser {
         let name = self.ident()?;
         let mut table = pluralized_table(&name);
         let mut rag = None;
+        let mut unique_together: Vec<Vec<String>> = Vec::new();
+        let mut composite_id: Vec<String> = Vec::new();
         self.punct('{')?;
         let mut fields = Vec::new();
         loop {
@@ -208,6 +210,8 @@ impl Parser {
                     match self.block_attr()? {
                         BlockAttr::Map(t) => table = t,
                         BlockAttr::Rag(r) => rag = Some(r),
+                        BlockAttr::Unique(cols) => unique_together.push(cols),
+                        BlockAttr::Id(cols) => composite_id = cols,
                         BlockAttr::Ignored => {}
                     }
                 }
@@ -220,6 +224,8 @@ impl Parser {
             table,
             fields,
             rag,
+            unique_together,
+            composite_id,
         })
     }
 
@@ -230,6 +236,19 @@ impl Parser {
         let name = self.ident()?;
         if name == "rag" {
             return Ok(BlockAttr::Rag(self.rag_block()?));
+        }
+        // `@@unique([a, b])` and `@@id([a, b])` carry a column list that the AST
+        // now models (ADR 0043); `@@index([…])` and anything else are still parsed
+        // and dropped (a composite index has no home in `ModelMeta` yet).
+        if (name == "unique" || name == "id") && self.peek() == Some(&Tok::Punct('(')) {
+            self.punct('(')?;
+            let cols = self.ident_list()?;
+            self.punct(')')?;
+            return Ok(if name == "unique" {
+                BlockAttr::Unique(cols)
+            } else {
+                BlockAttr::Id(cols)
+            });
         }
         let mut result = BlockAttr::Ignored;
         if self.eat_punct('(') {
@@ -248,6 +267,24 @@ impl Parser {
             }
         }
         Ok(result)
+    }
+
+    /// A bracketed list of identifiers: `[a, b, c]` — the shape `@@unique`/`@@id`
+    /// take.
+    fn ident_list(&mut self) -> R<Vec<String>> {
+        self.punct('[')?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_punct(']') {
+                break;
+            }
+            out.push(self.ident()?);
+            if !self.eat_punct(',') {
+                self.punct(']')?;
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Parse the args of `@@rag(fields: [title, body], embedder: "default", …)`.
@@ -498,6 +535,10 @@ enum BlockAttr {
     Map(String),
     /// `@@rag(..)` — the RAG declaration (ADR 0019).
     Rag(RagBlock),
+    /// `@@unique([a, b])` — a composite-unique group (ADR 0043).
+    Unique(Vec<String>),
+    /// `@@id([a, b])` — a composite primary key (ADR 0043).
+    Id(Vec<String>),
     /// Anything else (`@@index`, …): valid, but not modelled by the AST.
     Ignored,
 }

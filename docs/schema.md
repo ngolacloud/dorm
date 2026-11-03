@@ -73,9 +73,21 @@ becomes a `ForeignKey<Tenant>` whose `related_name` is `posts` (read off
 | `@map("col")` / `@@map("table")` | rename a column / table |
 | `@relation(onDelete: Cascade\|Restrict\|SetNull\|NoAction)` | the FK's delete action |
 
+## Block attributes
+
+| Attribute | Effect |
+|---|---|
+| `@@map("table")` | rename the table |
+| `@@id([a, b])` | a composite primary key — both columns become `primary_key` (ADR 0043) |
+| `@@unique([a, b])` | a composite unique constraint — one `unique_together` group per attribute (ADR 0043) |
+| `@@rag(…)` | opt the model into RAG (ADR 0019) |
+
+A column named by `@@id`/`@@unique` must be a real column of the model, or
+`dorm validate` names the typo.
+
 ## Not yet (roadmap)
 
-Composite primary keys, `@@unique`/`@@index` emission, table-level `@@check`,
-enums, default-ordering, and multi-file schemas. All additive — see
+Composite `@@index` emission (needs a new `ModelMeta` field), table-level
+`@@check`, enums, default-ordering, and multi-file schemas. All additive — see
 [roadmap.md](roadmap.md). Writing Rust models by hand still works; the schema is
 the tooled path.

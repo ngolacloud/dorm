@@ -69,14 +69,22 @@ fn model(schema: &Schema, m: &Model) -> String {
     } else {
         out.push_str("#[derive(Model, Debug, Clone)]\n");
     }
-    let _ = writeln!(out, "#[model(table = \"{}\")]", m.table);
+    // `@@unique([a, b])` groups ride in the `#[model(..)]` attribute: the derive
+    // accepts one `unique_together = "a, b"` per group (ADR 0043).
+    let mut model_args = format!("table = \"{}\"", m.table);
+    for group in &m.unique_together {
+        let _ = write!(model_args, ", unique_together = \"{}\"", group.join(", "));
+    }
+    let _ = writeln!(out, "#[model({model_args})]");
     if let Some(rag) = &m.rag {
         out.push_str(&rag_attr(rag));
     }
     let _ = writeln!(out, "pub struct {} {{", m.name);
     for f in &m.fields {
         match f {
-            Field::Scalar(s) => out.push_str(&scalar_field(s)),
+            // `@@id([a, b])` has no inline `@id`, so the columns it names are
+            // promoted to `primary_key` here (ADR 0043).
+            Field::Scalar(s) => out.push_str(&scalar_field(s, m.composite_id.contains(&s.name))),
             Field::ToOne(r) => out.push_str(&relation_field(schema, m, r)),
             // A `Target[]` is a reverse relation: no column, so no struct field.
             Field::ToMany { .. } => {}
@@ -127,9 +135,10 @@ fn rust_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn scalar_field(s: &crate::ScalarField) -> String {
+fn scalar_field(s: &crate::ScalarField, composite_pk: bool) -> String {
     let mut attrs: Vec<String> = Vec::new();
-    if s.primary_key {
+    // A `@@id([..])` member is a primary key even without an inline `@id`.
+    if s.primary_key || composite_pk {
         attrs.push("primary_key".into());
     }
     if s.unique {
@@ -314,5 +323,56 @@ mod tests {
         let rust = generate_rust(&parse(src).expect("parses"));
         // Only `fields` is emitted; the derive supplies template/embedder/sizes.
         assert!(rust.contains("#[rag(fields = [\"body\"])]"), "{rust}");
+    }
+
+    /// `@@unique([..])` and `@@id([..])` round-trip to the derive's attributes
+    /// (ADR 0043).
+    #[test]
+    fn composite_unique_and_id_reach_the_derive() {
+        let src = r#"
+            model RegionCode {
+              region String @db.VarChar(20)
+              code   String @db.VarChar(20)
+              label  String @db.VarChar(100)
+              @@id([region, code])
+              @@unique([region, label])
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let model = &schema.models[0];
+        // The AST captures both block attributes.
+        assert_eq!(model.composite_id, vec!["region", "code"]);
+        assert_eq!(model.unique_together, vec![vec!["region", "label"]]);
+
+        let rust = generate_rust(&schema);
+        // `@@unique` rides in the model attribute, one group per `unique_together`.
+        assert!(
+            rust.contains(
+                "#[model(table = \"region_codes\", unique_together = \"region, label\")]"
+            ),
+            "{rust}"
+        );
+        // `@@id` promotes both columns to `primary_key` even without an inline `@id`.
+        assert!(
+            rust.contains("#[field(primary_key, max_length = 20)]\n    pub region: String,"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("#[field(primary_key, max_length = 20)]\n    pub code: String,"),
+            "{rust}"
+        );
+        // A non-key column stays plain.
+        assert!(
+            rust.contains("#[field(max_length = 100)]\n    pub label: String,"),
+            "{rust}"
+        );
+    }
+
+    /// A schema with neither block attribute generates exactly what it did before:
+    /// no `unique_together`, no promoted keys (ADR 0043 is opt-in).
+    #[test]
+    fn no_block_attrs_means_no_change() {
+        let rust = generate_rust(&parse(BLOG).expect("parses"));
+        assert!(!rust.contains("unique_together"), "{rust}");
     }
 }

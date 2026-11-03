@@ -87,6 +87,11 @@ pub struct Model {
     /// for an ordinary model — and a schema with no `@@rag` anywhere generates
     /// byte-for-byte what it did before, pulling in no `dorm-rag` dependency.
     pub rag: Option<RagBlock>,
+    /// `@@unique([a, b])` groups — composite-unique constraints (ADR 0043).
+    pub unique_together: Vec<Vec<String>>,
+    /// `@@id([a, b])` — the composite primary key's columns, empty for a simple
+    /// or absent key (ADR 0043).
+    pub composite_id: Vec<String>,
 }
 
 /// A model's `@@rag(..)` declaration, parsed from the schema.
