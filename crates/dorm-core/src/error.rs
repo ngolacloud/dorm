@@ -161,6 +161,16 @@ pub fn classify_db(code: &str, msg: String) -> Error {
         // `statement_timeout` (ADR 0004). Surface it as a timeout, not a
         // generic database error, so a caller can react to it as one.
         QUERY_CANCELED => Error::Timeout(msg),
+        // `invalid_sql_statement_name` from a *prepared* statement is the
+        // signature of a transaction-mode pooler (PgBouncer) that is not forwarding
+        // protocol-level prepared statements: the server prepared `sN` on one
+        // backend and the next statement landed on another. Surface it with the
+        // actionable fix instead of the bare driver string (ADR 0034).
+        INVALID_STATEMENT_NAME if msg.contains("prepared statement") => Error::Config(format!(
+            "{msg} — this is the signature of a transaction-mode connection pooler \
+             (e.g. PgBouncer) without protocol-level prepared statements; set \
+             `DELONIX_ORM_NO_PREPARE=1` so DORM sends statements unprepared (ADR 0007/0034)"
+        )),
         _ => Error::Db(msg),
     }
 }
@@ -178,6 +188,11 @@ pub const MYSQL_DUPLICATE_ENTRY: &str = "1062";
 /// The SQLSTATE for `query_canceled` — what `statement_timeout` raises when it
 /// fires. [`classify_db`] turns it into [`Error::Timeout`].
 pub const QUERY_CANCELED: &str = "57014";
+
+/// The SQLSTATE for `invalid_sql_statement_name` — raised as
+/// `prepared statement "sN" does not exist` when a transaction-mode pooler
+/// drops the prepare. [`classify_db`] turns it into an actionable error (ADR 0034).
+pub const INVALID_STATEMENT_NAME: &str = "26000";
 
 /// Whether this error is a unique-constraint violation, on any backend.
 pub fn is_unique_violation(e: &Error) -> bool {
@@ -238,6 +253,25 @@ mod tests {
     #[test]
     fn an_ordinary_server_error_stays_a_db_error() {
         match classify_db("42P01", "ERROR [42P01]: relation does not exist".into()) {
+            Error::Db(_) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_prepared_statement_points_at_the_pooler_fix() {
+        // The PgBouncer-in-transaction-mode signature gets an actionable error
+        // naming the env flag, not the bare 26000 string (ADR 0034).
+        let msg = "ERROR [26000]: prepared statement \"s3\" does not exist".to_string();
+        match classify_db(INVALID_STATEMENT_NAME, msg) {
+            Error::Config(m) => assert!(m.contains("DELONIX_ORM_NO_PREPARE"), "{m}"),
+            other => panic!("expected an actionable Config error, got {other:?}"),
+        }
+        // A 26000 that is *not* about a prepared statement stays a plain Db error.
+        match classify_db(
+            INVALID_STATEMENT_NAME,
+            "ERROR [26000]: something else".into(),
+        ) {
             Error::Db(_) => {}
             other => panic!("expected Db, got {other:?}"),
         }
