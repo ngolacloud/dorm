@@ -1,3 +1,7 @@
+// dorm-messaging is deprecated (moved to seiva-messaging, ADR 0054); these
+// live tests still exercise it until the removal PR deletes the crate.
+#![allow(deprecated)]
+
 //! The Kafka broker backend + the outbox→broker bridge (ADR 0053) against a live
 //! Kafka (KRaft) and a live PostgreSQL.
 //!
