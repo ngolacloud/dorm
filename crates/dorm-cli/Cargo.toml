@@ -74,5 +74,5 @@ argon2 = "0.5"
 # `argon2` re-exports `password_hash`; naming it here with `getrandom` turns on
 # `OsRng` (the crate graph unifies to one `password-hash`), so the salt is drawn
 # from the OS CSPRNG.
-password-hash = { version = "0.5", features = ["getrandom"] }
+password-hash = { version = "0.6", features = ["getrandom"] }
 rpassword = "7"
