@@ -192,25 +192,121 @@ tokio::task_local! {
 /// `None` means the slow-query log is off; `Some(d)` is the threshold.
 static SLOW_QUERY: OnceLock<Option<Duration>> = OnceLock::new();
 
-/// Whether to skip `prepare_cached`, read from the environment exactly once.
-///
-/// Process configuration set at launch (for a transaction-mode pooler), not a
-/// per-call knob, so it is resolved on first use and cached off the hot path —
-/// like [`SLOW_QUERY`]. See [`NO_PREPARE_ENV`].
-static NO_PREPARE: OnceLock<bool> = OnceLock::new();
+/// The explicit [`NO_PREPARE_ENV`] setting, cached: `Some(true)`/`Some(false)` when
+/// the operator set it, `None` when they did not (leaving it to auto-detection).
+static NO_PREPARE_ENV_SET: OnceLock<Option<bool>> = OnceLock::new();
 
-/// `true` when statements must be sent unprepared (see [`NO_PREPARE_ENV`]).
-fn no_prepare() -> bool {
-    *NO_PREPARE.get_or_init(|| {
-        std::env::var(NO_PREPARE_ENV)
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
+/// Auto-detected no-prepare, tripped at runtime when a transaction-mode pooler is
+/// found — either reactively, the first time a cached statement comes back
+/// `26000` ([`trip_no_prepare_auto`]), or proactively from the PgBouncer admin
+/// console ([`autoconfigure_from_pgbouncer`]). Only consulted when the env is
+/// unset, so an explicit setting always wins (ADR 0049 / L15).
+static NO_PREPARE_AUTO: AtomicBool = AtomicBool::new(false);
+
+/// So the one-line "switched to unprepared" warning is logged once, not per query.
+static NO_PREPARE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn env_no_prepare() -> Option<bool> {
+    *NO_PREPARE_ENV_SET.get_or_init(|| {
+        std::env::var(NO_PREPARE_ENV).ok().map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
     })
+}
+
+/// `true` when statements must be sent unprepared. The explicit env wins; absent
+/// it, the auto-detected flag decides (ADR 0049).
+fn no_prepare() -> bool {
+    env_no_prepare().unwrap_or_else(|| NO_PREPARE_AUTO.load(Ordering::Relaxed))
+}
+
+/// Switch to unprepared statements after detecting a transaction-mode pooler.
+///
+/// A no-op when the operator set [`NO_PREPARE_ENV`] explicitly — their choice is
+/// honoured either way (if they set `0`, a `26000` still surfaces as the
+/// actionable error of ADR 0034). Otherwise it trips [`NO_PREPARE_AUTO`] and logs
+/// once, so DORM adapts to PgBouncer `transaction`/`statement` pooling with no
+/// configuration (L15).
+fn trip_no_prepare_auto() {
+    if env_no_prepare().is_some() {
+        return;
+    }
+    NO_PREPARE_AUTO.store(true, Ordering::Relaxed);
+    if !NO_PREPARE_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "a prepared statement was not found on reuse (26000) — a transaction-mode \
+             pooler (e.g. PgBouncer) is in front; DORM is now sending statements \
+             unprepared for this process (set {NO_PREPARE_ENV}=1 to do this from the \
+             start, or 0 to opt out)"
+        );
+    }
+}
+
+/// Whether `e` is the "prepared statement does not exist" (`26000`) a
+/// transaction-mode pooler raises when a cached statement's server connection was
+/// rotated out from under it — the signal [`trip_no_prepare_auto`] reacts to.
+fn is_stale_prepared_stmt(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_some_and(|db| {
+        // Both transaction-pooling prepared-statement faults, matched by SQLSTATE
+        // string the same way [`crate::error::classify_db`] does (no dependence on a
+        // driver constant): `26000` missing and `42P05` already-exists (ADR 0049).
+        matches!(
+            db.code().code(),
+            crate::error::INVALID_STATEMENT_NAME | crate::error::DUPLICATE_PREPARED_STATEMENT
+        ) && db.message().contains("prepared statement")
+    })
+}
+
+/// Ask a PgBouncer admin console for its `pool_mode` (ADR 0049 / L15) — the
+/// proactive, deterministic companion to the reactive `26000` self-heal.
+///
+/// `admin_dsn` connects to PgBouncer's special `pgbouncer` database, the one that
+/// answers `SHOW`. Returns the `pool_mode` (`transaction`/`session`/`statement`),
+/// or `None` when the server does not answer `SHOW CONFIG` — a real PostgreSQL
+/// rejects it (`unrecognized configuration parameter`), which reads as "no pooler
+/// in front". Uses a plain (NoTls) connection: the admin console is a local,
+/// trusted endpoint.
+pub async fn detect_pgbouncer_pool_mode(admin_dsn: &str) -> Result<Option<String>> {
+    let (client, connection) = tokio_postgres::connect(admin_dsn, NoTls)
+        .await
+        .map_err(from_pg)?;
+    let handle = tokio::spawn(connection);
+    // `SHOW CONFIG` must go over the *simple* query protocol: PgBouncer's admin
+    // console does not implement the extended (Parse/Bind) protocol. On a real
+    // PostgreSQL `SHOW CONFIG` errors, which we read as "not a pooler".
+    let mode = match client.simple_query("SHOW CONFIG").await {
+        Ok(msgs) => msgs.into_iter().find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) if row.get("key") == Some("pool_mode") => {
+                row.get("value").map(str::to_owned)
+            }
+            _ => None,
+        }),
+        Err(_) => None,
+    };
+    handle.abort();
+    Ok(mode)
+}
+
+/// Detect a transaction-/statement-mode PgBouncer via its admin console and, if
+/// found, switch this process to unprepared statements up front — the proactive
+/// half of L15 (ADR 0049). A no-op when [`NO_PREPARE_ENV`] was set explicitly
+/// (the operator's choice wins) or when the pooler is in `session` mode (prepared
+/// statements are safe there). Returns the detected `pool_mode`, if any.
+pub async fn autoconfigure_from_pgbouncer(admin_dsn: &str) -> Result<Option<String>> {
+    let mode = detect_pgbouncer_pool_mode(admin_dsn).await?;
+    if matches!(mode.as_deref(), Some("transaction") | Some("statement"))
+        && env_no_prepare().is_none()
+    {
+        NO_PREPARE_AUTO.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "PgBouncer pool_mode={} detected; DORM will send statements unprepared",
+            mode.as_deref().unwrap_or_default()
+        );
+    }
+    Ok(mode)
 }
 
 /// Read the configured DSN.
@@ -1199,6 +1295,60 @@ async fn query_routed(
     result
 }
 
+/// Run a `SELECT` on `conn`: cached-prepared (ADR 0007) unless no-prepare is in
+/// force, and self-healing on a transaction-pooler `26000` — the first time a
+/// reused cached statement is missing, [`trip_no_prepare_auto`] switches the
+/// process to unprepared and this statement is retried unprepared, so the query
+/// succeeds rather than surfacing the error (ADR 0049 / L15).
+async fn query_on(conn: &Object, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    if no_prepare() {
+        return conn.query(sql, params).await.map_err(from_pg);
+    }
+    match prepare_and_query(conn, sql, params).await {
+        Ok(rows) => Ok(rows),
+        Err(e) if is_stale_prepared_stmt(&e) => {
+            trip_no_prepare_auto();
+            conn.query(sql, params).await.map_err(from_pg)
+        }
+        Err(e) => Err(from_pg(e)),
+    }
+}
+
+/// The prepared path of [`query_on`], returning the raw driver error so the caller
+/// can recognise a `26000` before [`from_pg`] reshapes it.
+async fn prepare_and_query(
+    conn: &Object,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> std::result::Result<Vec<PgRow>, tokio_postgres::Error> {
+    let stmt = conn.prepare_cached(sql).await?;
+    conn.query(&stmt, params).await
+}
+
+/// The `execute` twin of [`query_on`], with the same `26000` self-heal (ADR 0049).
+async fn execute_on(conn: &Object, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+    if no_prepare() {
+        return conn.execute(sql, params).await.map_err(from_pg);
+    }
+    match prepare_and_execute(conn, sql, params).await {
+        Ok(n) => Ok(n),
+        Err(e) if is_stale_prepared_stmt(&e) => {
+            trip_no_prepare_auto();
+            conn.execute(sql, params).await.map_err(from_pg)
+        }
+        Err(e) => Err(from_pg(e)),
+    }
+}
+
+async fn prepare_and_execute(
+    conn: &Object,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> std::result::Result<u64, tokio_postgres::Error> {
+    let stmt = conn.prepare_cached(sql).await?;
+    conn.execute(&stmt, params).await
+}
+
 async fn query_inner(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
@@ -1209,18 +1359,10 @@ async fn query_inner(
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        if no_prepare() {
-            return conn.query(sql, params).await.map_err(from_pg);
-        }
-        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
-        return conn.query(&stmt, params).await.map_err(from_pg);
+        return query_on(conn, sql, params).await;
     }
     let conn = acquire(route).await?;
-    if no_prepare() {
-        return conn.query(sql, params).await.map_err(from_pg);
-    }
-    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
-    conn.query(&stmt, params).await.map_err(from_pg)
+    query_on(&conn, sql, params).await
 }
 
 /// Run a statement and report how many rows it touched.
@@ -1249,19 +1391,11 @@ async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64>
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
-        if no_prepare() {
-            return conn.execute(sql, params).await.map_err(from_pg);
-        }
-        let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
-        return conn.execute(&stmt, params).await.map_err(from_pg);
+        return execute_on(conn, sql, params).await;
     }
     // Writes always run on the primary.
     let conn = acquire(Route::Primary).await?;
-    if no_prepare() {
-        return conn.execute(sql, params).await.map_err(from_pg);
-    }
-    let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
-    conn.execute(&stmt, params).await.map_err(from_pg)
+    execute_on(&conn, sql, params).await
 }
 
 /// Run a statement for its effect only, outside any result set.

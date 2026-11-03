@@ -166,11 +166,23 @@ pub fn classify_db(code: &str, msg: String) -> Error {
         // protocol-level prepared statements: the server prepared `sN` on one
         // backend and the next statement landed on another. Surface it with the
         // actionable fix instead of the bare driver string (ADR 0034).
-        INVALID_STATEMENT_NAME if msg.contains("prepared statement") => Error::Config(format!(
-            "{msg} — this is the signature of a transaction-mode connection pooler \
-             (e.g. PgBouncer) without protocol-level prepared statements; set \
-             `DELONIX_ORM_NO_PREPARE=1` so DORM sends statements unprepared (ADR 0007/0034)"
-        )),
+        // Both faces of a transaction-mode pooler that is not forwarding
+        // protocol-level prepared statements: `26000` (the server prepared `sN` on
+        // one backend and the next statement landed on another, so it is *missing*)
+        // and `42P05` (two client connections multiplexed onto one backend both
+        // tried to prepare `sN`, so it *already exists*). Both get the actionable
+        // fix instead of the bare driver string (ADR 0034/0049).
+        INVALID_STATEMENT_NAME | DUPLICATE_PREPARED_STATEMENT
+            if msg.contains("prepared statement") =>
+        {
+            Error::Config(format!(
+                "{msg} — this is the signature of a transaction-mode connection pooler \
+                 (e.g. PgBouncer): either enable protocol-level prepared statements on the \
+                 pooler (PgBouncer ≥1.21 `max_prepared_statements`) or set \
+                 `DELONIX_ORM_NO_PREPARE=1` so DORM sends statements unprepared \
+                 (ADR 0007/0034/0049)"
+            ))
+        }
         _ => Error::Db(msg),
     }
 }
@@ -193,6 +205,12 @@ pub const QUERY_CANCELED: &str = "57014";
 /// `prepared statement "sN" does not exist` when a transaction-mode pooler
 /// drops the prepare. [`classify_db`] turns it into an actionable error (ADR 0034).
 pub const INVALID_STATEMENT_NAME: &str = "26000";
+
+/// The SQLSTATE for `duplicate_prepared_statement` — raised as
+/// `prepared statement "sN" already exists` when a transaction-mode pooler
+/// multiplexes two client connections onto one backend and both prepare the same
+/// name. The collision twin of [`INVALID_STATEMENT_NAME`] (ADR 0049).
+pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
 
 /// Whether this error is a unique-constraint violation, on any backend.
 pub fn is_unique_violation(e: &Error) -> bool {
@@ -272,6 +290,25 @@ mod tests {
             INVALID_STATEMENT_NAME,
             "ERROR [26000]: something else".into(),
         ) {
+            Error::Db(_) => {}
+            other => panic!("expected Db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_colliding_prepared_statement_also_points_at_the_pooler_fix() {
+        // The collision twin (42P05) is the same transaction-pooling signature and
+        // gets the same actionable error (ADR 0049).
+        let msg = "ERROR [42P05]: prepared statement \"s3\" already exists".to_string();
+        match classify_db(DUPLICATE_PREPARED_STATEMENT, msg) {
+            Error::Config(m) => {
+                assert!(m.contains("max_prepared_statements"), "{m}");
+                assert!(m.contains("DELONIX_ORM_NO_PREPARE"), "{m}");
+            }
+            other => panic!("expected an actionable Config error, got {other:?}"),
+        }
+        // A 42P05 unrelated to a prepared statement stays a plain Db error.
+        match classify_db(DUPLICATE_PREPARED_STATEMENT, "ERROR [42P05]: other".into()) {
             Error::Db(_) => {}
             other => panic!("expected Db, got {other:?}"),
         }
