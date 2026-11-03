@@ -37,6 +37,10 @@ members = [
     # Optional MCP server: expose the registry as tools/resources to an agent
     # (ADR 0020). Depends on dorm-core + dorm-rag; neither depends back on it.
     "crates/dorm-mcp",
+    # Optional generic transactional outbox/inbox: publish events in-transaction,
+    # drain them with independent cursor-tracking consumers (ADR 0026). dorm-core
+    # never depends on it.
+    "crates/dorm-outbox",
 ]
 
 [workspace.package]
