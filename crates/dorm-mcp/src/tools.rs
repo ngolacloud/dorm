@@ -229,7 +229,7 @@ fn tool(name: &str, description: &str, input_schema: Json, read_only: bool) -> J
 /// Execute a tool call, returning the text payload for the MCP `content`.
 ///
 /// When the server is bound to a tenant, the whole call runs inside
-/// [`db::with_tenant`](dorm_core::db::with_tenant), so the core scope seam injects
+/// [`db::with_tenant`], so the core scope seam injects
 /// and enforces the tenant for every `tenant_scoped` model (ADR 0021) — the
 /// server's own tenant, never a tool argument. The handlers below still push the
 /// tenant for the backends the seam does not cover (e.g. RAG's direct compile),

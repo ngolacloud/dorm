@@ -10,7 +10,7 @@
 //! so no surface built on them can forget the filter.
 //!
 //! Fail-closed: a `tenant_scoped` model compiled with no tenant in scope, and not
-//! under [`db::with_system_scope`](crate::db::with_system_scope), is
+//! under [`db::with_system_scope`], is
 //! [`Error::TenantScopeMissing`] — refusing beats silently reading every tenant.
 
 use crate::compiler::{self, Plan, Sql};

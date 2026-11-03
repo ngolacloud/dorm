@@ -56,7 +56,7 @@ pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
 /// are down) — ADR 0050.
 pub const REPLICA_DSN_ENV: &str = "DELONIX_ORM_REPLICA_DSN";
 /// Seconds a read replica stays ejected after a failed acquire before it is
-/// retried (ADR 0050). Default [`REPLICA_EJECT_COOLDOWN_DEFAULT`].
+/// retried (ADR 0050). Defaults to 10 (`REPLICA_EJECT_COOLDOWN_DEFAULT`).
 pub const REPLICA_EJECT_COOLDOWN_ENV: &str = "DELONIX_ORM_REPLICA_EJECT_COOLDOWN_SECS";
 const REPLICA_EJECT_COOLDOWN_DEFAULT: u64 = 10;
 /// Ceiling on pooled connections.
@@ -729,8 +729,8 @@ impl Database {
     }
 
     /// Connect with several read replicas, balanced and ejected as in
-    /// [`REPLICA_DSN_ENV`] (ADR 0050). The list-shaped twin of [`connect`]; an
-    /// empty slice is simply no replica.
+    /// [`REPLICA_DSN_ENV`] (ADR 0050). The list-shaped twin of
+    /// [`connect`](Database::connect); an empty slice is simply no replica.
     pub fn connect_replicas(
         primary_dsn: &str,
         replica_dsns: &[&str],

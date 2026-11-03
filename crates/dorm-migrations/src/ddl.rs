@@ -73,7 +73,7 @@ pub fn schema_for_on(models: &[&'static ModelMeta], backend: Backend) -> Result<
 ///
 /// PostgreSQL has no `CREATE TYPE IF NOT EXISTS`, so each is wrapped in a `DO`
 /// block that checks `pg_type` first; re-running is a no-op. On SQLite/MySQL the
-/// enum column is a plain `TEXT` ([`sql_type`]), so there is no type to create and
+/// enum column is a plain `TEXT` (`sql_type`), so there is no type to create and
 /// this is empty. The variants are model-definition constants (compile time,
 /// never a caller), so they are quoted straight in — the same rule as a field
 /// default or a `CHECK`.
@@ -402,8 +402,7 @@ pub fn index_on(table: &str, column: &str) -> String {
     index_on_cols(table, &[column])
 }
 
-/// The composite form: `CREATE INDEX IF NOT EXISTS <table>_<c1>_<c2>_idx ON
-/// <table> (<c1>, <c2>)` (ADR 0044). The single-column [`index_on`] is this with
+/// The composite form: `CREATE INDEX IF NOT EXISTS <table>_<c1>_<c2>_idx ON <table> (<c1>, <c2>)` (ADR 0044). The single-column [`index_on`] is this with
 /// one column, so one naming rule serves both and a dropped index names exactly
 /// what a created one made.
 pub fn index_on_cols(table: &str, columns: &[&str]) -> String {

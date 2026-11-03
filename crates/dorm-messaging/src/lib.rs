@@ -11,8 +11,8 @@
 //!
 //! Broker backends implement the same [`Publisher`] trait behind Cargo features,
 //! and [`OutboxBus::forward`] bridges the outbox to any of them, at-least-once.
-//! **NATS** ([`nats`], ADR 0051), **AMQP/RabbitMQ** ([`amqp`], ADR 0052) and
-//! **Kafka** ([`kafka`], ADR 0053) are implemented, each behind its feature and
+//! **NATS** (`nats`, ADR 0051), **AMQP/RabbitMQ** (`amqp`, ADR 0052) and
+//! **Kafka** (`kafka`, ADR 0053) are implemented, each behind its feature and
 //! each proven against a live broker through the one bridge.
 
 use std::future::Future;
@@ -174,7 +174,7 @@ impl OutboxBus {
     /// leaves the cursor where it was, so the event is retried, and after
     /// `max_attempts` it dead-letters, exactly as [`dorm_outbox::relay`] defines).
     ///
-    /// Works with any [`Publisher`]: the [`nats::NatsPublisher`] behind the `nats`
+    /// Works with any [`Publisher`]: the `nats::NatsPublisher` behind the `nats`
     /// feature, or a test double. Returns how many events it forwarded this pass.
     pub async fn forward<P: Publisher>(
         &self,
