@@ -101,6 +101,14 @@ impl Parser {
                     self.pos += 1;
                     enums.push(self.enum_decl()?);
                 }
+                Tok::Ident(kw) if kw == "namespace" => {
+                    // `namespace NAME { model… enum… }` (DORM-B2): a PostgreSQL
+                    // schema grouping. Each model inside carries the namespace;
+                    // enums inside are declared normally (a native enum is not
+                    // module-owned data in this cut).
+                    self.pos += 1;
+                    self.namespace_block(&mut models, &mut enums)?;
+                }
                 Tok::Ident(kw) if kw == "generator" => {
                     // Accepted and ignored: DORM generates via `dorm generate`,
                     // not a `generator` block, but tolerating it eases paste-in
@@ -109,7 +117,7 @@ impl Parser {
                     let _ = self.ident();
                     self.skip_block()?;
                 }
-                _ => return self.err("expected `datasource`, `model` or `enum`"),
+                _ => return self.err("expected `datasource`, `model`, `enum` or `namespace`"),
             }
         }
         // Resolution pass: an enum may be declared after the model that uses it,
@@ -135,6 +143,37 @@ impl Parser {
             models,
             enums,
         })
+    }
+
+    /// Parse a `namespace NAME { model… enum… }` block (DORM-B2), pushing its
+    /// models (each tagged with the namespace) and enums into the schema's lists.
+    /// Only `model` and `enum` may appear inside; nesting a namespace is refused.
+    fn namespace_block(&mut self, models: &mut Vec<Model>, enums: &mut Vec<EnumDecl>) -> R<()> {
+        let name = self.ident()?;
+        self.punct('{')?;
+        loop {
+            match self.peek() {
+                Some(Tok::Punct('}')) => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some(Tok::Ident(kw)) if kw == "model" => {
+                    self.pos += 1;
+                    let mut m = self.model()?;
+                    m.namespace = Some(name.clone());
+                    models.push(m);
+                }
+                Some(Tok::Ident(kw)) if kw == "enum" => {
+                    self.pos += 1;
+                    enums.push(self.enum_decl()?);
+                }
+                Some(Tok::Ident(kw)) if kw == "namespace" => {
+                    return self.err("a namespace cannot be nested inside another");
+                }
+                Some(_) => return self.err("expected `model`, `enum` or `}` inside a namespace"),
+                None => return self.err("unterminated namespace"),
+            }
+        }
     }
 
     /// Parse an `enum Name { v1 v2 … }` block (ADR 0047). The variants are bare
@@ -270,6 +309,9 @@ impl Parser {
         }
         Ok(Model {
             name,
+            // Set by the `namespace` block that encloses it, if any; a top-level
+            // model stays `None` (DORM-B2).
+            namespace: None,
             table,
             fields,
             rag,
@@ -604,6 +646,38 @@ fn pluralized_table(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse;
+
+    #[test]
+    fn namespace_blocks_tag_their_models_and_leave_top_level_models_untagged() {
+        let src = r#"
+            model Global { id Int @id }
+            namespace identity {
+              model User { id Int @id }
+            }
+            namespace notes {
+              model Note { id Int @id }
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let ns = |name: &str| {
+            schema
+                .models
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap()
+                .namespace
+                .clone()
+        };
+        assert_eq!(ns("Global"), None, "a top-level model has no namespace");
+        assert_eq!(ns("User"), Some("identity".to_string()));
+        assert_eq!(ns("Note"), Some("notes".to_string()));
+    }
+
+    #[test]
+    fn a_nested_namespace_is_refused() {
+        let err = parse("namespace a {\n  namespace b { model M { id Int @id } }\n}\n");
+        assert!(err.is_err(), "nesting a namespace must not parse");
+    }
 
     #[test]
     fn a_rag_block_parses_into_every_field() {

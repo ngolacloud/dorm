@@ -9,6 +9,8 @@
 //! borrowing `dorm-core`'s (this crate deliberately has no dependency on the ORM
 //! core).
 
+use std::collections::BTreeMap;
+
 use crate::{Field, Scalar, Schema};
 
 /// How serious a [`validate()`] finding is.
@@ -187,7 +189,53 @@ pub fn validate(schema: &Schema) -> Vec<Issue> {
             }
         }
     }
+
+    // Namespace isolation (DORM-B2): a relation may not cross a namespace
+    // boundary. Between modules only identifiers travel; the relationship itself
+    // stays within one namespace, which is how the ORM imposes the module
+    // boundary a framework relies on. A model's namespace must equal the
+    // namespace of every model it relates to (both `None` — the top level — is a
+    // match; a namespace relating to the top level is not).
+    let ns_of: BTreeMap<&str, Option<&str>> = schema
+        .models
+        .iter()
+        .map(|m| (m.name.as_str(), m.namespace.as_deref()))
+        .collect();
+    for m in &schema.models {
+        for f in &m.fields {
+            let target = match f {
+                Field::ToOne(r) => r.target.as_str(),
+                Field::ToMany { target, .. } => target.as_str(),
+                _ => continue,
+            };
+            // An unknown target is a different error, reported by the relation
+            // flow; here we only judge a relation to a *known* model.
+            if let Some(target_ns) = ns_of.get(target) {
+                if *target_ns != m.namespace.as_deref() {
+                    issues.push(Issue::error(
+                        &m.name,
+                        format!(
+                            "relation to `{target}` crosses a namespace boundary \
+                             ({} → {}); modules share only identifiers — reference it \
+                             by id and go through its facade, not a cross-namespace relation",
+                            ns_label(m.namespace.as_deref()),
+                            ns_label(*target_ns),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     issues
+}
+
+/// A namespace for a message: `` namespace `x` `` or `the top level`.
+fn ns_label(ns: Option<&str>) -> String {
+    match ns {
+        Some(n) => format!("namespace `{n}`"),
+        None => "the top level".to_string(),
+    }
 }
 
 /// The scalar field of `m` named `name`, if any.
@@ -228,6 +276,53 @@ mod tests {
     fn a_well_formed_rag_model_validates_clean() {
         let schema = parse(WITH_RAG).expect("parses");
         assert!(validate(&schema).is_empty(), "{:?}", validate(&schema));
+    }
+
+    #[test]
+    fn a_relation_within_one_namespace_is_fine_but_across_namespaces_is_refused() {
+        // notes.Note → notes.Author: same namespace, allowed. notes.Note →
+        // identity.User: crosses the boundary, refused (DORM-B2).
+        let src = r#"
+            namespace identity {
+              model User { id Int @id }
+            }
+            namespace notes {
+              model Author { id Int @id }
+              model Note {
+                id     Int    @id
+                author Author @relation(onDelete: Cascade)
+                user   User   @relation(onDelete: Cascade)
+              }
+            }
+        "#;
+        let issues = validate(&parse(src).expect("parses"));
+        assert!(
+            issues.iter().any(|i| i.model == "Note"
+                && i.message.contains("crosses a namespace boundary")
+                && i.message.contains("User")),
+            "the cross-namespace relation to User must be refused: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.message.contains("Author")),
+            "the same-namespace relation to Author must be allowed: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_top_level_relation_is_unaffected_by_the_namespace_rule() {
+        // No namespaces anywhere: the legacy single-schema shape is unchanged.
+        let src = r#"
+            model Author { id Int @id }
+            model Note {
+              id     Int    @id
+              author Author @relation(onDelete: Cascade)
+            }
+        "#;
+        let issues = validate(&parse(src).expect("parses"));
+        assert!(
+            !issues.iter().any(|i| i.message.contains("namespace")),
+            "top-level relations raise no namespace issue: {issues:?}"
+        );
     }
 
     #[test]
