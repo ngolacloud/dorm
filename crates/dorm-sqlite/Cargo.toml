@@ -21,7 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Runs the SQL the ORM compiler produces (with the SQLite dialect) against a real
 # SQLite. `bundled` compiles SQLite in — no system library needed.
 dorm-core = { path = "../dorm-core", version = "0.6.0" }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
