@@ -44,6 +44,9 @@ members = [
     # Optional durable PostgreSQL job queue + expiring leases (ADR 0027). dorm-core
     # never depends on it.
     "crates/dorm-jobs",
+    # Optional messaging: CloudEvents envelope + Publisher/Subscriber, outbox-backed
+    # by default, broker backends behind features (ADR 0031).
+    "crates/dorm-messaging",
 ]
 
 [workspace.package]

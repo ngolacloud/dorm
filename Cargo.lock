@@ -1160,6 +1160,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dorm-messaging"
+version = "0.1.0"
+dependencies = [
+ "dorm-core",
+ "dorm-outbox",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dorm-migrations"
 version = "0.7.1"
 dependencies = [
