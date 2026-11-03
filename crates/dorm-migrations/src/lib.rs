@@ -57,6 +57,11 @@ pub enum Error {
     /// message names the table and what changed; the next version handles these.
     #[error("unsupported schema change: {0}")]
     UnsupportedChange(String),
+    /// A declared column rename does not line up with the schema: its source
+    /// column is not in the previous snapshot, or its target is not in the
+    /// current models. The message names the table and columns.
+    #[error("invalid column rename: {0}")]
+    InvalidRename(String),
     /// A problem reading or writing the on-disk migration history: a directory
     /// that cannot be read, a file that is not valid JSON, or a backend that does
     /// not match the migrations already there. The message says which.
@@ -66,6 +71,9 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub use autodetect::{autodetect, make_migration, Snapshot};
+pub use autodetect::{
+    autodetect, autodetect_with_renames, make_migration, make_migration_with_renames, ColumnRename,
+    Snapshot,
+};
 pub use history::{History, StoredMigration};
-pub use migrator::{diff, initial, migrate, sync, Migration};
+pub use migrator::{diff, initial, migrate, revert, sync, Migration};

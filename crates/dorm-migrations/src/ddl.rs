@@ -17,6 +17,10 @@ use dorm_core::value::FieldType;
 pub enum Backend {
     Postgres,
     Sqlite,
+    /// MySQL / MariaDB (ADR 0018). The type map below is the first cut; the
+    /// `VARCHAR`-for-indexed-`TEXT` and table-level foreign-key refinements are
+    /// the DDL slice (ADR 0018 Inc. 3).
+    MySql,
 }
 
 impl Backend {
@@ -28,6 +32,7 @@ impl Backend {
         match dorm_core::db::backend_of(dsn) {
             dorm_core::db::Backend::Sqlite => Backend::Sqlite,
             dorm_core::db::Backend::Postgres => Backend::Postgres,
+            dorm_core::db::Backend::MySql => Backend::MySql,
         }
     }
 }
@@ -111,6 +116,7 @@ fn column_def(f: &FieldMeta, backend: Backend) -> Result<String> {
             return Ok(match backend {
                 Backend::Postgres => format!("{} BIGSERIAL PRIMARY KEY", f.column),
                 Backend::Sqlite => format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", f.column),
+                Backend::MySql => format!("{} BIGINT AUTO_INCREMENT PRIMARY KEY", f.column),
             });
         }
         let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f, backend)?);
@@ -169,7 +175,9 @@ pub fn add_column(meta: &ModelMeta, f: &FieldMeta) -> Result<String> {
 pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Result<String> {
     let guard = match backend {
         Backend::Postgres => "IF NOT EXISTS ",
-        Backend::Sqlite => "",
+        // MySQL has no `IF NOT EXISTS` on `ADD COLUMN`; the versioned ledger, not
+        // idempotent re-runs, is the source of truth there (ADR 0018).
+        Backend::Sqlite | Backend::MySql => "",
     };
     Ok(format!(
         "ALTER TABLE {} ADD COLUMN {}{} {}",
@@ -187,7 +195,7 @@ pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Resul
 pub fn drop_column(table: &str, column: &str, backend: Backend) -> String {
     let guard = match backend {
         Backend::Postgres => "IF EXISTS ",
-        Backend::Sqlite => "",
+        Backend::Sqlite | Backend::MySql => "",
     };
     format!("ALTER TABLE {table} DROP COLUMN {guard}{column}")
 }
@@ -202,11 +210,39 @@ pub fn drop_index(table: &str, column: &str) -> String {
     format!("DROP INDEX IF EXISTS {}_{}_idx", table, column)
 }
 
+/// `ALTER TABLE <table> RENAME COLUMN <from> TO <to>` — the data-preserving
+/// alternative to drop-then-add when a column is renamed (B-24). Both PostgreSQL
+/// and SQLite (≥ 3.25) accept this exact form, so no dialect split is needed.
+pub fn rename_column(table: &str, from: &str, to: &str) -> String {
+    format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")
+}
+
 /// `CREATE INDEX IF NOT EXISTS <table>_<column>_idx ON <table> (<column>)` — the
 /// one place the index name is spelled, shared by [`indexes`] and the
 /// autodetector so a dropped index names exactly what a created one made.
 pub fn index_on(table: &str, column: &str) -> String {
     format!("CREATE INDEX IF NOT EXISTS {table}_{column}_idx ON {table} ({column})")
+}
+
+/// Like [`index_on`] but non-blocking on PostgreSQL (B-22).
+///
+/// A plain `CREATE INDEX` takes a `SHARE` lock that stops writes to the table
+/// for the whole build; `CREATE INDEX CONCURRENTLY` takes only a
+/// `SHARE UPDATE EXCLUSIVE` lock, so writes keep flowing while the index builds.
+/// The trade-off is that `CONCURRENTLY` **cannot run inside a transaction**
+/// (PostgreSQL rejects it with `25001`), so the caller must apply it outside one
+/// — which is why [`crate::migrate`]/`sync` run indexes separately from the
+/// transactional table changes. SQLite has no `CONCURRENTLY`, so it falls back
+/// to the plain form.
+pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> String {
+    match backend {
+        // MySQL has no `CREATE INDEX CONCURRENTLY`.
+        Backend::MySql => index_on(table, column),
+        Backend::Postgres => format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_{column}_idx ON {table} ({column})"
+        ),
+        Backend::Sqlite => index_on(table, column),
+    }
 }
 
 /// The column's SQL default, if any. An explicit `default = "..."` wins; failing
@@ -220,6 +256,7 @@ fn effective_default(f: &FieldMeta, backend: Backend) -> Option<String> {
             Some(match backend {
                 Backend::Postgres => "now()".to_string(),
                 Backend::Sqlite => "CURRENT_TIMESTAMP".to_string(),
+                Backend::MySql => "CURRENT_TIMESTAMP(6)".to_string(),
             })
         } else {
             None
@@ -253,6 +290,28 @@ fn sql_type(ty: FieldType, backend: Backend) -> String {
             FieldType::I32 | FieldType::I64 | FieldType::Bool => "INTEGER",
             FieldType::Text | FieldType::Timestamp | FieldType::Uuid | FieldType::Json => "TEXT",
             FieldType::Decimal => "NUMERIC",
+            FieldType::F64 => "REAL",
+            FieldType::Bytes => "BLOB",
+        }
+        .to_string(),
+        Backend::MySql => match ty {
+            FieldType::I32 => "INT",
+            FieldType::I64 => "BIGINT",
+            FieldType::F64 => "DOUBLE",
+            // TINYINT(1) is MySQL's boolean; the driver maps 0/1 ↔ bool.
+            FieldType::Bool => "TINYINT(1)",
+            // `TEXT` here; a UNIQUE/indexed TEXT needs a `VARCHAR(n)` — the Inc. 3
+            // refinement that has the field's attributes to decide.
+            FieldType::Text => "TEXT",
+            // An unqualified DECIMAL is `(10,0)` on MySQL and would truncate cents;
+            // a wide precision keeps money exact, as ADR 0016 requires.
+            FieldType::Decimal => "DECIMAL(38,9)",
+            // DATETIME (not TIMESTAMP: no 2038 limit, no tz conversion); UTC comes
+            // from the connection's `time_zone='+00:00'`.
+            FieldType::Timestamp => "DATETIME(6)",
+            FieldType::Uuid => "CHAR(36)",
+            FieldType::Json => "JSON",
+            FieldType::Bytes => "LONGBLOB",
         }
         .to_string(),
     }
@@ -273,6 +332,18 @@ pub fn indexes(meta: &ModelMeta) -> Vec<String> {
         .iter()
         .filter(|f| f.index)
         .map(|f| index_on(meta.table, f.column))
+        .collect()
+}
+
+/// Like [`indexes`] but each index builds `CONCURRENTLY` on PostgreSQL (B-22), so
+/// the caller must run these outside a transaction. Used by `sync`, which applies
+/// indexes to a possibly-populated table where a blocking build would stop
+/// writes.
+pub fn indexes_concurrent(meta: &ModelMeta, backend: Backend) -> Vec<String> {
+    meta.fields
+        .iter()
+        .filter(|f| f.index)
+        .map(|f| index_on_concurrent(meta.table, f.column, backend))
         .collect()
 }
 
@@ -399,6 +470,20 @@ mod tests {
         assert_eq!(
             indexes(&M),
             vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
+        );
+    }
+
+    // B-22: the concurrent variant builds without blocking writes on PostgreSQL
+    // and falls back to the plain form on SQLite (which has no CONCURRENTLY).
+    #[test]
+    fn a_concurrent_index_is_non_blocking_on_postgres_and_plain_on_sqlite() {
+        assert_eq!(
+            index_on_concurrent("tenants", "slug", Backend::Postgres),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
+        );
+        assert_eq!(
+            index_on_concurrent("tenants", "slug", Backend::Sqlite),
+            "CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
         );
     }
 

@@ -63,7 +63,7 @@ let newest = Author::objects()
 | [`dorm-migrations`](crates/dorm-migrations) | DDL generation, the schema autodetector, and the versioned migrator |
 | [`dorm-models`](crates/dorm-models) | The ORM's **own** example models, used to pin the generated SQL in snapshot tests |
 | [`dorm-example`](crates/dorm-example) | A standalone ~40-line blog using only `dorm-*` — the independence proof |
-| [`dorm-shell`](crates/dorm-shell) | The `dorm` REPL — enumerates the linked models and runs string-typed queries live |
+| [`dorm-shell`](crates/dorm-shell) | The `dorm-shell` REPL — enumerates the linked models and runs string-typed queries live |
 
 ## Install
 

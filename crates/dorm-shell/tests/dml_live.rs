@@ -4,7 +4,7 @@
 //!
 //! Ignored unless `DELONIX_ORM_TEST_DSN` is set, the same convention as
 //! `dorm-models`'s live suites. It spawns the binary `cargo` built for this
-//! test (`CARGO_BIN_EXE_dorm`) and pipes a script into its stdin, exactly as a
+//! test (`CARGO_BIN_EXE_dorm-shell`) and pipes a script into its stdin, exactly as a
 //! person would type it.
 //!
 //! ```text
@@ -42,7 +42,7 @@ fn ensure_schema(dsn: &str) {
 /// Run the `dorm` binary with `args`, feeding `script` on stdin, and return its
 /// combined stdout.
 fn drive(dsn: &str, args: &[&str], script: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dorm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dorm-shell"))
         .args(args)
         .env("DELONIX_ORM_DSN", dsn)
         .stdin(Stdio::piped())

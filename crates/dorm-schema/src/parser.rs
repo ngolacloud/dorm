@@ -2,7 +2,8 @@
 
 use crate::lexer::{lex, Tok};
 use crate::{
-    snake, Auto, Datasource, Field, Model, OnDelete, Relation, Scalar, ScalarField, Schema, Url,
+    snake, Auto, Datasource, Field, Model, OnDelete, RagBlock, Relation, Scalar, ScalarField,
+    Schema, Url,
 };
 
 /// A parse failure, with the 1-based line when known.
@@ -193,6 +194,7 @@ impl Parser {
     fn model(&mut self) -> R<Model> {
         let name = self.ident()?;
         let mut table = pluralized_table(&name);
+        let mut rag = None;
         self.punct('{')?;
         let mut fields = Vec::new();
         loop {
@@ -203,8 +205,10 @@ impl Parser {
                 }
                 Some(Tok::AtAt) => {
                     self.pos += 1;
-                    if let Some(t) = self.block_attr()? {
-                        table = t;
+                    match self.block_attr()? {
+                        BlockAttr::Map(t) => table = t,
+                        BlockAttr::Rag(r) => rag = Some(r),
+                        BlockAttr::Ignored => {}
                     }
                 }
                 Some(_) => fields.push(self.field()?),
@@ -215,16 +219,22 @@ impl Parser {
             name,
             table,
             fields,
+            rag,
         })
     }
 
-    /// A block-level `@@…` attribute. Returns `Some(table)` for `@@map`.
-    fn block_attr(&mut self) -> R<Option<String>> {
+    /// A block-level `@@…` attribute: `@@map` (the table), `@@rag` (ADR 0019), or
+    /// anything else (kept only to stay valid — the formatter preserves it from
+    /// the text, not the AST).
+    fn block_attr(&mut self) -> R<BlockAttr> {
         let name = self.ident()?;
-        let mut table = None;
+        if name == "rag" {
+            return Ok(BlockAttr::Rag(self.rag_block()?));
+        }
+        let mut result = BlockAttr::Ignored;
         if self.eat_punct('(') {
             if name == "map" {
-                table = Some(self.string()?);
+                result = BlockAttr::Map(self.string()?);
             }
             // Consume the rest of the args (e.g. `@@index([a, b])`).
             let mut depth = 1;
@@ -237,7 +247,60 @@ impl Parser {
                 }
             }
         }
-        Ok(table)
+        Ok(result)
+    }
+
+    /// Parse the args of `@@rag(fields: [title, body], embedder: "default", …)`.
+    /// Consumes its own enclosing `( … )`.
+    fn rag_block(&mut self) -> R<RagBlock> {
+        self.punct('(')?;
+        let mut rb = RagBlock::default();
+        loop {
+            if self.eat_punct(')') {
+                break;
+            }
+            let key = self.ident()?;
+            self.punct(':')?;
+            match key.as_str() {
+                "fields" => rb.fields = self.ident_or_str_list()?,
+                "metadata" => rb.metadata = self.ident_or_str_list()?,
+                "template" => rb.template = Some(self.string()?),
+                "embedder" => rb.embedder = Some(self.string()?),
+                "distance" => rb.distance = Some(self.string()?),
+                "chunk_size" => rb.chunk_size = Some(self.int()? as u32),
+                "chunk_overlap" => rb.chunk_overlap = Some(self.int()? as u32),
+                other => {
+                    return self.err(format!(
+                        "unknown @@rag option `{other}`; known: fields, template, embedder, \
+                         chunk_size, chunk_overlap, metadata, distance"
+                    ))
+                }
+            }
+            // A comma between entries is optional, like Prisma's attribute args.
+            self.eat_punct(',');
+        }
+        Ok(rb)
+    }
+
+    /// A `[a, b]` list whose elements are field names or strings — the shape
+    /// `fields`/`metadata` take.
+    fn ident_or_str_list(&mut self) -> R<Vec<String>> {
+        self.punct('[')?;
+        let mut out = Vec::new();
+        loop {
+            if self.eat_punct(']') {
+                break;
+            }
+            match self.next() {
+                Some(Tok::Ident(s)) | Some(Tok::Str(s)) => out.push(s),
+                _ => {
+                    self.pos -= 1;
+                    return self.err("expected a field name or a string in the list");
+                }
+            }
+            self.eat_punct(',');
+        }
+        Ok(out)
     }
 
     fn field(&mut self) -> R<Field> {
@@ -429,6 +492,61 @@ enum FieldAttr {
     Ignored,
 }
 
+/// A block-level `@@…` attribute's parsed meaning.
+enum BlockAttr {
+    /// `@@map("table")` — the table name.
+    Map(String),
+    /// `@@rag(..)` — the RAG declaration (ADR 0019).
+    Rag(RagBlock),
+    /// Anything else (`@@index`, …): valid, but not modelled by the AST.
+    Ignored,
+}
+
 fn pluralized_table(model: &str) -> String {
     crate::pluralize(&snake(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn a_rag_block_parses_into_every_field() {
+        let src = r#"
+            model Ticket {
+              id    Int    @id @default(autoincrement())
+              title String
+              body  String
+              @@rag(fields: [title, body], template: "{title}", embedder: "e1", chunk_size: 500, chunk_overlap: 50, metadata: [status], distance: "l2")
+            }
+        "#;
+        let schema = parse(src).expect("parses");
+        let rag = schema.models[0].rag.as_ref().expect("has rag");
+        assert_eq!(rag.fields, vec!["title", "body"]);
+        assert_eq!(rag.template.as_deref(), Some("{title}"));
+        assert_eq!(rag.embedder.as_deref(), Some("e1"));
+        assert_eq!(rag.chunk_size, Some(500));
+        assert_eq!(rag.chunk_overlap, Some(50));
+        assert_eq!(rag.metadata, vec!["status"]);
+        assert_eq!(rag.distance.as_deref(), Some("l2"));
+    }
+
+    #[test]
+    fn a_model_without_rag_has_none_and_an_unknown_rag_key_is_an_error() {
+        let plain = parse("model T {\n  id Int @id\n}\n").expect("parses");
+        assert!(plain.models[0].rag.is_none());
+
+        let bad = parse("model T {\n  id Int @id\n  @@rag(fyelds: [id])\n}\n");
+        assert!(bad.is_err());
+        assert!(bad.unwrap_err().0.contains("unknown @@rag option"));
+    }
+
+    #[test]
+    fn an_unknown_double_at_attribute_is_still_ignored() {
+        // `@@index` is not modelled; it must parse (and be dropped) as before.
+        let schema = parse("model T {\n  id Int @id\n  name String\n  @@index([name])\n}\n")
+            .expect("parses");
+        assert!(schema.models[0].rag.is_none());
+        assert_eq!(schema.models[0].fields.len(), 2);
+    }
 }

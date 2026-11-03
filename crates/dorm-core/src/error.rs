@@ -146,14 +146,23 @@ pub fn classify_db(code: &str, msg: String) -> Error {
 /// from a genuine failure when it loses a race.
 pub const UNIQUE_VIOLATION: &str = "23505";
 
+/// MySQL/MariaDB's `ER_DUP_ENTRY` error code. Unlike PostgreSQL there is no
+/// dedicated SQLSTATE for a duplicate key (it is the generic `23000`), so
+/// `get_or_create` keys off the error code, which the MySQL driver records in
+/// brackets just as [`from_pg`] records the PostgreSQL SQLSTATE (ADR 0018).
+pub const MYSQL_DUPLICATE_ENTRY: &str = "1062";
+
 /// The SQLSTATE for `query_canceled` — what `statement_timeout` raises when it
 /// fires. [`classify_db`] turns it into [`Error::Timeout`].
 pub const QUERY_CANCELED: &str = "57014";
 
-/// Whether this error is a unique-constraint violation.
+/// Whether this error is a unique-constraint violation, on any backend.
 pub fn is_unique_violation(e: &Error) -> bool {
     match e {
-        Error::Db(msg) => msg.contains(UNIQUE_VIOLATION),
+        Error::Db(msg) => {
+            msg.contains(&format!("[{UNIQUE_VIOLATION}]"))
+                || msg.contains(&format!("[{MYSQL_DUPLICATE_ENTRY}]"))
+        }
         _ => false,
     }
 }
@@ -171,9 +180,23 @@ mod tests {
     }
 
     #[test]
+    fn a_mysql_duplicate_key_is_a_unique_violation() {
+        // The MySQL driver's `db_err` records the error code in brackets (code
+        // 1062, SQLSTATE 23000), which is what `get_or_create` keys off on MySQL.
+        let e = Error::Db(format!(
+            "ERROR [{MYSQL_DUPLICATE_ENTRY}] (23000): Duplicate entry 'x' for key 'name'"
+        ));
+        assert!(is_unique_violation(&e));
+    }
+
+    #[test]
     fn other_database_errors_are_not_unique_violations() {
         assert!(!is_unique_violation(&Error::Db(
             "ERROR [42P01]: relation does not exist".into()
+        )));
+        // A MySQL error that is not a duplicate key (e.g. a lock-wait timeout).
+        assert!(!is_unique_violation(&Error::Db(
+            "ERROR [1205] (HY000): Lock wait timeout exceeded".into()
         )));
         assert!(!is_unique_violation(&Error::Pool("timed out".into())));
     }

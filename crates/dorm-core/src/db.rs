@@ -45,6 +45,11 @@ use crate::value::Value;
 pub const DSN_ENV: &str = "DELONIX_ORM_DSN";
 /// Accepted fallback, checked only when [`DSN_ENV`] is absent.
 pub const DSN_ENV_FALLBACK: &str = "PAAS_DATABASE_URL";
+/// An optional read-replica DSN. When set, the process-default [`Database`]
+/// routes the reads DORM compiles (`StatementKind::Read`) to it, while writes —
+/// and anything inside a transaction — stay on [`DSN_ENV`]'s primary. Absent,
+/// there is no replica and every statement runs on the primary, unchanged.
+pub const REPLICA_DSN_ENV: &str = "DELONIX_ORM_REPLICA_DSN";
 /// Ceiling on pooled connections.
 pub const POOL_MAX_ENV: &str = "DELONIX_ORM_POOL_MAX";
 /// How long a caller waits for a connection before giving up.
@@ -61,9 +66,40 @@ pub const STATEMENT_TIMEOUT_MS_ENV: &str = "DELONIX_ORM_STATEMENT_TIMEOUT_MS";
 pub const SSLMODE_ENV: &str = "DELONIX_ORM_SSLMODE";
 /// Overrides the DSN's `sslrootcert`: a PEM file of roots to trust.
 pub const SSLROOTCERT_ENV: &str = "DELONIX_ORM_SSLROOTCERT";
+/// When truthy (`1`/`true`/`yes`/`on`), statements are sent unprepared —
+/// `conn.query(sql, …)` instead of `prepare_cached` (ADR 0007).
+///
+/// This is the switch for **PgBouncer in `transaction` pooling mode**: there a
+/// named prepared statement lives on a server connection that PgBouncer may
+/// hand to a different client on the next transaction, so a cached handle comes
+/// back as `prepared statement "sN" does not exist` (`26000`). Unprepared
+/// execution has no named handle to lose. It costs a Parse round trip per call —
+/// the price of running behind a transaction-mode pooler (DBA-03/H2).
+pub const NO_PREPARE_ENV: &str = "DELONIX_ORM_NO_PREPARE";
+/// How a connection is checked before a checkout hands it out (ADR 0015):
+/// `verified` (the default — a liveness round trip, so a connection a database
+/// restart or `pg_terminate_backend` killed is detected and replaced rather than
+/// handed to a doomed query), `fast` (no round trip, lowest latency), or `clean`
+/// (`DISCARD ALL` as well). The resilient default costs one empty round trip per
+/// checkout; `fast` is the opt-out for a latency-critical, stable deployment.
+pub const POOL_RECYCLING_ENV: &str = "DELONIX_ORM_POOL_RECYCLING";
+/// How many times `acquire` retries a transient connection failure — a database
+/// restarting, or a momentarily exhausted pool — before giving up. `0` disables
+/// retry. **Only the acquire is retried**, never a statement already in flight:
+/// a connection breaking mid-write could have committed, so retrying it might
+/// double-apply. An acquire has sent nothing, so retrying it is always safe.
+pub const RETRY_MAX_ENV: &str = "DELONIX_ORM_RETRY_MAX";
+/// The base backoff between acquire retries, in milliseconds; it doubles each
+/// attempt up to a 2 s cap. See [`RETRY_MAX_ENV`].
+pub const RETRY_BASE_MS_ENV: &str = "DELONIX_ORM_RETRY_BASE_MS";
 
 const POOL_MAX_DEFAULT: usize = 8;
 const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
+const RETRY_MAX_DEFAULT: u64 = 3;
+const RETRY_BASE_MS_DEFAULT: u64 = 50;
+/// The ceiling on a single backoff wait, so exponential growth cannot stall a
+/// request for minutes.
+const RETRY_BACKOFF_CAP_MS: u64 = 2_000;
 
 /// How much SQL a log line carries before it is truncated. Long enough to read
 /// the shape of a statement, short enough that a 50-line generated query does
@@ -71,8 +107,51 @@ const POOL_ACQUIRE_TIMEOUT_DEFAULT_MS: u64 = 5_000;
 /// those are never here (see [`observe`]).
 const SQL_LOG_MAX: usize = 300;
 
-static POOL: OnceLock<Pool> = OnceLock::new();
+/// The process-default database, built lazily from the environment the first
+/// time it is needed.
+///
+/// It is a *default*, not the only source. A caller can build a [`Database`]
+/// explicitly and run against it with [`with_session`]; the module never
+/// *requires* this global — which is what lets one process serve many databases
+/// (a tenant's, a primary/replica pair) instead of the single process-wide pool
+/// it used to be locked to.
+static DEFAULT_DB: OnceLock<Database> = OnceLock::new();
+
+tokio::task_local! {
+    /// The [`Database`] in scope for this task, if any. Set by [`with_session`]
+    /// and consulted by every statement before it falls back to `DEFAULT_DB`.
+    /// This is what carries a per-session database — a tenant's, or a
+    /// primary/replica pair — down to the `db::*` calls without threading a
+    /// handle through every `QuerySet` method (the same task-local shape the
+    /// transaction routing and the read-only scope already use).
+    static SESSION: Arc<Database>;
+}
+
+/// Which connection a statement wants: the primary, or a read replica when the
+/// active [`Database`] has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Writes, DDL, raw statements, and everything inside a transaction.
+    Primary,
+    /// A read DORM compiled (`compiler::StatementKind::Read`); served by the
+    /// replica when the active database has one, otherwise by the primary.
+    ReadReplica,
+}
+
+/// The process-wide read-only default, for the one-process-one-session case (the
+/// CLI/shell's `--read-only`). A *session* can override it per task — see
+/// [`READ_ONLY_SCOPE`] and [`with_read_only`].
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+tokio::task_local! {
+    /// A per-session read-only override (B-12 / SEC-03). A task running inside
+    /// [`with_read_only`] consults this instead of the process-wide [`READ_ONLY`]
+    /// flag, so one request can be read-only while another, concurrent request on
+    /// the same process writes — the isolation a global `AtomicBool` cannot give.
+    /// Outside any such scope the global default applies, so the CLI/shell is
+    /// unaffected.
+    static READ_ONLY_SCOPE: bool;
+}
 
 /// The slow-query threshold, read from the environment exactly once.
 ///
@@ -81,6 +160,27 @@ static READ_ONLY: AtomicBool = AtomicBool::new(false);
 /// path free of an env lookup (and its lock + allocation) on every statement.
 /// `None` means the slow-query log is off; `Some(d)` is the threshold.
 static SLOW_QUERY: OnceLock<Option<Duration>> = OnceLock::new();
+
+/// Whether to skip `prepare_cached`, read from the environment exactly once.
+///
+/// Process configuration set at launch (for a transaction-mode pooler), not a
+/// per-call knob, so it is resolved on first use and cached off the hot path —
+/// like [`SLOW_QUERY`]. See [`NO_PREPARE_ENV`].
+static NO_PREPARE: OnceLock<bool> = OnceLock::new();
+
+/// `true` when statements must be sent unprepared (see [`NO_PREPARE_ENV`]).
+fn no_prepare() -> bool {
+    *NO_PREPARE.get_or_init(|| {
+        std::env::var(NO_PREPARE_ENV)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Read the configured DSN.
 pub fn dsn() -> Result<String> {
@@ -230,17 +330,46 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Mark this process as read-only. Every write refuses before it reaches SQL.
+/// Mark this **process** as read-only. Every write refuses before it reaches SQL.
 ///
 /// The session is *also* opened `READ ONLY` at the server, which is the real
 /// guard; this flag exists so the refusal names the operation instead of
 /// surfacing a PostgreSQL error about a read-only transaction.
+///
+/// This is the process-wide default, for the one-process-one-session case (the
+/// CLI/shell's `--read-only`). A server handling many sessions on one process
+/// wants [`with_read_only`] instead, which scopes the flag to one task so
+/// concurrent sessions do not leak into each other (B-12 / SEC-03).
 pub fn set_read_only(yes: bool) {
     READ_ONLY.store(yes, Ordering::SeqCst);
 }
 
-/// Whether this process is read-only.
+/// Run `fut` with the read-only state forced to `yes` for this task alone,
+/// overriding the process-wide [`set_read_only`] default.
+///
+/// This is the per-session form: two concurrent requests can each wrap their work
+/// in `with_read_only` with different values and neither sees the other's — the
+/// isolation the global flag cannot provide. It applies to the whole async
+/// subtree the future awaits (transactions included), but not to tasks spawned
+/// off it, which start their own task-local scope — a spawned task is a new
+/// session.
+pub async fn with_read_only<F, T>(yes: bool, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    READ_ONLY_SCOPE.scope(yes, fut).await
+}
+
+/// Whether the current context is read-only, most specific wins: the per-task
+/// scope ([`with_read_only`], B-12) overrides the session's [`Database`] default
+/// ([`with_session`]), which overrides the process-wide [`set_read_only`] flag.
 pub fn is_read_only() -> bool {
+    if let Ok(yes) = READ_ONLY_SCOPE.try_with(|&yes| yes) {
+        return yes;
+    }
+    if let Ok(yes) = SESSION.try_with(|db| db.read_only) {
+        return yes;
+    }
     READ_ONLY.load(Ordering::SeqCst)
 }
 
@@ -252,29 +381,91 @@ pub fn guard_write(op: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Build the pool, once.
+/// A database: a primary connection pool, an optional read replica, and the
+/// read-only default for sessions that run against it.
 ///
-/// # The pool belongs to one runtime
+/// This is the handle that replaced the single process-wide pool. A process can
+/// hold as many as it needs — one per tenant, a primary/replica pair — and reach
+/// one for a unit of work with [`with_session`], instead of every `db::*` call
+/// implicitly meaning the one global pool. The `DEFAULT_DB` built from the
+/// environment is just the most common case of this, kept so the embedded
+/// single-database path needs no session at all.
+///
+/// # The pools belong to one runtime
 ///
 /// `tokio-postgres` drives each connection from a background task, so a pooled
-/// connection is owned by the runtime that created it. This pool is a process
-/// global, which means **the process must keep one runtime alive for as long as
-/// it uses the ORM**. Drop that runtime and every connection in the pool dies
-/// with it; the next borrow comes back `connection closed`.
-///
-/// It matters for the shell: the synchronous REPL has to build its runtime once
-/// and `block_on` against that same one for the whole session. A runtime per
-/// statement would work for exactly one statement. This is not a hypothetical —
-/// it is what the integration tests did first, and five of them failed on it.
-pub fn pool() -> Result<&'static Pool> {
-    if let Some(p) = POOL.get() {
-        return Ok(p);
+/// connection is owned by the runtime that created it. **The process must keep
+/// one runtime alive for as long as it uses these pools.** Drop that runtime and
+/// every connection dies with it; the next borrow comes back `connection
+/// closed`. It matters for the shell: the synchronous REPL builds its runtime
+/// once and `block_on`s against that same one for the whole session. A runtime
+/// per statement would work for exactly one statement — it is what the
+/// integration tests did first, and five of them failed on it.
+pub struct Database {
+    primary: Pool,
+    /// Present when a replica DSN was configured; reads route here.
+    replica: Option<Pool>,
+    /// The primary DSN, kept so backend/dialect detection can consult the active
+    /// database rather than only the process environment.
+    dsn: String,
+    /// The read-only default for sessions on this database. A task can still
+    /// override it per request with [`with_read_only`] (B-12).
+    read_only: bool,
+}
+
+impl Database {
+    /// Connect a database from explicit DSNs: a required primary and an optional
+    /// read replica. `read_only` becomes the default for sessions that run
+    /// against it (overridable per task by [`with_read_only`]).
+    ///
+    /// This is the handle a server builds per tenant, or once with a
+    /// primary/replica pair; it needs no process environment set, which is what
+    /// frees the module from requiring the global pool.
+    pub fn connect(primary_dsn: &str, replica_dsn: Option<&str>, read_only: bool) -> Result<Self> {
+        let primary = build_pool(primary_dsn)?;
+        let replica = match replica_dsn {
+            Some(r) if !r.trim().is_empty() => Some(build_pool(r)?),
+            _ => None,
+        };
+        Ok(Database {
+            primary,
+            replica,
+            dsn: primary_dsn.to_string(),
+            read_only,
+        })
     }
-    let raw = dsn()?;
+
+    /// Build the process-default database from the environment: [`DSN_ENV`] for
+    /// the primary and [`REPLICA_DSN_ENV`] for the optional replica.
+    fn from_env() -> Result<Self> {
+        let primary = dsn()?;
+        let replica = std::env::var(REPLICA_DSN_ENV)
+            .ok()
+            .filter(|r| !r.trim().is_empty());
+        Database::connect(&primary, replica.as_deref(), false)
+    }
+
+    /// The pool a route resolves to. A [`Route::ReadReplica`] picks the replica
+    /// only when one exists **and** no transaction is open: a transaction already
+    /// holds its own connection and must not be split across primary and replica,
+    /// and it is the one place a read must see its own uncommitted writes.
+    fn pool_for(&self, route: Route) -> &Pool {
+        match route {
+            Route::ReadReplica if !in_transaction() => {
+                self.replica.as_ref().unwrap_or(&self.primary)
+            }
+            _ => &self.primary,
+        }
+    }
+}
+
+/// Build one connection pool for a DSN. This is the former body of `pool()`,
+/// lifted so a [`Database`] can build a primary and a replica the same way.
+fn build_pool(raw: &str) -> Result<Pool> {
     // `tokio_postgres::Config` rejects `sslmode=verify-full` and does not know
     // `sslrootcert`, so the TLS keys DORM handles itself are pulled out before
     // the parse; verification is done by the connector, not the driver.
-    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(&raw);
+    let (cleaned, dsn_mode, dsn_root) = extract_tls_params(raw);
     let mut config: Config = cleaned
         .parse()
         .map_err(|e| Error::Config(format!("the DSN is not usable: {e}")))?;
@@ -293,7 +484,7 @@ pub fn pool() -> Result<&'static Pool> {
     let requirement = ssl_requirement(mode.as_deref())?;
 
     let manager = build_manager(config, requirement, root.as_deref())?;
-    let pool = Pool::builder(manager)
+    Pool::builder(manager)
         // Required because the timeouts below are set: deadpool needs a runtime
         // to arm them against, and without this it refuses to build with
         // "Timeouts require a runtime" rather than silently ignoring them.
@@ -305,9 +496,38 @@ pub fn pool() -> Result<&'static Pool> {
         ) as u64)))
         .create_timeout(Some(Duration::from_millis(POOL_ACQUIRE_TIMEOUT_DEFAULT_MS)))
         .build()
-        .map_err(|e| Error::Pool(e.to_string()))?;
+        .map_err(|e| Error::Pool(e.to_string()))
+}
 
-    Ok(POOL.get_or_init(|| pool))
+/// The process-default database, built from the environment on first use.
+fn default_db() -> Result<&'static Database> {
+    if let Some(d) = DEFAULT_DB.get() {
+        return Ok(d);
+    }
+    let built = Database::from_env()?;
+    Ok(DEFAULT_DB.get_or_init(|| built))
+}
+
+/// Run `fut` with `db` as the database in scope for the task, so every `db::*`
+/// statement it makes — queries, writes, transactions — runs against `db`
+/// instead of the process default. Concurrent sessions on different databases do
+/// not see each other's: a spawned task starts outside the scope and falls back
+/// to the default, exactly as the read-only scope and the transaction scope do.
+pub async fn with_session<F, T>(db: Arc<Database>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION.scope(db, fut).await
+}
+
+/// The primary pool of the process-default database.
+///
+/// Kept for callers that want the process pool directly — the pool-stats gauge,
+/// chiefly. It is deliberately the *default*: a statement does not go through
+/// here, it goes through `acquire`, which honours the session in scope. This
+/// returns the global so the embedded single-database path is unchanged.
+pub fn pool() -> Result<&'static Pool> {
+    Ok(&default_db()?.primary)
 }
 
 // --------------------------------------------------------------------- TLS
@@ -403,6 +623,30 @@ fn merge_statement_timeout(options: Option<&str>, ms: u64) -> Option<String> {
     })
 }
 
+/// The connection-recycling strategy from the environment (ADR 0015), defaulting
+/// to the resilient `Verified`. See [`POOL_RECYCLING_ENV`].
+fn recycling_method() -> RecyclingMethod {
+    match std::env::var(POOL_RECYCLING_ENV)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("fast") => RecyclingMethod::Fast,
+        Ok("clean") => RecyclingMethod::Clean,
+        // `verified` by name, and also the default for anything unset or
+        // unrecognised: resilience is the safe thing to assume.
+        _ => RecyclingMethod::Verified,
+    }
+}
+
+/// Exponential backoff for the n-th acquire retry (0-based), capped. Pure, so the
+/// schedule is unit-tested. Attempt 0 waits `base`, 1 waits `2×base`, and so on,
+/// never past [`RETRY_BACKOFF_CAP_MS`].
+fn backoff_delay(base_ms: u64, attempt: u32) -> Duration {
+    let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    let ms = base_ms.saturating_mul(factor).min(RETRY_BACKOFF_CAP_MS);
+    Duration::from_millis(ms)
+}
+
 /// Build the pool's `Manager`, choosing the TLS connector from the requirement
 /// and the compiled features. `deadpool`'s `Manager` is not generic over the TLS
 /// type — it erases it — so every arm returns the same `Manager` and the process
@@ -415,12 +659,14 @@ fn build_manager(
     requirement: SslRequirement,
     root: Option<&str>,
 ) -> Result<Manager> {
-    // `Fast` recycling: the pool hands back a connection without a round trip.
-    // It is safe here because a connection is only ever returned to the pool
-    // with no transaction open — `atomic` takes it out of the pool instead of
-    // returning a dirty one.
+    // How a connection is checked on checkout (ADR 0015). `Verified` (the default)
+    // does a liveness round trip, so a connection killed by a restart or
+    // `pg_terminate_backend` is detected and replaced rather than handed to a
+    // doomed query; `fast` opts out of the round trip. Either is safe: a
+    // connection is only ever returned to the pool with no transaction open
+    // (`atomic` takes it out instead of returning a dirty one).
     let mgr_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
+        recycling_method: recycling_method(),
     };
 
     if requirement == SslRequirement::Disable {
@@ -617,8 +863,53 @@ tokio::task_local! {
     static CURRENT_TX: Shared;
 }
 
-async fn acquire() -> Result<Object> {
-    pool()?
+/// Acquire a connection for `route` from the database in scope — the session's
+/// if [`with_session`] set one, otherwise the process default. Holding the
+/// session `Arc` across the `.await` keeps its pools alive for the borrow.
+/// Acquire a connection for `route`, retrying a transient failure with backoff
+/// (ADR 0015). A pool error means nothing was sent on any connection yet — the
+/// database is restarting, or the pool is momentarily exhausted — so retrying is
+/// always safe (unlike a statement in flight, which `acquire` never retries). The
+/// `Verified` recycling above already replaces a *dead* pooled connection
+/// transparently; this retry covers the window where a fresh connection cannot be
+/// made yet because the server is still coming back.
+async fn acquire(route: Route) -> Result<Object> {
+    let max = env_u64(RETRY_MAX_ENV, RETRY_MAX_DEFAULT);
+    let base = env_u64(RETRY_BASE_MS_ENV, RETRY_BASE_MS_DEFAULT);
+    let mut attempt: u32 = 0;
+    loop {
+        match acquire_once(route).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if u64::from(attempt) >= max {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    target: "dorm::db",
+                    attempt = attempt + 1,
+                    max,
+                    error = %e,
+                    "retrying connection acquisition after a transient failure"
+                );
+                tokio::time::sleep(backoff_delay(base, attempt)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One acquisition from the database in scope — the session's pool, or the
+/// process default's.
+async fn acquire_once(route: Route) -> Result<Object> {
+    if let Ok(db) = SESSION.try_with(|d| d.clone()) {
+        return db
+            .pool_for(route)
+            .get()
+            .await
+            .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")));
+    }
+    default_db()?
+        .pool_for(route)
         .get()
         .await
         .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
@@ -640,12 +931,28 @@ async fn acquire() -> Result<Object> {
 /// given query — pays Parse once and is Bind/Execute-only thereafter. The win
 /// grows with repetition, which is the ORM's whole access pattern.
 pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    query_routed(sql, params, Route::Primary).await
+}
+
+/// Run a read on a read replica when the active [`Database`] has one — otherwise
+/// identical to [`query`]. This is the entry the typed read funnel uses for a
+/// `StatementKind::Read`; a transaction in scope keeps it on the primary (a
+/// transaction must read its own writes), as `Database::pool_for` enforces.
+pub async fn query_read(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+    query_routed(sql, params, Route::ReadReplica).await
+}
+
+async fn query_routed(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    route: Route,
+) -> Result<Vec<PgRow>> {
     // Observed end to end (ADR 0008): the clock spans Parse-or-cache-hit plus
     // Bind/Execute, which is the latency the caller actually pays. `in_tx` is
     // read up front so the event records the routing even on the error path.
     let in_tx = in_transaction();
     let start = Instant::now();
-    let result = query_inner(sql, params).await;
+    let result = query_inner(sql, params, route).await;
     observe(
         "query",
         sql,
@@ -656,16 +963,26 @@ pub async fn query(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRo
     result
 }
 
-async fn query_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<PgRow>> {
+async fn query_inner(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    route: Route,
+) -> Result<Vec<PgRow>> {
     if let Ok(tx) = CURRENT_TX.try_with(|t| t.clone()) {
         let guard = tx.lock().await;
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
+        if no_prepare() {
+            return conn.query(sql, params).await.map_err(from_pg);
+        }
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.query(&stmt, params).await.map_err(from_pg);
     }
-    let conn = acquire().await?;
+    let conn = acquire(route).await?;
+    if no_prepare() {
+        return conn.query(sql, params).await.map_err(from_pg);
+    }
     let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
     conn.query(&stmt, params).await.map_err(from_pg)
 }
@@ -696,10 +1013,17 @@ async fn execute_inner(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64>
         let conn = guard.conn.as_ref().ok_or_else(|| {
             Error::Db("the transaction's connection is gone; it was rolled back".into())
         })?;
+        if no_prepare() {
+            return conn.execute(sql, params).await.map_err(from_pg);
+        }
         let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
         return conn.execute(&stmt, params).await.map_err(from_pg);
     }
-    let conn = acquire().await?;
+    // Writes always run on the primary.
+    let conn = acquire(Route::Primary).await?;
+    if no_prepare() {
+        return conn.execute(sql, params).await.map_err(from_pg);
+    }
     let stmt = conn.prepare_cached(sql).await.map_err(from_pg)?;
     conn.execute(&stmt, params).await.map_err(from_pg)
 }
@@ -723,6 +1047,8 @@ async fn simple(conn: &Object, sql: &str) -> Result<()> {
 pub enum Backend {
     Postgres,
     Sqlite,
+    /// MySQL / MariaDB (ADR 0018), opt-in behind the `mysql` feature.
+    MySql,
 }
 
 /// Which backend the configured DSN selects.
@@ -736,14 +1062,27 @@ pub fn backend_of(dsn: &str) -> Backend {
     let lower = d.to_ascii_lowercase();
     if lower.starts_with("sqlite:") || lower.starts_with("file:") || d == ":memory:" {
         Backend::Sqlite
+    } else if lower.starts_with("mysql:") || lower.starts_with("mariadb:") {
+        Backend::MySql
     } else {
         Backend::Postgres
     }
 }
 
+/// The DSN of the database in scope — the session's ([`with_session`]) if one is
+/// set, otherwise the process environment's. Backend and dialect detection use
+/// this so a session on an explicit [`Database`] is classified by *its* DSN, and
+/// a process that runs purely through sessions needs no environment DSN at all.
+fn active_dsn() -> Result<String> {
+    if let Ok(d) = SESSION.try_with(|db| db.dsn.clone()) {
+        return Ok(d);
+    }
+    dsn()
+}
+
 /// The configured backend, or an error if no DSN is set.
 fn backend() -> Result<Backend> {
-    Ok(backend_of(&dsn()?))
+    Ok(backend_of(&active_dsn()?))
 }
 
 /// The SQL dialect the configured backend speaks.
@@ -753,48 +1092,170 @@ fn backend() -> Result<Backend> {
 /// query's SQL still works — the missing DSN surfaces later, when the query is
 /// actually run.
 pub fn dialect() -> Dialect {
-    match dsn() {
-        Ok(d) if backend_of(&d) == Backend::Sqlite => Dialect::Sqlite,
+    match active_dsn().map(|d| backend_of(&d)) {
+        Ok(Backend::Sqlite) => Dialect::Sqlite,
+        Ok(Backend::MySql) => Dialect::MySql,
         _ => Dialect::Postgres,
     }
 }
 
-/// Run a row-returning statement against the configured backend, taking ORM
-/// values and handing back backend-agnostic [`Row`]s.
-///
-/// Both paths keep the transaction-in-scope routing: PostgreSQL reuses [`query`]
-/// (routed by `CURRENT_TX`); SQLite checks its own transaction task-local and,
-/// inside an [`atomic`], runs on the connection the transaction already holds.
-pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-    match backend()? {
-        Backend::Postgres => {
-            let borrowed: Vec<&(dyn ToSql + Sync)> =
-                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            Ok(query(sql, &borrowed)
-                .await?
-                .into_iter()
-                .map(Row::Pg)
-                .collect())
-        }
-        #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::fetch(sql, params).await,
-        #[cfg(not(feature = "sqlite"))]
-        Backend::Sqlite => Err(sqlite_disabled()),
+/// Whether the active backend supports `cap` (ADR 0011) — a convenience over
+/// [`dialect`]`().supports(cap)` for callers outside the compiler, e.g. a
+/// migrator deciding whether it may emit `CREATE INDEX CONCURRENTLY`.
+pub fn supports(cap: crate::compiler::Capability) -> bool {
+    dialect().supports(cap)
+}
+
+// -------------------------------------------------------- the backend driver
+//
+// ADR 0011. `Driver` is the per-statement runtime seam a backend implements:
+// given a compiled statement, run it. It is the extension point a non-PG-wire
+// engine (MySQL, SQL Server, Oracle) plugs into — it brings its own wire driver,
+// parameter binding and row type, and implements these three verbs. The
+// transaction *openers* stay backend-split (`atomic_pg`, the `sqlite` module);
+// these are the per-statement verbs the typed path funnels through, and the free
+// functions below select the driver from the active backend and delegate.
+
+trait Driver {
+    /// Run a row-returning statement; `route` lets a read prefer a replica.
+    async fn fetch(&self, sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>>;
+    /// Run a statement for its affected-row count.
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64>;
+    /// Run one or more parameterless DDL statements.
+    async fn run_ddl(&self, ddl: &str) -> Result<()>;
+}
+
+/// The PostgreSQL driver: the pooled, replica-aware path built on [`query`]/
+/// [`query_read`]/[`execute`], and so on the [`Database`] in scope.
+struct PostgresDriver;
+
+impl Driver for PostgresDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>> {
+        let borrowed: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+        let rows = match route {
+            Route::ReadReplica => query_read(sql, &borrowed).await?,
+            Route::Primary => query(sql, &borrowed).await?,
+        };
+        Ok(rows.into_iter().map(Row::Pg).collect())
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let borrowed: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+        execute(sql, &borrowed).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        simple(&acquire(Route::Primary).await?, ddl).await
     }
 }
 
-/// Run a statement for its row count against the configured backend.
-pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+/// The SQLite driver: the single shared connection. It has no replica, so `route`
+/// does not change where a statement runs.
+#[cfg(feature = "sqlite")]
+struct SqliteDriver;
+
+#[cfg(feature = "sqlite")]
+impl Driver for SqliteDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], _route: Route) -> Result<Vec<Row>> {
+        sqlite::fetch(sql, params).await
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        sqlite::run(sql, params).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        sqlite::run_ddl(ddl).await
+    }
+}
+
+/// The MySQL driver: its own `mysql_async` pool (ADR 0018). Like SQLite it does
+/// not use the `Database` handle, so `route` is ignored (no replica yet).
+#[cfg(feature = "mysql")]
+struct MySqlDriver;
+
+#[cfg(feature = "mysql")]
+impl Driver for MySqlDriver {
+    async fn fetch(&self, sql: &str, params: &[Value], _route: Route) -> Result<Vec<Row>> {
+        mysql::fetch(sql, params).await
+    }
+
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        mysql::run(sql, params).await
+    }
+
+    async fn run_ddl(&self, ddl: &str) -> Result<()> {
+        mysql::run_ddl(ddl).await
+    }
+}
+
+/// Run a row-returning statement on the active backend's `Driver`, taking ORM
+/// values and handing back backend-agnostic [`Row`]s. Keeps the
+/// transaction-in-scope routing (PostgreSQL via `CURRENT_TX`; SQLite via its own
+/// task-local), and always runs on the primary.
+pub async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    fetch_routed(sql, params, Route::Primary).await
+}
+
+/// Run a read that may be served by a read replica. This is [`fetch`] for a
+/// `StatementKind::Read`: on PostgreSQL the active [`Database`]'s replica serves
+/// it when there is one (and no transaction is open); SQLite has no replica, so
+/// it is identical to [`fetch`] there.
+pub async fn fetch_read(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+    fetch_routed(sql, params, Route::ReadReplica).await
+}
+
+async fn fetch_routed(sql: &str, params: &[Value], route: Route) -> Result<Vec<Row>> {
     match backend()? {
-        Backend::Postgres => {
-            let borrowed: Vec<&(dyn ToSql + Sync)> =
-                params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-            execute(sql, &borrowed).await
-        }
+        Backend::Postgres => PostgresDriver.fetch(sql, params, route).await,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::run(sql, params).await,
+        Backend::Sqlite => SqliteDriver.fetch(sql, params, route).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.fetch(sql, params, route).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
+    }
+}
+
+/// Run a statement for its row count on the active backend's `Driver`.
+pub async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+    match backend()? {
+        Backend::Postgres => PostgresDriver.run(sql, params).await,
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => SqliteDriver.run(sql, params).await,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.run(sql, params).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
+    }
+}
+
+/// Run an `INSERT` and report `(rows affected, first generated key)` — the verb
+/// the no-`RETURNING` create path uses to learn the keys the database assigned
+/// (ADR 0018 Inc. 2b). Must run inside the `atomic` that reloads the rows, since
+/// `last_insert_id` is per-connection. Only MySQL reaches it: PostgreSQL and
+/// SQLite have `RETURNING`, so their create path reads the row back in the
+/// `INSERT` itself and never calls this.
+// Without the `mysql` feature no arm consumes the arguments — the only backend
+// that reaches `insert` is MySQL.
+#[cfg_attr(not(feature = "mysql"), allow(unused_variables))]
+pub async fn insert(sql: &str, params: &[Value]) -> Result<(u64, u64)> {
+    match backend()? {
+        #[cfg(feature = "mysql")]
+        Backend::MySql => mysql::insert(sql, params).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
+        Backend::Postgres | Backend::Sqlite => Err(Error::Db(
+            "insert()-then-reload is only for a backend without RETURNING; \
+             this backend reads the written row back with INSERT … RETURNING"
+                .into(),
+        )),
     }
 }
 
@@ -829,11 +1290,15 @@ pub async fn sql_execute(sql: &str, params: &[Value]) -> Result<u64> {
 /// backend. Used to stand a schema up before the typed path queries it.
 pub async fn run_ddl(ddl: &str) -> Result<()> {
     match backend()? {
-        Backend::Postgres => simple(&acquire().await?, ddl).await,
+        Backend::Postgres => PostgresDriver.run_ddl(ddl).await,
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => sqlite::run_ddl(ddl).await,
+        Backend::Sqlite => SqliteDriver.run_ddl(ddl).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => MySqlDriver.run_ddl(ddl).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 
@@ -843,6 +1308,16 @@ fn sqlite_disabled() -> Error {
     Error::Config(
         "the DSN selects SQLite, but this build has no SQLite backend; \
          rebuild dorm-core with features = [\"sqlite\"]"
+            .into(),
+    )
+}
+
+/// The error a MySQL DSN gets in a build that left the `mysql` feature off.
+#[cfg(not(feature = "mysql"))]
+fn mysql_disabled() -> Error {
+    Error::Config(
+        "the DSN selects MySQL, but this build has no MySQL backend; \
+         rebuild dorm-core with features = [\"mysql\"]"
             .into(),
     )
 }
@@ -874,6 +1349,65 @@ mod sqlite {
     use crate::value::Value;
 
     static CONN: OnceLock<Arc<Mutex<rusqlite::Connection>>> = OnceLock::new();
+
+    /// The reader pool for a file-backed database (ADR 0017). Read-only
+    /// connections a standalone read checks out, so reads run concurrently with
+    /// the writer under WAL instead of serialising on the one connection. `None`
+    /// for `:memory:`, which has no file to share and keeps the single connection.
+    static READERS: OnceLock<Option<ReaderPool>> = OnceLock::new();
+
+    /// A pool of read-only connections to one file database, bounded by a
+    /// semaphore so at most N readers are live at once. Idle connections are kept
+    /// and reused rather than reopened per read.
+    struct ReaderPool {
+        path: String,
+        idle: Mutex<Vec<rusqlite::Connection>>,
+        permits: tokio::sync::Semaphore,
+    }
+
+    /// The reader pool for the configured DSN, or `None` for `:memory:`. Built
+    /// once; its size follows the same `DELONIX_ORM_POOL_MAX` as PostgreSQL's.
+    fn readers() -> Option<&'static ReaderPool> {
+        READERS
+            .get_or_init(|| {
+                dsn_path(&dsn().ok()?).map(|path| ReaderPool {
+                    path,
+                    idle: Mutex::new(Vec::new()),
+                    permits: tokio::sync::Semaphore::new(super::env_usize(super::POOL_MAX_ENV, 4)),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Run a standalone read on a pooled reader connection. Holds a permit for the
+    /// query so the pool never exceeds its size, checks out an idle connection (or
+    /// opens one), and returns it afterwards — even if the query failed.
+    async fn read_pooled(
+        pool: &'static ReaderPool,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Row>> {
+        let _permit = pool
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| Error::Db("the SQLite reader pool is closed".into()))?;
+        let conn = match pool.idle.lock().map_err(|_| poisoned())?.pop() {
+            Some(c) => c,
+            None => open_reader(&pool.path)?,
+        };
+        let sql = sql.to_string();
+        let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
+        // The connection moves into the blocking closure and back out, so a failed
+        // query still returns it to the pool rather than leaking it.
+        let (result, conn) = blocking(move || {
+            let rows = query_on(&conn, &sql, params);
+            Ok((rows, conn))
+        })
+        .await?;
+        pool.idle.lock().map_err(|_| poisoned())?.push(conn);
+        result
+    }
 
     /// Serialises logical access to the single connection. An outer `atomic`
     /// holds it for its whole scope; a standalone statement holds it for one call.
@@ -926,23 +1460,71 @@ mod sqlite {
         Ok(CONN.get_or_init(|| Arc::new(Mutex::new(c))).clone())
     }
 
-    /// Open a connection for the DSN. `sqlite::memory:`, `sqlite:` and `:memory:`
-    /// are in-memory; anything else is the file path after the scheme.
-    fn open(dsn: &str) -> Result<rusqlite::Connection> {
+    /// The file path a SQLite DSN names, or `None` for an in-memory database.
+    /// `sqlite::memory:`, `sqlite:` and `:memory:` are in-memory; anything else is
+    /// the path after the scheme.
+    fn dsn_path(dsn: &str) -> Option<String> {
         let rest = dsn
             .trim()
             .strip_prefix("sqlite:")
             .or_else(|| dsn.trim().strip_prefix("file:"))
             .unwrap_or_else(|| dsn.trim());
-        let conn = if rest.is_empty() || rest == ":memory:" {
-            rusqlite::Connection::open_in_memory()
+        if rest.is_empty() || rest == ":memory:" {
+            None
         } else {
-            rusqlite::Connection::open(rest)
-        };
-        conn.map_err(|e| Error::Db(e.to_string()))
+            Some(rest.to_string())
+        }
+    }
+
+    /// Open the writer connection for the DSN. A file database is put in **WAL**
+    /// journal mode (ADR 0017): a writer and the pooled readers then run
+    /// concurrently — readers see the last committed snapshot while the writer
+    /// writes, instead of every statement serialising on one connection. An
+    /// in-memory database cannot use WAL (it has no file to journal), so it keeps
+    /// the single-connection behaviour.
+    fn open(dsn: &str) -> Result<rusqlite::Connection> {
+        match dsn_path(dsn) {
+            None => rusqlite::Connection::open_in_memory().map_err(|e| Error::Db(e.to_string())),
+            Some(path) => {
+                let conn =
+                    rusqlite::Connection::open(&path).map_err(|e| Error::Db(e.to_string()))?;
+                // WAL is a persistent property of the database file, so setting it
+                // on the writer is enough — a reader that opens the same file later
+                // is already in WAL mode. `busy_timeout` lets a brief lock
+                // contention wait rather than failing with `SQLITE_BUSY`.
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .map_err(|e| Error::Db(e.to_string()))?;
+                conn.busy_timeout(std::time::Duration::from_millis(5_000))
+                    .map_err(|e| Error::Db(e.to_string()))?;
+                Ok(conn)
+            }
+        }
+    }
+
+    /// Open a read-only connection to a file database for the reader pool. WAL is
+    /// already set by the writer, so a reader only needs its own `busy_timeout`.
+    fn open_reader(path: &str) -> Result<rusqlite::Connection> {
+        use rusqlite::OpenFlags;
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| Error::Db(e.to_string()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(5_000))
+            .map_err(|e| Error::Db(e.to_string()))?;
+        Ok(conn)
     }
 
     pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        // A standalone read on a file database goes to the reader pool — concurrent
+        // with the writer under WAL. Inside a transaction, or on `:memory:`, it
+        // stays on the one connection the transaction or the database holds, so it
+        // still reads its own uncommitted writes.
+        if !in_tx() {
+            if let Some(pool) = readers() {
+                return read_pooled(pool, sql, params).await;
+            }
+        }
         let _lock = lock_if_standalone().await;
         fetch_on_conn(sql, params).await
     }
@@ -963,28 +1545,40 @@ mod sqlite {
         .await
     }
 
-    /// Run a row-returning statement on the connection, assuming the caller holds
-    /// the connection lock (standalone statement) or is inside a transaction.
+    /// Run a row-returning statement on one connection — the shape the reader pool
+    /// and the shared-connection path both need. Synchronous: the callers wrap it
+    /// in [`blocking`].
+    fn query_on(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: Vec<rusqlite::types::Value>,
+    ) -> Result<Vec<Row>> {
+        let mut stmt = conn.prepare(sql).map_err(db_err)?;
+        let ncols = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let mut cells = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                cells.push(r.get::<usize, rusqlite::types::Value>(i).map_err(db_err)?);
+            }
+            out.push(Row::Sqlite(SqliteRow::new(cells)));
+        }
+        Ok(out)
+    }
+
+    /// Run a row-returning statement on the **shared** connection, assuming the
+    /// caller holds the connection lock (standalone statement) or is inside a
+    /// transaction.
     async fn fetch_on_conn(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         let conn = conn()?;
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
         blocking(move || {
             let guard = conn.lock().map_err(|_| poisoned())?;
-            let mut stmt = guard.prepare(&sql).map_err(db_err)?;
-            let ncols = stmt.column_count();
-            let mut rows = stmt
-                .query(rusqlite::params_from_iter(params))
-                .map_err(db_err)?;
-            let mut out = Vec::new();
-            while let Some(r) = rows.next().map_err(db_err)? {
-                let mut cells = Vec::with_capacity(ncols);
-                for i in 0..ncols {
-                    cells.push(r.get::<usize, rusqlite::types::Value>(i).map_err(db_err)?);
-                }
-                out.push(Row::Sqlite(SqliteRow::new(cells)));
-            }
-            Ok(out)
+            query_on(&guard, &sql, params)
         })
         .await
     }
@@ -1194,6 +1788,273 @@ mod sqlite {
     }
 }
 
+/// The MySQL backend: its own `mysql_async` pool (ADR 0018), a sibling of the
+/// `sqlite` module. Like SQLite it reads the DSN from the process environment and
+/// does not use the `Database` handle — session/replica wait for the Database↔
+/// Driver refactor. The non-scalar types travel as text/native values via
+/// [`value_to_mysql`]/the `mysql_*` decoders in [`crate::row`].
+///
+/// Every connection checkout runs the `setup` statements: **`ANSI_QUOTES`** so the
+/// compiler's double-quoted identifiers are identifiers, not string literals;
+/// **`time_zone='+00:00'`** so a `DATETIME` round-trips a `DateTime<Utc>`; and
+/// **`utf8mb4`**. They are `setup` rather than `init` so they are re-applied after
+/// the pool resets a reused connection.
+#[cfg(feature = "mysql")]
+mod mysql {
+    use std::sync::{Arc, OnceLock};
+
+    use mysql_async::prelude::Queryable;
+
+    use super::{dsn, savepoint_name, Error, Result, Tx};
+    use crate::compiler::positionalize;
+    use crate::row::{value_to_mysql, Row};
+    use crate::value::Value;
+
+    static MYSQL_POOL: OnceLock<mysql_async::Pool> = OnceLock::new();
+
+    /// The connection a MySQL transaction runs on, plus its savepoint depth —
+    /// the mirror of PostgreSQL's `TxState`, with a `mysql_async::Conn` in place of
+    /// the pooled `Object`.
+    struct MySqlTxState {
+        conn: Option<mysql_async::Conn>,
+        depth: usize,
+    }
+
+    type Shared = Arc<tokio::sync::Mutex<MySqlTxState>>;
+
+    tokio::task_local! {
+        /// The transaction in scope, if any. Set by [`atomic`] for the closure's
+        /// duration, so a nested `fetch`/`run` finds it and runs on its connection.
+        static MYSQL_TX: Shared;
+    }
+
+    /// The pool, built once from the DSN with the per-connection `init` fixups.
+    fn pool() -> Result<&'static mysql_async::Pool> {
+        if let Some(p) = MYSQL_POOL.get() {
+            return Ok(p);
+        }
+        let url = dsn()?;
+        let opts = mysql_async::Opts::from_url(&url)
+            .map_err(|e| Error::Config(format!("the MySQL DSN is not usable: {e}")))?;
+        let builder = mysql_async::OptsBuilder::from_opts(opts).setup(vec![
+            // `setup`, not `init`: these run on every checkout, so they survive the
+            // pool's `COM_RESET_CONNECTION` on return. `init` runs only once at
+            // connect, and the reset then wipes `sql_mode` — a reused connection
+            // would lose `ANSI_QUOTES` and reject the compiler's `"ident"` quoting.
+            // Append the mode, never overwrite, so the server's strict mode is kept.
+            "SET SESSION sql_mode=CONCAT(@@sql_mode, ',ANSI_QUOTES')".to_string(),
+            "SET time_zone='+00:00'".to_string(),
+            "SET NAMES utf8mb4".to_string(),
+        ]);
+        Ok(MYSQL_POOL.get_or_init(|| mysql_async::Pool::new(builder)))
+    }
+
+    /// Acquire a connection, retrying a transient failure with the same capped
+    /// backoff as the PostgreSQL path (ADR 0015).
+    async fn conn() -> Result<mysql_async::Conn> {
+        let max = super::env_u64(super::RETRY_MAX_ENV, super::RETRY_MAX_DEFAULT);
+        let base = super::env_u64(super::RETRY_BASE_MS_ENV, super::RETRY_BASE_MS_DEFAULT);
+        let mut attempt: u32 = 0;
+        loop {
+            match pool()?.get_conn().await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    if u64::from(attempt) >= max {
+                        return Err(Error::Pool(format!(
+                            "could not acquire a MySQL connection: {e}"
+                        )));
+                    }
+                    tokio::time::sleep(super::backoff_delay(base, attempt)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// The numbered `?n` the compiler emits, converted to the bare positional `?`
+    /// MySQL binds by order, with the parameters reordered to match (ADR 0018).
+    fn positional(sql: &str, params: &[Value]) -> (String, Vec<mysql_async::Value>) {
+        let (text, ordered) = positionalize(sql, params);
+        (text, ordered.iter().map(value_to_mysql).collect())
+    }
+
+    pub(super) async fn fetch(sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            let rows: Vec<mysql_async::Row> = conn.exec(text, params).await.map_err(db_err)?;
+            return Ok(rows.into_iter().map(Row::MySql).collect());
+        }
+        let mut conn = conn().await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(text, params).await.map_err(db_err)?;
+        Ok(rows.into_iter().map(Row::MySql).collect())
+    }
+
+    pub(super) async fn run(sql: &str, params: &[Value]) -> Result<u64> {
+        let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            conn.exec_drop(text, params).await.map_err(db_err)?;
+            return Ok(conn.affected_rows());
+        }
+        let mut conn = conn().await?;
+        conn.exec_drop(text, params).await.map_err(db_err)?;
+        Ok(conn.affected_rows())
+    }
+
+    /// Run an `INSERT` and report `(rows affected, last_insert_id)` — the verb the
+    /// no-`RETURNING` path uses to find the generated keys. `last_insert_id` is
+    /// per-connection, so this must run inside the transaction that then reloads
+    /// the rows. Wired by the create path in ADR 0018 Inc. 2b.
+    pub(super) async fn insert(sql: &str, params: &[Value]) -> Result<(u64, u64)> {
+        let (text, params) = positional(sql, params);
+        if let Ok(tx) = MYSQL_TX.try_with(|t| t.clone()) {
+            let mut guard = tx.lock().await;
+            let conn = guard.conn.as_mut().ok_or_else(tx_gone)?;
+            conn.exec_drop(text, params).await.map_err(db_err)?;
+            return Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)));
+        }
+        let mut conn = conn().await?;
+        conn.exec_drop(text, params).await.map_err(db_err)?;
+        Ok((conn.affected_rows(), conn.last_insert_id().unwrap_or(0)))
+    }
+
+    pub(super) async fn run_ddl(ddl: &str) -> Result<()> {
+        // DDL auto-commits in MySQL, so it is never run on a transaction's
+        // connection; a standalone checkout is correct and avoids surprising a
+        // transaction with an implicit commit.
+        let mut conn = conn().await?;
+        conn.query_drop(ddl).await.map_err(db_err)
+    }
+
+    /// Run `f` inside a transaction (ADR 0018), the MySQL mirror of `atomic_pg`:
+    /// an owned `Conn` in a task-local, `BEGIN`/`SAVEPOINT` issued directly. InnoDB
+    /// supports savepoints, so nesting is a savepoint exactly as on PostgreSQL.
+    pub(super) async fn atomic<F, Fut, T>(f: F) -> Result<T>
+    where
+        F: FnOnce(Tx) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match MYSQL_TX.try_with(|t| t.clone()) {
+            // Already inside one: a savepoint.
+            Ok(shared) => {
+                let depth = {
+                    let mut state = shared.lock().await;
+                    state.depth += 1;
+                    let depth = state.depth;
+                    let conn = state.conn.as_mut().ok_or_else(tx_gone)?;
+                    conn.query_drop(format!("SAVEPOINT {}", savepoint_name(depth)))
+                        .await
+                        .map_err(db_err)?;
+                    depth
+                };
+                let name = savepoint_name(depth);
+                let guard = PanicGuard {
+                    shared: shared.clone(),
+                    armed: true,
+                };
+                let outcome = f(Tx { depth }).await;
+                let mut guard = guard;
+                guard.armed = false;
+
+                let mut state = shared.lock().await;
+                state.depth -= 1;
+                let conn = state.conn.as_mut().ok_or_else(tx_gone)?;
+                match outcome {
+                    Ok(v) => {
+                        conn.query_drop(format!("RELEASE SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        Ok(v)
+                    }
+                    Err(e) => {
+                        conn.query_drop(format!("ROLLBACK TO SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        conn.query_drop(format!("RELEASE SAVEPOINT {name}"))
+                            .await
+                            .map_err(db_err)?;
+                        Err(e)
+                    }
+                }
+            }
+            // The outermost transaction.
+            Err(_) => {
+                let mut conn = conn().await?;
+                conn.query_drop("BEGIN").await.map_err(db_err)?;
+                let shared: Shared = Arc::new(tokio::sync::Mutex::new(MySqlTxState {
+                    conn: Some(conn),
+                    depth: 1,
+                }));
+                let guard = PanicGuard {
+                    shared: shared.clone(),
+                    armed: true,
+                };
+                let outcome = MYSQL_TX.scope(shared.clone(), f(Tx { depth: 1 })).await;
+                let mut guard = guard;
+                guard.armed = false;
+
+                let mut state = shared.lock().await;
+                let mut conn = state.conn.take().ok_or_else(tx_gone)?;
+                let result = match outcome {
+                    Ok(v) => conn.query_drop("COMMIT").await.map(|()| v).map_err(db_err),
+                    Err(e) => {
+                        // The rollback's own failure must not hide the error that
+                        // caused it; that is the one the caller needs to read.
+                        let _ = conn.query_drop("ROLLBACK").await;
+                        Err(e)
+                    }
+                };
+                // Dropping the `Conn` returns it to the pool now that no transaction
+                // is open.
+                drop(conn);
+                result
+            }
+        }
+    }
+
+    /// Closes the connection if dropped while still holding it — which only happens
+    /// on a panic, and is what makes MySQL roll the transaction back (a connection
+    /// closing mid-transaction is rolled back by the server), the same guarantee
+    /// `PanicGuard` gives the PostgreSQL path.
+    struct PanicGuard {
+        shared: Shared,
+        armed: bool,
+    }
+
+    impl Drop for PanicGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Ok(mut state) = self.shared.try_lock() {
+                // Take the connection out so it is closed rather than returned to
+                // the pool with an open transaction; the server rolls it back.
+                let _ = state.conn.take();
+            }
+        }
+    }
+
+    fn tx_gone() -> Error {
+        Error::Db("the MySQL transaction's connection is gone; it was rolled back".into())
+    }
+
+    fn db_err(e: mysql_async::Error) -> Error {
+        // Record a server error's code in brackets, as `from_pg` records the
+        // PostgreSQL SQLSTATE, so `is_unique_violation` can recognise a duplicate
+        // key (`ER_DUP_ENTRY`, code 1062) without parsing mysql_async's `Display`.
+        if let mysql_async::Error::Server(ref se) = e {
+            return Error::Db(format!(
+                "ERROR [{}] ({}): {}",
+                se.code, se.state, se.message
+            ));
+        }
+        Error::Db(e.to_string())
+    }
+}
+
 /// A handle on the transaction in scope.
 ///
 /// It carries no connection: the task-local does the routing. What it offers is
@@ -1266,6 +2127,10 @@ where
         Backend::Sqlite => sqlite::atomic(f).await,
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        #[cfg(feature = "mysql")]
+        Backend::MySql => mysql::atomic(f).await,
+        #[cfg(not(feature = "mysql"))]
+        Backend::MySql => Err(mysql_disabled()),
     }
 }
 
@@ -1322,7 +2187,7 @@ where
 
         // The outermost transaction.
         Err(_) => {
-            let conn = acquire().await?;
+            let conn = acquire(Route::Primary).await?;
             let start = if is_read_only() {
                 "BEGIN READ ONLY"
             } else {
@@ -1417,7 +2282,7 @@ enum TxHandle {
 pub async fn begin_interactive() -> Result<InteractiveTransaction> {
     match backend()? {
         Backend::Postgres => {
-            let conn = acquire().await?;
+            let conn = acquire(Route::Primary).await?;
             let start = if is_read_only() {
                 "BEGIN READ ONLY"
             } else {
@@ -1436,6 +2301,9 @@ pub async fn begin_interactive() -> Result<InteractiveTransaction> {
         ))),
         #[cfg(not(feature = "sqlite"))]
         Backend::Sqlite => Err(sqlite_disabled()),
+        Backend::MySql => Err(Error::Db(
+            "MySQL interactive transactions are not implemented yet (ADR 0018 Inc. 2)".into(),
+        )),
     }
 }
 
@@ -1728,6 +2596,42 @@ mod tests {
             merge_statement_timeout(Some("-c search_path=app"), 0).as_deref(),
             Some("-c search_path=app")
         );
+    }
+
+    #[test]
+    fn backoff_doubles_each_attempt_and_is_capped() {
+        // Attempt 0 waits the base, then it doubles: 50, 100, 200, 400…
+        assert_eq!(backoff_delay(50, 0), Duration::from_millis(50));
+        assert_eq!(backoff_delay(50, 1), Duration::from_millis(100));
+        assert_eq!(backoff_delay(50, 2), Duration::from_millis(200));
+        assert_eq!(backoff_delay(50, 3), Duration::from_millis(400));
+        // The cap holds, and a huge attempt cannot overflow into a tiny wait.
+        assert_eq!(
+            backoff_delay(1000, 10),
+            Duration::from_millis(RETRY_BACKOFF_CAP_MS)
+        );
+        assert_eq!(
+            backoff_delay(1, 200),
+            Duration::from_millis(RETRY_BACKOFF_CAP_MS)
+        );
+    }
+
+    #[test]
+    fn recycling_defaults_to_verified_and_honours_the_override() {
+        let before = std::env::var(POOL_RECYCLING_ENV).ok();
+        std::env::remove_var(POOL_RECYCLING_ENV);
+        assert!(matches!(recycling_method(), RecyclingMethod::Verified));
+        std::env::set_var(POOL_RECYCLING_ENV, "fast");
+        assert!(matches!(recycling_method(), RecyclingMethod::Fast));
+        std::env::set_var(POOL_RECYCLING_ENV, " Clean ");
+        assert!(matches!(recycling_method(), RecyclingMethod::Clean));
+        // Anything unrecognised falls back to the resilient default.
+        std::env::set_var(POOL_RECYCLING_ENV, "banana");
+        assert!(matches!(recycling_method(), RecyclingMethod::Verified));
+        match before {
+            Some(v) => std::env::set_var(POOL_RECYCLING_ENV, v),
+            None => std::env::remove_var(POOL_RECYCLING_ENV),
+        }
     }
 
     #[test]
