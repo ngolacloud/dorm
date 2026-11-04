@@ -1,3 +1,8 @@
+> **DEPRECATED — moved to `seiva-messaging`.** Broker messaging is cross-service
+> communication, not the ORM's job (ADR 0054). This crate moved to the Delonix
+> Seiva repository (`seiva-messaging` + `seiva-outbox-relay`), history preserved,
+> and will be removed from DORM in a future release. Depend on those instead.
+
 # dorm-messaging
 
 Optional messaging for [DORM](../../README.md) (ADR 0031): a **CloudEvents 1.0**

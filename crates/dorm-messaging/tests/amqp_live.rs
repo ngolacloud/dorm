@@ -1,3 +1,7 @@
+// dorm-messaging is deprecated (moved to seiva-messaging, ADR 0054); these
+// live tests still exercise it until the removal PR deletes the crate.
+#![allow(deprecated)]
+
 //! The AMQP broker backend + the outbox→broker bridge (ADR 0052) against a live
 //! RabbitMQ and a live PostgreSQL.
 //!
