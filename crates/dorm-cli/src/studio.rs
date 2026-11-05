@@ -63,13 +63,13 @@ pub async fn serve(port: u16, writable: bool) -> crate::CliResult {
         .route("/", get(index))
         .route("/api/schema", get(schema))
         .route(
-            "/api/tables/:table/rows",
+            "/api/tables/{table}/rows",
             get(get_rows)
                 .post(insert_row)
                 .patch(update_row)
                 .delete(delete_row),
         )
-        .route("/api/tables/:table/export.csv", get(export_csv));
+        .route("/api/tables/{table}/export.csv", get(export_csv));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
