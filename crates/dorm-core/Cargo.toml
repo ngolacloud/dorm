@@ -1,9 +1,11 @@
 [package]
 name = "dorm-core"
-# Independent: this release adds the backend-generic `db` (ADR 0003) — the `row`
-# module, the `Decode` seam, `db::{fetch, run, run_ddl, dialect}`, the
-# `compile_*_on` round-out, and the opt-in `sqlite` feature.
-version = "0.6.0"
+# Independent: 0.6.1 publishes the additive API the 0.6 line grew after 0.6.0 was
+# cut — the `Database` handle + `with_session`, strict sessions
+# (`set_strict_sessions`/`strict_sessions`), `ConnectOptions`, and `set_cursor_key`
+# (DORM-B1, #26). All backward-compatible additions, so `dorm-core = "0.6"` picks
+# it up with no downstream manifest change.
+version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
