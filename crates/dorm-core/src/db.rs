@@ -953,10 +953,7 @@ impl Database {
             }
             // Every replica is ejected or failing: serve the read from the primary.
         }
-        self.primary
-            .get()
-            .await
-            .map_err(|e| Error::Pool(format!("could not acquire a connection: {e}")))
+        self.primary.get().await.map_err(map_acquire_err)
     }
 
     /// Proactively eject read replicas that lag more than `max_lag_secs` behind
@@ -1480,16 +1477,34 @@ tokio::task_local! {
     static CURRENT_TX: Shared;
 }
 
+/// Maps a connection-acquisition failure to the ORM error, distinguishing a
+/// **saturated** pool (`PoolError::Timeout` — no connection came free within
+/// `wait_timeout`) from a connect/backend failure. The distinction is what lets
+/// [`acquire`] fail fast on backpressure instead of retrying it (B-1).
+fn map_acquire_err(e: deadpool_postgres::PoolError) -> Error {
+    match e {
+        deadpool_postgres::PoolError::Timeout(kind) => {
+            Error::PoolExhausted(format!("no connection free within wait_timeout ({kind:?})"))
+        }
+        other => Error::Pool(format!("could not acquire a connection: {other}")),
+    }
+}
+
 /// Acquire a connection for `route` from the database in scope — the session's
 /// if [`with_session`] set one, otherwise the process default. Holding the
 /// session `Arc` across the `.await` keeps its pools alive for the borrow.
 /// Acquire a connection for `route`, retrying a transient failure with backoff
-/// (ADR 0015). A pool error means nothing was sent on any connection yet — the
-/// database is restarting, or the pool is momentarily exhausted — so retrying is
-/// always safe (unlike a statement in flight, which `acquire` never retries). The
-/// `Verified` recycling above already replaces a *dead* pooled connection
-/// transparently; this retry covers the window where a fresh connection cannot be
-/// made yet because the server is still coming back.
+/// (ADR 0015). A backend/connect pool error means nothing was sent on any
+/// connection yet — the database is restarting — so retrying is safe (unlike a
+/// statement in flight, which `acquire` never retries). The `Verified` recycling
+/// above already replaces a *dead* pooled connection transparently; this retry
+/// covers the window where a fresh connection cannot be made yet because the
+/// server is still coming back.
+///
+/// A **saturated** pool ([`Error::PoolExhausted`], `PoolError::Timeout`) is the
+/// exception: it is backpressure, not a transient fault, so it is returned at once
+/// — retrying it only turns a fast failure (~`wait_timeout`) into a slow one
+/// (`RETRY_MAX × wait_timeout`) and amplifies the contention upstream (B-1).
 async fn acquire(route: Route) -> Result<Object> {
     let max = env_u64(RETRY_MAX_ENV, RETRY_MAX_DEFAULT);
     let base = env_u64(RETRY_BASE_MS_ENV, RETRY_BASE_MS_DEFAULT);
@@ -1498,7 +1513,8 @@ async fn acquire(route: Route) -> Result<Object> {
         match acquire_once(route).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
-                if u64::from(attempt) >= max {
+                // Fail fast on a saturated pool (backpressure) and when retries run out.
+                if matches!(e, Error::PoolExhausted(_)) || u64::from(attempt) >= max {
                     return Err(e);
                 }
                 tracing::warn!(
@@ -3077,6 +3093,30 @@ impl Drop for InteractiveTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pool_wait_timeout_is_exhaustion_not_a_retryable_fault() {
+        // A `wait_timeout` (the pool is saturated) maps to `PoolExhausted`, which
+        // `acquire` returns at once — NOT `Pool`, which it retries (B-1).
+        let timeout = map_acquire_err(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Wait,
+        ));
+        assert!(
+            matches!(timeout, Error::PoolExhausted(_)),
+            "a pool wait-timeout is backpressure: {timeout:?}"
+        );
+        // A create timeout (cannot build a new connection yet) is also exhaustion.
+        let create = map_acquire_err(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Create,
+        ));
+        assert!(matches!(create, Error::PoolExhausted(_)));
+        // A closed pool is a plain pool error (the retry budget still bounds it).
+        let closed = map_acquire_err(deadpool_postgres::PoolError::Closed);
+        assert!(
+            matches!(closed, Error::Pool(_)),
+            "a non-timeout pool failure stays retryable: {closed:?}"
+        );
+    }
 
     #[test]
     fn savepoint_names_are_generated_and_contain_nothing_a_caller_supplied() {
