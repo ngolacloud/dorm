@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::error::{Error, Result};
-use crate::expr::{Aggregate, Assignment, OrderBy, Predicate, F, Q};
+use crate::expr::{AggKind, Aggregate, Assignment, OrderBy, Predicate, F, Q};
 use crate::lookup::Lookup;
 use crate::meta::{FieldMeta, ModelMeta};
 use crate::registry::{self, Join, Resolved};
@@ -395,7 +395,10 @@ fn compile_predicate(
                 path: p.path.clone(),
             })?,
         };
-        let ty = agg.kind.result_type().unwrap_or(FieldType::I64);
+        // The promoted result type (A-F1): a HAVING on `SUM(bigint)` compares a
+        // NUMERIC, not a bigint, so the lookup must validate against the promoted
+        // type the column aggregates to — the same type the SELECT decodes.
+        let ty = aggregate_type(plan, agg);
         lookup.validate(ty, &p.path, &p.values)?;
         let operand = compile_aggregate_expr(plan, agg, joins)?;
         return Ok(Clause::Having(compile_comparison(
@@ -789,14 +792,18 @@ fn compile_aggregate_expr(plan: &Plan, agg: &Aggregate, joins: &mut Joins) -> Re
     ))
 }
 
-/// The result type of an aggregate, for decoding.
+/// The result type of an aggregate, for decoding — the PostgreSQL-**promoted**
+/// type, not the source column's own (A-F1). `COUNT` never touches the column (and
+/// its `path` may be a relation name, not a scalar field, so do not resolve it);
+/// `SUM`/`AVG`/`MIN`/`MAX` promote from the resolved column type.
 fn aggregate_type(plan: &Plan, agg: &Aggregate) -> FieldType {
-    if let Some(t) = agg.kind.result_type() {
-        return t;
+    if agg.kind == AggKind::Count {
+        return FieldType::I64;
     }
-    registry::resolve(plan.model, &agg.path)
+    let column = registry::resolve(plan.model, &agg.path)
         .map(|r| r.field.ty)
-        .unwrap_or(FieldType::I64)
+        .unwrap_or(FieldType::I64);
+    agg.kind.result_type_over(column)
 }
 
 /// `SELECT` for a plan: the root columns, anything `select_related` brought in,

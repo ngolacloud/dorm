@@ -53,11 +53,17 @@ fn runtime() -> &'static Runtime {
 /// emits one `CREATE INDEX` spanning both columns. Runs without a database.
 #[test]
 fn the_composite_index_resolves_and_emits_one_create_index_over_both_columns() {
-    let groups: Vec<Vec<&str>> = Event::meta()
+    // The inventory slice has no guaranteed iteration order (it is linker-built),
+    // so compare the index groups as a SET — two independent composite indexes on
+    // one model have no inherent order between them.
+    let mut groups: Vec<Vec<&str>> = Event::meta()
         .composite_indexes()
         .map(|g| g.to_vec())
         .collect();
-    assert_eq!(groups, vec![vec!["tenant", "created_at"], vec!["status"]]);
+    groups.sort();
+    let mut expected = vec![vec!["status"], vec!["tenant", "created_at"]];
+    expected.sort();
+    assert_eq!(groups, expected);
 
     let idx = dorm_migrations::ddl::indexes(Event::meta());
     assert!(

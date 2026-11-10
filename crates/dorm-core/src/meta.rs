@@ -484,8 +484,14 @@ mod tests {
             unique_together: &[],
             checks: &[],
         };
-        let groups: Vec<Vec<&str>> = IMETA.composite_indexes().map(|g| g.to_vec()).collect();
-        assert_eq!(groups, vec![vec!["tenant", "created_at"], vec!["status"]]);
+        // The inventory slice has no guaranteed iteration order (it is linker-built),
+        // so compare the index groups as a SET — two independent composite indexes
+        // on one model have no inherent order between them.
+        let mut groups: Vec<Vec<&str>> = IMETA.composite_indexes().map(|g| g.to_vec()).collect();
+        groups.sort();
+        let mut expected = vec![vec!["status"], vec!["tenant", "created_at"]];
+        expected.sort();
+        assert_eq!(groups, expected);
         // A model with no `IndexMeta` submission has no composite indexes.
         assert_eq!(META.composite_indexes().count(), 0);
     }
