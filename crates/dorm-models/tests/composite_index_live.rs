@@ -63,7 +63,7 @@ fn the_composite_index_resolves_and_emits_one_create_index_over_both_columns() {
     assert!(
         idx.iter()
             .any(|s| s.contains("l5_events_tenant_created_at_idx")
-                && s.contains("(tenant, created_at)")),
+                && s.contains("(\"tenant\", \"created_at\")")),
         "a composite CREATE INDEX over both columns: {idx:?}"
     );
 }

@@ -44,7 +44,7 @@ fn runtime() -> &'static Runtime {
 fn the_ddl_emits_a_table_level_composite_primary_key() {
     let ddl = dorm_migrations::ddl::create_table(RegionCode::meta()).expect("ddl");
     assert!(
-        ddl.contains("PRIMARY KEY (region, code)"),
+        ddl.contains("PRIMARY KEY (\"region\", \"code\")"),
         "expected a composite table-level key: {ddl}"
     );
     assert!(

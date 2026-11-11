@@ -76,13 +76,13 @@ fn the_enum_type_resolves_and_the_ddl_creates_and_uses_it() {
     );
     assert_eq!(types.len(), 1, "one CREATE TYPE: {types:?}");
     assert!(
-        types[0].contains("CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped')"),
+        types[0].contains("CREATE TYPE \"order_status\" AS ENUM ('pending', 'paid', 'shipped')"),
         "{types:?}"
     );
 
     let ddl = dorm_migrations::ddl::create_table(Order::meta()).expect("ddl");
     assert!(
-        ddl.contains("status order_status"),
+        ddl.contains("\"status\" \"order_status\""),
         "the column uses the enum type: {ddl}"
     );
 }

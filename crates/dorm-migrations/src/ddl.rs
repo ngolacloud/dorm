@@ -6,6 +6,7 @@
 //! the query compiler's snapshot tests.
 
 use crate::{Error, Result};
+use dorm_core::dialect::SqlDialect;
 use dorm_core::meta::{FieldMeta, ModelMeta};
 use dorm_core::registry;
 use dorm_core::value::FieldType;
@@ -35,6 +36,36 @@ impl Backend {
             dorm_core::db::Backend::MySql => Backend::MySql,
         }
     }
+
+    /// The SQL dialect this backend quotes and renders with — the same
+    /// `impl SqlDialect` the query compiler delegates to (ADR 0011), so the DDL
+    /// and the runtime queries quote identifiers by one rule (E-A-3).
+    fn dialect(self) -> &'static dyn SqlDialect {
+        match self {
+            Backend::Postgres => &dorm_core::dialect::Postgres,
+            Backend::Sqlite => &dorm_core::dialect::Sqlite,
+            Backend::MySql => &dorm_core::dialect::MySql,
+        }
+    }
+}
+
+/// Quote an identifier for `backend` so a reserved word (`user`, `order`) or any
+/// name that is not a bare lowercase identifier survives being spliced into DDL
+/// (E-A-3). Delegates to the backend's `quote_ident` — the one rule the query
+/// compiler already uses — so a `"user"` table is created and queried the same
+/// way. Table/column names come from `#[derive(Model)]` metadata (compile-time,
+/// never a caller), the same trust the generator already carries.
+pub(crate) fn q(backend: Backend, ident: &str) -> String {
+    backend.dialect().quote_ident(ident)
+}
+
+/// Quote an identifier for the PostgreSQL/SQLite-only helpers (indexes, drops,
+/// renames, the online expand/contract constraints). Both dialects share the
+/// `"ident"` form, and the online steps — `NOT VALID`, `CONCURRENTLY` — are
+/// Postgres-only (ADR 0038), so these paths never need MySQL's backticks. Keeps
+/// the `&str`-only signatures the autodetector calls while still quoting (E-A-3).
+pub(crate) fn qp(ident: &str) -> String {
+    dorm_core::dialect::Postgres.quote_ident(ident)
 }
 
 /// The full schema for an ordered set of models, for PostgreSQL. See
@@ -92,8 +123,9 @@ pub fn create_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec
             format!(
                 "DO $$ BEGIN \
                  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{name}') THEN \
-                 CREATE TYPE {name} AS ENUM ({labels}); \
-                 END IF; END $$"
+                 CREATE TYPE {} AS ENUM ({labels}); \
+                 END IF; END $$",
+                q(backend, name)
             )
         })
         .collect()
@@ -116,7 +148,8 @@ pub fn alter_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<
         for v in variants {
             let label = v.replace('\'', "''");
             out.push(format!(
-                "ALTER TYPE {name} ADD VALUE IF NOT EXISTS '{label}'"
+                "ALTER TYPE {} ADD VALUE IF NOT EXISTS '{label}'",
+                q(backend, name)
             ));
         }
     }
@@ -158,23 +191,37 @@ pub fn create_table_named_on(meta: &ModelMeta, name: &str, backend: Backend) -> 
     for f in meta.fields {
         if composite && f.primary_key {
             // A plain column — the key-ness is the table-level constraint below.
-            parts.push(format!("{} {}", f.column, column_modifiers(f, backend)?));
+            parts.push(format!(
+                "{} {}",
+                q(backend, f.column),
+                column_modifiers(f, backend)?
+            ));
         } else {
             parts.push(column_def(f, backend)?);
         }
     }
     if composite {
-        parts.push(format!("PRIMARY KEY ({})", pk_cols.join(", ")));
+        let cols = pk_cols
+            .iter()
+            .map(|c| q(backend, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("PRIMARY KEY ({cols})"));
     }
     for group in meta.unique_together {
-        parts.push(format!("UNIQUE ({})", group.join(", ")));
+        let cols = group
+            .iter()
+            .map(|c| q(backend, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("UNIQUE ({cols})"));
     }
     for check in meta.checks {
         parts.push(format!("CHECK ({check})"));
     }
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {} (\n    {}\n)",
-        name,
+        q(backend, name),
         parts.join(",\n    ")
     ))
 }
@@ -193,20 +240,29 @@ fn column_def(f: &FieldMeta, backend: Backend) -> Result<String> {
             && effective_default(f, backend).is_none()
             && f.relation.is_none()
         {
+            let col = q(backend, f.column);
             return Ok(match backend {
-                Backend::Postgres => format!("{} BIGSERIAL PRIMARY KEY", f.column),
-                Backend::Sqlite => format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", f.column),
-                Backend::MySql => format!("{} BIGINT AUTO_INCREMENT PRIMARY KEY", f.column),
+                Backend::Postgres => format!("{col} BIGSERIAL PRIMARY KEY"),
+                Backend::Sqlite => format!("{col} INTEGER PRIMARY KEY AUTOINCREMENT"),
+                Backend::MySql => format!("{col} BIGINT AUTO_INCREMENT PRIMARY KEY"),
             });
         }
-        let mut s = format!("{} {} PRIMARY KEY", f.column, column_type(f, backend)?);
+        let mut s = format!(
+            "{} {} PRIMARY KEY",
+            q(backend, f.column),
+            column_type(f, backend)?
+        );
         if let Some(d) = effective_default(f, backend) {
             s.push_str(&format!(" DEFAULT {d}"));
         }
         return Ok(s);
     }
 
-    Ok(format!("{} {}", f.column, column_modifiers(f, backend)?))
+    Ok(format!(
+        "{} {}",
+        q(backend, f.column),
+        column_modifiers(f, backend)?
+    ))
 }
 
 /// Everything after the column name in a definition: the type, then
@@ -228,8 +284,8 @@ fn column_modifiers(f: &FieldMeta, backend: Backend) -> Result<String> {
         let (table, pk) = relation_target(rel.model)?;
         s.push_str(&format!(
             " REFERENCES {} ({}) ON DELETE {}",
-            table,
-            pk,
+            q(backend, table),
+            q(backend, pk),
             rel.on_delete.sql()
         ));
     }
@@ -261,9 +317,9 @@ pub fn add_column_on(meta: &ModelMeta, f: &FieldMeta, backend: Backend) -> Resul
     };
     Ok(format!(
         "ALTER TABLE {} ADD COLUMN {}{} {}",
-        meta.table,
+        q(backend, meta.table),
         guard,
-        f.column,
+        q(backend, f.column),
         column_modifiers(f, backend)?
     ))
 }
@@ -277,24 +333,34 @@ pub fn drop_column(table: &str, column: &str, backend: Backend) -> String {
         Backend::Postgres => "IF EXISTS ",
         Backend::Sqlite | Backend::MySql => "",
     };
-    format!("ALTER TABLE {table} DROP COLUMN {guard}{column}")
+    format!(
+        "ALTER TABLE {} DROP COLUMN {guard}{}",
+        q(backend, table),
+        q(backend, column)
+    )
 }
 
 /// `DROP TABLE IF EXISTS …` — the same on both backends.
 pub fn drop_table(table: &str) -> String {
-    format!("DROP TABLE IF EXISTS {table}")
+    format!("DROP TABLE IF EXISTS {}", qp(table))
 }
 
-/// `DROP INDEX IF EXISTS …` for the index [`index_on`] would have created.
+/// `DROP INDEX IF EXISTS …` for the index [`index_on`] would have created. Names
+/// the index through [`index_name`] so a drop quotes exactly what a create made.
 pub fn drop_index(table: &str, column: &str) -> String {
-    format!("DROP INDEX IF EXISTS {}_{}_idx", table, column)
+    format!("DROP INDEX IF EXISTS {}", qp(&index_name(table, &[column])))
 }
 
 /// `ALTER TABLE <table> RENAME COLUMN <from> TO <to>` — the data-preserving
 /// alternative to drop-then-add when a column is renamed (B-24). Both PostgreSQL
 /// and SQLite (≥ 3.25) accept this exact form, so no dialect split is needed.
 pub fn rename_column(table: &str, from: &str, to: &str) -> String {
-    format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}")
+    format!(
+        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+        qp(table),
+        qp(from),
+        qp(to)
+    )
 }
 
 /// Reject anything that is not a plain SQL identifier before it is spliced into
@@ -334,7 +400,10 @@ pub fn add_not_null_check_not_valid(table: &str, column: &str) -> Result<String>
     let column = ident(column)?;
     let name = not_null_constraint(table, column);
     Ok(format!(
-        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({column} IS NOT NULL) NOT VALID"
+        "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({} IS NOT NULL) NOT VALID",
+        qp(table),
+        qp(&name),
+        qp(column)
     ))
 }
 
@@ -348,7 +417,11 @@ pub fn validate_not_null(table: &str, column: &str) -> Result<String> {
     let table = ident(table)?;
     let column = ident(column)?;
     let name = not_null_constraint(table, column);
-    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+    Ok(format!(
+        "ALTER TABLE {} VALIDATE CONSTRAINT {}",
+        qp(table),
+        qp(&name)
+    ))
 }
 
 /// `ALTER TABLE <t> ADD CONSTRAINT <name> CHECK (<expr>) NOT VALID` for an
@@ -360,7 +433,9 @@ pub fn add_check_not_valid(table: &str, name: &str, check_expr: &str) -> Result<
     let table = ident(table)?;
     let name = ident(name)?;
     Ok(format!(
-        "ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({check_expr}) NOT VALID"
+        "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({check_expr}) NOT VALID",
+        qp(table),
+        qp(name)
     ))
 }
 
@@ -368,7 +443,11 @@ pub fn add_check_not_valid(table: &str, name: &str, check_expr: &str) -> Result<
 pub fn validate_constraint(table: &str, name: &str) -> Result<String> {
     let table = ident(table)?;
     let name = ident(name)?;
-    Ok(format!("ALTER TABLE {table} VALIDATE CONSTRAINT {name}"))
+    Ok(format!(
+        "ALTER TABLE {} VALIDATE CONSTRAINT {}",
+        qp(table),
+        qp(name)
+    ))
 }
 
 /// `ALTER TABLE <t> DROP CONSTRAINT IF EXISTS <name>` — the `contract`-step inverse
@@ -377,7 +456,9 @@ pub fn drop_constraint(table: &str, name: &str) -> Result<String> {
     let table = ident(table)?;
     let name = ident(name)?;
     Ok(format!(
-        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}"
+        "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {}",
+        qp(table),
+        qp(name)
     ))
 }
 
@@ -391,7 +472,9 @@ pub fn set_not_null(table: &str, column: &str) -> Result<String> {
     let table = ident(table)?;
     let column = ident(column)?;
     Ok(format!(
-        "ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"
+        "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
+        qp(table),
+        qp(column)
     ))
 }
 
@@ -408,9 +491,17 @@ pub fn index_on(table: &str, column: &str) -> String {
 pub fn index_on_cols(table: &str, columns: &[&str]) -> String {
     let name = index_name(table, columns);
     format!(
-        "CREATE INDEX IF NOT EXISTS {name} ON {table} ({})",
-        columns.join(", ")
+        "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+        qp(&name),
+        qp(table),
+        quote_cols(columns)
     )
+}
+
+/// Quote a list of column identifiers for PostgreSQL/SQLite, `", "`-joined — the
+/// shared rendering for the index column lists (E-A-3).
+fn quote_cols(columns: &[&str]) -> String {
+    columns.iter().map(|c| qp(c)).collect::<Vec<_>>().join(", ")
 }
 
 /// The one place a (possibly composite) index name is spelled:
@@ -436,12 +527,16 @@ pub fn index_on_concurrent(table: &str, column: &str, backend: Backend) -> Strin
 /// The composite form of [`index_on_concurrent`] (ADR 0044).
 pub fn index_on_cols_concurrent(table: &str, columns: &[&str], backend: Backend) -> String {
     let name = index_name(table, columns);
-    let cols = columns.join(", ");
+    let cols = quote_cols(columns);
     match backend {
         // MySQL has no `CREATE INDEX CONCURRENTLY`.
         Backend::MySql => index_on_cols(table, columns),
         Backend::Postgres => {
-            format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({cols})")
+            format!(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ({cols})",
+                qp(&name),
+                qp(table)
+            )
         }
         Backend::Sqlite => index_on_cols(table, columns),
     }
@@ -487,7 +582,13 @@ fn column_type(f: &FieldMeta, backend: Backend) -> Result<String> {
 /// mapping; SQLite collapses onto its storage classes (ADR 0002).
 fn sql_type(ty: FieldType, backend: Backend) -> String {
     match backend {
-        Backend::Postgres => ty.sql_type().to_string(),
+        // A native enum column's type is the enum type's name, which is itself an
+        // identifier — quote it so a reserved type name resolves (E-A-3), matching
+        // the quoted `CREATE TYPE`. Every other PostgreSQL type is a keyword.
+        Backend::Postgres => match ty {
+            FieldType::Enum(name) => q(backend, name),
+            _ => ty.sql_type().to_string(),
+        },
         Backend::Sqlite => match ty {
             FieldType::I32 | FieldType::I64 | FieldType::Bool => "INTEGER",
             FieldType::Text | FieldType::Timestamp | FieldType::Uuid | FieldType::Json => "TEXT",
@@ -604,7 +705,7 @@ mod tests {
         };
         assert_eq!(
             column_def(&f, Backend::Postgres).unwrap(),
-            "id BIGSERIAL PRIMARY KEY"
+            "\"id\" BIGSERIAL PRIMARY KEY"
         );
     }
 
@@ -618,7 +719,7 @@ mod tests {
         };
         assert_eq!(
             column_def(&f, Backend::Postgres).unwrap(),
-            "addon_name TEXT PRIMARY KEY"
+            "\"addon_name\" TEXT PRIMARY KEY"
         );
     }
 
@@ -630,7 +731,7 @@ mod tests {
         };
         assert_eq!(
             column_def(&f, Backend::Postgres).unwrap(),
-            "slug TEXT NOT NULL UNIQUE"
+            "\"slug\" TEXT NOT NULL UNIQUE"
         );
     }
 
@@ -642,7 +743,7 @@ mod tests {
         };
         assert_eq!(
             column_def(&f, Backend::Postgres).unwrap(),
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            "\"created_at\" TIMESTAMPTZ NOT NULL DEFAULT now()"
         );
     }
 
@@ -652,18 +753,18 @@ mod tests {
             nullable: true,
             ..field("note", FieldType::Text)
         };
-        assert_eq!(column_def(&f, Backend::Postgres).unwrap(), "note TEXT");
+        assert_eq!(column_def(&f, Backend::Postgres).unwrap(), "\"note\" TEXT");
     }
 
     #[test]
     fn jsonb_and_bigint_map_from_their_field_types() {
         assert_eq!(
             column_def(&field("doc", FieldType::Json), Backend::Postgres).unwrap(),
-            "doc JSONB NOT NULL"
+            "\"doc\" JSONB NOT NULL"
         );
         assert_eq!(
             column_def(&field("n", FieldType::I64), Backend::Postgres).unwrap(),
-            "n BIGINT NOT NULL"
+            "\"n\" BIGINT NOT NULL"
         );
     }
 
@@ -694,7 +795,7 @@ mod tests {
         };
         assert_eq!(
             indexes(&M),
-            vec!["CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"]
+            vec!["CREATE INDEX IF NOT EXISTS \"tenants_slug_idx\" ON \"tenants\" (\"slug\")"]
         );
     }
 
@@ -705,20 +806,20 @@ mod tests {
     fn a_not_null_check_is_added_not_valid_then_validated_under_a_stable_name() {
         assert_eq!(
             add_not_null_check_not_valid("accounts", "email").unwrap(),
-            "ALTER TABLE accounts ADD CONSTRAINT accounts_email_not_null \
-             CHECK (email IS NOT NULL) NOT VALID"
+            "ALTER TABLE \"accounts\" ADD CONSTRAINT \"accounts_email_not_null\" \
+             CHECK (\"email\" IS NOT NULL) NOT VALID"
         );
         assert_eq!(
             validate_not_null("accounts", "email").unwrap(),
-            "ALTER TABLE accounts VALIDATE CONSTRAINT accounts_email_not_null"
+            "ALTER TABLE \"accounts\" VALIDATE CONSTRAINT \"accounts_email_not_null\""
         );
         assert_eq!(
             set_not_null("accounts", "email").unwrap(),
-            "ALTER TABLE accounts ALTER COLUMN email SET NOT NULL"
+            "ALTER TABLE \"accounts\" ALTER COLUMN \"email\" SET NOT NULL"
         );
         assert_eq!(
             drop_constraint("accounts", "accounts_email_not_null").unwrap(),
-            "ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_email_not_null"
+            "ALTER TABLE \"accounts\" DROP CONSTRAINT IF EXISTS \"accounts_email_not_null\""
         );
     }
 
@@ -726,11 +827,11 @@ mod tests {
     fn a_general_check_carries_the_author_expression_and_validates_by_name() {
         assert_eq!(
             add_check_not_valid("orders", "orders_total_positive", "total >= 0").unwrap(),
-            "ALTER TABLE orders ADD CONSTRAINT orders_total_positive CHECK (total >= 0) NOT VALID"
+            "ALTER TABLE \"orders\" ADD CONSTRAINT \"orders_total_positive\" CHECK (total >= 0) NOT VALID"
         );
         assert_eq!(
             validate_constraint("orders", "orders_total_positive").unwrap(),
-            "ALTER TABLE orders VALIDATE CONSTRAINT orders_total_positive"
+            "ALTER TABLE \"orders\" VALIDATE CONSTRAINT \"orders_total_positive\""
         );
     }
 
@@ -749,11 +850,11 @@ mod tests {
     fn a_concurrent_index_is_non_blocking_on_postgres_and_plain_on_sqlite() {
         assert_eq!(
             index_on_concurrent("tenants", "slug", Backend::Postgres),
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"tenants_slug_idx\" ON \"tenants\" (\"slug\")"
         );
         assert_eq!(
             index_on_concurrent("tenants", "slug", Backend::Sqlite),
-            "CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug)"
+            "CREATE INDEX IF NOT EXISTS \"tenants_slug_idx\" ON \"tenants\" (\"slug\")"
         );
     }
 
@@ -816,11 +917,11 @@ mod tests {
         };
         assert_eq!(
             create_table(&M).unwrap(),
-            "CREATE TABLE IF NOT EXISTS tenant_databases (\n    \
-             addon_name TEXT PRIMARY KEY,\n    \
-             token_sha256 TEXT NOT NULL UNIQUE,\n    \
-             doc JSONB NOT NULL,\n    \
-             UNIQUE (tenant, name),\n    \
+            "CREATE TABLE IF NOT EXISTS \"tenant_databases\" (\n    \
+             \"addon_name\" TEXT PRIMARY KEY,\n    \
+             \"token_sha256\" TEXT NOT NULL UNIQUE,\n    \
+             \"doc\" JSONB NOT NULL,\n    \
+             UNIQUE (\"tenant\", \"name\"),\n    \
              CHECK (token_sha256 ~ '^sha256:[0-9a-f]{64}$')\n)"
         );
     }
@@ -852,10 +953,10 @@ mod tests {
         };
         assert_eq!(
             create_table(&M).unwrap(),
-            "CREATE TABLE IF NOT EXISTS x (\n    \
-             a TEXT PRIMARY KEY,\n    \
-             UNIQUE (a, b),\n    \
-             UNIQUE (c),\n    \
+            "CREATE TABLE IF NOT EXISTS \"x\" (\n    \
+             \"a\" TEXT PRIMARY KEY,\n    \
+             UNIQUE (\"a\", \"b\"),\n    \
+             UNIQUE (\"c\"),\n    \
              CHECK (a <> '')\n)"
         );
     }
@@ -920,12 +1021,12 @@ mod tests {
     fn sqlite_maps_the_serial_key_the_types_and_the_now_default() {
         let ddl = schema_for_on(&[&NOTE], Backend::Sqlite).unwrap();
         assert!(
-            ddl.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            ddl.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"),
             "{ddl}"
         );
-        assert!(ddl.contains("title TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("\"title\" TEXT NOT NULL"), "{ddl}");
         assert!(
-            ddl.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            ddl.contains("\"created_at\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
             "{ddl}"
         );
         // The PostgreSQL spelling must be absent.
@@ -968,7 +1069,7 @@ mod tests {
         // with the single-column form, and spans every column (ADR 0044).
         assert_eq!(
             index_on_cols("events", &["tenant", "created_at"]),
-            "CREATE INDEX IF NOT EXISTS events_tenant_created_at_idx ON events (tenant, created_at)"
+            "CREATE INDEX IF NOT EXISTS \"events_tenant_created_at_idx\" ON \"events\" (\"tenant\", \"created_at\")"
         );
         // A single column goes through the same path as `index_on`.
         assert_eq!(
@@ -978,8 +1079,8 @@ mod tests {
         // Concurrent on PostgreSQL; the fallback on SQLite is the plain form.
         assert_eq!(
             index_on_cols_concurrent("events", &["tenant", "created_at"], Backend::Postgres),
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS events_tenant_created_at_idx \
-             ON events (tenant, created_at)"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"events_tenant_created_at_idx\" \
+             ON \"events\" (\"tenant\", \"created_at\")"
         );
         assert_eq!(
             index_on_cols_concurrent("events", &["a", "b"], Backend::Sqlite),
@@ -1022,11 +1123,78 @@ mod tests {
         assert_eq!(
             indexes(&M),
             vec![
-                "CREATE INDEX IF NOT EXISTS idx_models_slug_idx ON idx_models (slug)".to_string(),
-                "CREATE INDEX IF NOT EXISTS idx_models_tenant_created_at_idx \
-                 ON idx_models (tenant, created_at)"
+                "CREATE INDEX IF NOT EXISTS \"idx_models_slug_idx\" ON \"idx_models\" (\"slug\")"
+                    .to_string(),
+                "CREATE INDEX IF NOT EXISTS \"idx_models_tenant_created_at_idx\" \
+                 ON \"idx_models\" (\"tenant\", \"created_at\")"
                     .to_string(),
             ]
         );
+    }
+
+    // E-A-3: a table named after a reserved word (`user`), with a reserved column
+    // (`order`) that is also indexed, must still produce DDL a database accepts —
+    // because every identifier is quoted (`"user"`, `"order"`). The proof is
+    // execution, not shape: the schema applies on SQLite and a row round-trips
+    // through the reserved names. (SQLite stands in for the offline gate; the
+    // same quoting lets `table = "user"` create on PostgreSQL — the live done-when.)
+    #[test]
+    fn reserved_words_as_table_and_column_create_and_round_trip() {
+        const FS: &[FieldMeta] = &[
+            FieldMeta {
+                name: "id",
+                column: "id",
+                ty: FieldType::I64,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+                index: false,
+                max_length: None,
+                default: None,
+                auto_now_add: false,
+                auto_now: false,
+                relation: None,
+            },
+            FieldMeta {
+                name: "order",
+                column: "order",
+                ty: FieldType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                index: true,
+                max_length: None,
+                default: None,
+                auto_now_add: false,
+                auto_now: false,
+                relation: None,
+            },
+        ];
+        const M: ModelMeta = ModelMeta {
+            name: "ReservedModel",
+            table: "user",
+            fields: FS,
+            ordering: &[],
+            tenant_scoped: false,
+            unique_together: &[],
+            checks: &[],
+        };
+
+        let ddl = schema_for_on(&[&M], Backend::Sqlite).unwrap();
+        // The reserved identifiers are quoted everywhere they appear.
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS \"user\""), "{ddl}");
+        assert!(ddl.contains("\"order\" TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("ON \"user\" (\"order\")"), "{ddl}");
+
+        // And the capstone: it is valid SQL the engine runs, and the row survives.
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(&ddl)
+            .expect("the reserved-word schema applies");
+        conn.execute("INSERT INTO \"user\" (\"order\") VALUES ('x')", [])
+            .expect("insert into a reserved table/column");
+        let got: String = conn
+            .query_row("SELECT \"order\" FROM \"user\"", [], |r| r.get(0))
+            .expect("select the reserved column back");
+        assert_eq!(got, "x");
     }
 }

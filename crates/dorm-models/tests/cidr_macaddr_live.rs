@@ -50,8 +50,8 @@ fn the_sql_types_are_cidr_and_macaddr_and_the_ddl_uses_them() {
     assert_eq!(FieldType::Cidr.sql_type(), "CIDR");
     assert_eq!(FieldType::MacAddr.sql_type(), "MACADDR");
     let ddl = dorm_migrations::ddl::create_table(NetBlock::meta()).expect("ddl");
-    assert!(ddl.contains("block CIDR"), "cidr column: {ddl}");
-    assert!(ddl.contains("mac MACADDR"), "macaddr column: {ddl}");
+    assert!(ddl.contains("\"block\" CIDR"), "cidr column: {ddl}");
+    assert!(ddl.contains("\"mac\" MACADDR"), "macaddr column: {ddl}");
 }
 
 #[test]
