@@ -710,15 +710,22 @@ fn sqlite_rebuild(prev: &Table, cur: &Table, meta: &'static ModelMeta) -> Result
         .collect();
 
     let mut out = vec![ddl::create_table_named_on(meta, &tmp, Backend::Sqlite)?];
+    let qtmp = ddl::qp(&tmp);
+    let qcur = ddl::qp(&cur.name);
     if !shared.is_empty() {
-        let cols = shared.join(", ");
+        // The same quoted column list serves both the INSERT and the SELECT, so
+        // a reserved column name survives the copy (E-A-3).
+        let cols = shared
+            .iter()
+            .map(|c| ddl::qp(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push(format!(
-            "INSERT INTO {tmp} ({cols}) SELECT {cols} FROM {}",
-            cur.name
+            "INSERT INTO {qtmp} ({cols}) SELECT {cols} FROM {qcur}"
         ));
     }
-    out.push(format!("DROP TABLE {}", cur.name));
-    out.push(format!("ALTER TABLE {tmp} RENAME TO {}", cur.name));
+    out.push(format!("DROP TABLE {qcur}"));
+    out.push(format!("ALTER TABLE {qtmp} RENAME TO {qcur}"));
     out.extend(ddl::indexes(meta));
     Ok(out)
 }
@@ -759,8 +766,9 @@ fn pg_column_alters(
         // A plain column: a foreign key's type follows its target, so with the
         // reference unchanged the type cannot have, and we never reach here.
         out.push(format!(
-            "ALTER TABLE {table} ALTER COLUMN {} TYPE {}",
-            cur.name,
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
+            ddl::qp(table),
+            ddl::qp(&cur.name),
             field.ty.sql_type()
         ));
     }
@@ -772,22 +780,30 @@ fn pg_column_alters(
             "SET NOT NULL"
         };
         out.push(format!(
-            "ALTER TABLE {table} ALTER COLUMN {} {verb}",
-            cur.name
+            "ALTER TABLE {} ALTER COLUMN {} {verb}",
+            ddl::qp(table),
+            ddl::qp(&cur.name)
         ));
     }
 
     if pg_default(prev) != pg_default(cur) {
         out.push(match pg_default(cur) {
             Some(d) => format!(
-                "ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {d}",
-                cur.name
+                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {d}",
+                ddl::qp(table),
+                ddl::qp(&cur.name)
             ),
-            None => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", cur.name),
+            None => format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT",
+                ddl::qp(table),
+                ddl::qp(&cur.name)
+            ),
         });
     }
 
     if prev.unique != cur.unique {
+        // The constraint name is built unquoted so the 63-byte limit is measured
+        // on the real identifier, then quoted as a whole at emission (E-A-3).
         let name = format!("{table}_{}_key", cur.name);
         if name.len() > 63 {
             return Err(Error::UnsupportedChange(format!(
@@ -798,11 +814,17 @@ fn pg_column_alters(
         }
         out.push(if cur.unique {
             format!(
-                "ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({})",
-                cur.name
+                "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({})",
+                ddl::qp(table),
+                ddl::qp(&name),
+                ddl::qp(&cur.name)
             )
         } else {
-            format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}")
+            format!(
+                "ALTER TABLE {} DROP CONSTRAINT IF EXISTS {}",
+                ddl::qp(table),
+                ddl::qp(&name)
+            )
         });
     }
 
@@ -1026,8 +1048,8 @@ mod tests {
         assert_eq!(
             stmts,
             vec![
-                "ALTER TABLE notes ALTER COLUMN title TYPE BIGINT".to_string(),
-                "ALTER TABLE notes ALTER COLUMN title DROP NOT NULL".to_string(),
+                "ALTER TABLE \"notes\" ALTER COLUMN \"title\" TYPE BIGINT".to_string(),
+                "ALTER TABLE \"notes\" ALTER COLUMN \"title\" DROP NOT NULL".to_string(),
             ],
             "{stmts:?}"
         );
@@ -1044,10 +1066,13 @@ mod tests {
         );
         assert_eq!(
             stmts[1],
-            "INSERT INTO notes__dorm_new (id, title) SELECT id, title FROM notes"
+            "INSERT INTO \"notes__dorm_new\" (\"id\", \"title\") SELECT \"id\", \"title\" FROM \"notes\""
         );
-        assert_eq!(stmts[2], "DROP TABLE notes");
-        assert_eq!(stmts[3], "ALTER TABLE notes__dorm_new RENAME TO notes");
+        assert_eq!(stmts[2], "DROP TABLE \"notes\"");
+        assert_eq!(
+            stmts[3],
+            "ALTER TABLE \"notes__dorm_new\" RENAME TO \"notes\""
+        );
     }
 
     #[test]
@@ -1071,14 +1096,17 @@ mod tests {
         let add = autodetect(&v1, &[&UNIQ_META], Backend::Postgres).unwrap();
         assert_eq!(
             add,
-            vec!["ALTER TABLE notes ADD CONSTRAINT notes_title_key UNIQUE (title)".to_string()]
+            vec![
+                "ALTER TABLE \"notes\" ADD CONSTRAINT \"notes_title_key\" UNIQUE (\"title\")"
+                    .to_string()
+            ]
         );
         // …and dropping it later targets the same name.
         let v2 = Snapshot::from_models(&[&UNIQ_META]);
         let drop = autodetect(&v2, &[&NOTE_V1_META], Backend::Postgres).unwrap();
         assert_eq!(
             drop,
-            vec!["ALTER TABLE notes DROP CONSTRAINT IF EXISTS notes_title_key".to_string()]
+            vec!["ALTER TABLE \"notes\" DROP CONSTRAINT IF EXISTS \"notes_title_key\"".to_string()]
         );
     }
 
@@ -1102,13 +1130,13 @@ mod tests {
         let set = autodetect(&v1, &[&DEF_META], Backend::Postgres).unwrap();
         assert_eq!(
             set,
-            vec!["ALTER TABLE notes ALTER COLUMN title SET DEFAULT 'untitled'".to_string()]
+            vec!["ALTER TABLE \"notes\" ALTER COLUMN \"title\" SET DEFAULT 'untitled'".to_string()]
         );
         let v2 = Snapshot::from_models(&[&DEF_META]);
         let drop = autodetect(&v2, &[&NOTE_V1_META], Backend::Postgres).unwrap();
         assert_eq!(
             drop,
-            vec!["ALTER TABLE notes ALTER COLUMN title DROP DEFAULT".to_string()]
+            vec!["ALTER TABLE \"notes\" ALTER COLUMN \"title\" DROP DEFAULT".to_string()]
         );
     }
 

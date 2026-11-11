@@ -55,7 +55,7 @@ impl Backend {
 /// compiler already uses — so a `"user"` table is created and queried the same
 /// way. Table/column names come from `#[derive(Model)]` metadata (compile-time,
 /// never a caller), the same trust the generator already carries.
-fn q(backend: Backend, ident: &str) -> String {
+pub(crate) fn q(backend: Backend, ident: &str) -> String {
     backend.dialect().quote_ident(ident)
 }
 
@@ -64,7 +64,7 @@ fn q(backend: Backend, ident: &str) -> String {
 /// `"ident"` form, and the online steps — `NOT VALID`, `CONCURRENTLY` — are
 /// Postgres-only (ADR 0038), so these paths never need MySQL's backticks. Keeps
 /// the `&str`-only signatures the autodetector calls while still quoting (E-A-3).
-fn qp(ident: &str) -> String {
+pub(crate) fn qp(ident: &str) -> String {
     dorm_core::dialect::Postgres.quote_ident(ident)
 }
 
