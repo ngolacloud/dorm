@@ -35,7 +35,7 @@ chrono = { workspace = true, features = ["clock", "serde"] }
 # later if a minimal build wants it gone.
 hmac = "0.13"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { workspace = true, features = ["v4", "serde"] }
 rust_decimal = { workspace = true }
 # `CIDR` → `cidr::IpCidr`, `MACADDR` → `eui48::MacAddress`, native on PostgreSQL
