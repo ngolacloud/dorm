@@ -48,7 +48,7 @@ tokio = { workspace = true, features = ["time", "rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 # The local ONNX embedder (feature-gated): runs the model on the host via ONNX
 # Runtime, so data never leaves the box. Heavy, hence strictly opt-in.
-fastembed = { version = "4", optional = true }
+fastembed = { version = "7", optional = true }
 
 [features]
 default = []
