@@ -70,11 +70,8 @@ chrono = { workspace = true, features = ["alloc"] }
 # stored value, so any Argon2 verifier reads it back. `rpassword` reads a password
 # from the terminal without echoing it; the non-interactive flags/env/stdin paths
 # bypass it entirely.
-argon2 = "0.5"
-# `argon2` re-exports `password_hash`, which draws its salt through `rand_core`'s
-# `OsRng`. We depend on `rand_core` directly (same 0.6 line `argon2`/`password-hash`
-# already use) with `getrandom` on, rather than leaning on feature-unification of a
-# separately-declared `password-hash`: a `password-hash` major bump would split the
-# graph and silently drop `OsRng`. This keeps the OS CSPRNG salt wired explicitly.
-rand_core = { version = "0.6", features = ["getrandom"] }
+# The default features (`alloc` + `getrandom`) let `hash_password` draw a fresh
+# random salt from the OS CSPRNG internally — no separate `rand_core`/`SaltString`
+# plumbing, which `password-hash` 0.6 removed.
+argon2 = "0.6"
 rpassword = "7"

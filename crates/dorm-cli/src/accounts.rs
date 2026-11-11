@@ -23,12 +23,11 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 
-use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::password_hash::PasswordHasher;
 use argon2::Argon2;
 use dorm_core::db;
 use dorm_core::row::Row;
 use dorm_core::value::Value;
-use rand_core::OsRng;
 use serde_json::json;
 
 use crate::CliResult;
@@ -69,9 +68,8 @@ async fn ensure_table() -> Result<(), Box<dyn std::error::Error>> {
 /// — so the stored value carries everything a verifier needs. Defaults are the
 /// `argon2` crate's recommended Argon2id parameters.
 fn hash_password(password: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let salt = SaltString::generate(&mut OsRng);
     let phc = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| format!("hashing password: {e}"))?
         .to_string();
     Ok(phc)
