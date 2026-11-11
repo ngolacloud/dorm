@@ -39,6 +39,7 @@ pub mod compiler;
 pub mod cqrs;
 pub mod cursor;
 pub mod db;
+pub mod dialect;
 pub mod error;
 pub mod expr;
 pub mod field;

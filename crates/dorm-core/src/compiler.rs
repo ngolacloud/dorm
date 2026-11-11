@@ -226,91 +226,56 @@ pub enum Capability {
     IlikeOperator,
 }
 
-// Everything a dialect decides differently lives here, as methods on `Dialect` —
-// not as `match`es scattered through the compiler. Adding a SQL backend (ADR
-// 0011) is adding an arm to each of these, in one place, which is what keeps the
-// fan-out to MySQL/MSSQL/Cockroach/Oracle tractable.
+// What a dialect decides differently now lives in ONE trait with one impl per
+// backend ([`crate::dialect::SqlDialect`]); this enum is the `Copy` SELECTOR that
+// maps to an impl. Adding a SQL backend (ADR 0011) is a new `impl SqlDialect` plus
+// one arm in [`Dialect::ops`] — not an arm in every method here (G1/E-A-1). These
+// methods delegate, so the compiler's call sites are unchanged.
 impl Dialect {
-    /// The case-insensitive pattern operator: PostgreSQL's `ILIKE`, or `LIKE` on
-    /// SQLite (whose `LIKE` is already case-insensitive for ASCII).
+    /// The `impl SqlDialect` carrying this dialect's per-backend behaviour — the
+    /// single place a new engine plugs in.
+    pub fn ops(self) -> &'static dyn crate::dialect::SqlDialect {
+        match self {
+            Dialect::Postgres => &crate::dialect::Postgres,
+            Dialect::Sqlite => &crate::dialect::Sqlite,
+            Dialect::MySql => &crate::dialect::MySql,
+        }
+    }
+
+    /// The case-insensitive pattern operator (`ILIKE`/`LIKE`).
     fn ilike(self) -> &'static str {
-        match self {
-            Dialect::Postgres => "ILIKE",
-            // SQLite's and MySQL's `LIKE` are case-insensitive under their default
-            // collations, so neither needs a dedicated operator.
-            Dialect::Sqlite | Dialect::MySql => "LIKE",
-        }
+        self.ops().ilike()
     }
 
-    /// The character that introduces a bound-parameter placeholder: `$` on
-    /// PostgreSQL (`$1`), `?` on SQLite (`?1`) and MySQL (`?`). Numbered on
-    /// Postgres/SQLite, which is what lets [`shift_placeholders`] renumber a
-    /// subquery's parameters.
+    /// The character that introduces a bound-parameter placeholder (`$`/`?`).
+    /// [`shift_placeholders`] uses it to renumber a subquery's parameters.
     fn placeholder_marker(self) -> char {
-        match self {
-            Dialect::Postgres => '$',
-            Dialect::Sqlite | Dialect::MySql => '?',
-        }
+        self.ops().placeholder_marker()
     }
 
-    /// A bound-parameter placeholder for binding position `n` (1-based).
-    ///
-    /// **Numbered on every dialect, MySQL included.** MySQL ultimately binds a
-    /// bare positional `?`, but numbering it here (`?1`, `?2`) is what keeps the
-    /// compiler's one invariant intact: a `SELECT` with `HAVING` binds the HAVING
-    /// parameter before the WHERE one, so bind-order ≠ textual order, and a bare
-    /// `?` would then bind the values in the wrong slots. The number disambiguates
-    /// during compilation and `shift_placeholders` can renumber a subquery; the
-    /// numbered `?n` is converted to the bare positional `?` — reordering the
-    /// parameter vector by textual appearance — once, in the MySQL driver, by
-    /// [`positionalize`]. See ADR 0018.
+    /// A bound-parameter placeholder for binding position `n` (1-based). Numbered
+    /// on every dialect so a `HAVING`-before-`WHERE` bind order stays unambiguous
+    /// during compilation; MySQL's driver later positionalises `?n` → bare `?`
+    /// (see [`positionalize`], ADR 0018).
     fn placeholder(self, n: usize) -> String {
-        format!("{}{n}", self.placeholder_marker())
+        self.ops().placeholder(n)
     }
 
-    /// Whether this dialect binds a bare positional `?` (by order), rather than a
-    /// numbered placeholder. True only for MySQL; the executor (its driver) then
+    /// Whether this dialect binds a bare positional `?` (MySQL); its driver then
     /// runs [`positionalize`] on the compiled SQL before sending it.
     pub fn positional_unnumbered(self) -> bool {
-        matches!(self, Dialect::MySql)
+        self.ops().positional_unnumbered()
     }
 
     /// The SQL expression for "now", used to refresh `auto_now` columns on write.
     fn now(self) -> &'static str {
-        match self {
-            // `now()` is PostgreSQL's and MySQL's spelling alike.
-            Dialect::Postgres | Dialect::MySql => "now()",
-            Dialect::Sqlite => "CURRENT_TIMESTAMP",
-        }
+        self.ops().now()
     }
 
-    /// Whether this dialect's backend has `cap`. The single source of truth for
-    /// what a backend can do (ADR 0011); the core consults it before emitting a
-    /// feature not every engine has.
+    /// Whether this dialect's backend has `cap` (ADR 0011); the core consults it
+    /// before emitting a feature not every engine has.
     pub fn supports(self, cap: Capability) -> bool {
-        use Capability::*;
-        match self {
-            // PostgreSQL (and the PG-wire CockroachDB) has all of these.
-            Dialect::Postgres => true,
-            Dialect::Sqlite => match cap {
-                // SQLite ≥ 3.35 has RETURNING and SAVEPOINT, and its DDL is
-                // transactional.
-                Returning | Savepoints | DdlInTransaction => true,
-                // No `CONCURRENTLY`, no dedicated boolean, no `ILIKE` keyword
-                // (its `LIKE` is already case-insensitive for ASCII).
-                ConcurrentIndex | NativeBoolean | IlikeOperator => false,
-            },
-            Dialect::MySql => match cap {
-                // MySQL has SAVEPOINT, but no `RETURNING` (a write reads the row
-                // back via `last_insert_id`), most DDL auto-commits (no DDL in a
-                // transaction), there is no `CREATE INDEX CONCURRENTLY`, a boolean
-                // is `TINYINT(1)`, and there is no `ILIKE` keyword.
-                Savepoints => true,
-                Returning | DdlInTransaction | ConcurrentIndex | NativeBoolean | IlikeOperator => {
-                    false
-                }
-            },
-        }
+        self.ops().supports(cap)
     }
 }
 
