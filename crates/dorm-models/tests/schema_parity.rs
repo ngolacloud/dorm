@@ -20,39 +20,43 @@ fn normalize(sql: &str) -> String {
 }
 
 /// The hand-written schema for the four example models — the oracle.
+// Every identifier is quoted (E-A-3): the generator delegates to the dialect's
+// `quote_ident`, the same rule the query compiler uses, so a reserved table or
+// column name survives. For these lowercase names the quotes are semantically
+// inert — `"tenants"` is `tenants` — but the oracle freezes the exact text.
 const ORACLE_EXAMPLE_SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS tenants (
-    id          BIGSERIAL PRIMARY KEY,
-    slug        TEXT        NOT NULL UNIQUE,
-    name        TEXT        NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS \"tenants\" (
+    \"id\"          BIGSERIAL PRIMARY KEY,
+    \"slug\"        TEXT        NOT NULL UNIQUE,
+    \"name\"        TEXT        NOT NULL,
+    \"created_at\"  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS tenants_slug_idx ON tenants (slug);
+CREATE INDEX IF NOT EXISTS \"tenants_slug_idx\" ON \"tenants\" (\"slug\");
 
-CREATE TABLE IF NOT EXISTS plans (
-    id            BIGSERIAL PRIMARY KEY,
-    code          TEXT    NOT NULL UNIQUE,
-    name          TEXT    NOT NULL,
-    monthly_price NUMERIC NOT NULL
+CREATE TABLE IF NOT EXISTS \"plans\" (
+    \"id\"            BIGSERIAL PRIMARY KEY,
+    \"code\"          TEXT    NOT NULL UNIQUE,
+    \"name\"          TEXT    NOT NULL,
+    \"monthly_price\" NUMERIC NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS applications (
-    id         BIGSERIAL PRIMARY KEY,
-    tenant     BIGINT      NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
-    plan       BIGINT      NOT NULL REFERENCES plans (id)   ON DELETE RESTRICT,
-    name       TEXT        NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS \"applications\" (
+    \"id\"         BIGSERIAL PRIMARY KEY,
+    \"tenant\"     BIGINT      NOT NULL REFERENCES \"tenants\" (\"id\") ON DELETE CASCADE,
+    \"plan\"       BIGINT      NOT NULL REFERENCES \"plans\" (\"id\")   ON DELETE RESTRICT,
+    \"name\"       TEXT        NOT NULL,
+    \"created_at\" TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS applications_name_idx ON applications (name);
+CREATE INDEX IF NOT EXISTS \"applications_name_idx\" ON \"applications\" (\"name\");
 
-CREATE TABLE IF NOT EXISTS deployments (
-    id         BIGSERIAL PRIMARY KEY,
-    app        BIGINT      NOT NULL REFERENCES applications (id) ON DELETE CASCADE,
-    replicas   BIGINT      NOT NULL,
-    status     TEXT        NOT NULL,
-    config     JSONB       NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS \"deployments\" (
+    \"id\"         BIGSERIAL PRIMARY KEY,
+    \"app\"        BIGINT      NOT NULL REFERENCES \"applications\" (\"id\") ON DELETE CASCADE,
+    \"replicas\"   BIGINT      NOT NULL,
+    \"status\"     TEXT        NOT NULL,
+    \"config\"     JSONB       NOT NULL,
+    \"created_at\" TIMESTAMPTZ NOT NULL DEFAULT now(),
+    \"updated_at\" TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ";
 
@@ -92,12 +96,12 @@ fn a_generic_text_pk_composite_unique_and_check_all_generate() {
     assert_eq!(
         normalize(&generated),
         normalize(
-            "CREATE TABLE IF NOT EXISTS products (
-                sku      TEXT    PRIMARY KEY,
-                category TEXT    NOT NULL,
-                name     TEXT    NOT NULL,
-                price    NUMERIC NOT NULL,
-                UNIQUE (category, name),
+            "CREATE TABLE IF NOT EXISTS \"products\" (
+                \"sku\"      TEXT    PRIMARY KEY,
+                \"category\" TEXT    NOT NULL,
+                \"name\"     TEXT    NOT NULL,
+                \"price\"    NUMERIC NOT NULL,
+                UNIQUE (\"category\", \"name\"),
                 CHECK (price >= 0)
             )"
         ),

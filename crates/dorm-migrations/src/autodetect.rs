@@ -945,7 +945,7 @@ mod tests {
         let stmts = autodetect(&Snapshot::empty(), &[&NOTE_V1_META], Backend::Postgres).unwrap();
         assert_eq!(stmts.len(), 1, "{stmts:?}");
         assert!(
-            stmts[0].starts_with("CREATE TABLE IF NOT EXISTS notes"),
+            stmts[0].starts_with("CREATE TABLE IF NOT EXISTS \"notes\""),
             "{stmts:?}"
         );
     }
@@ -958,11 +958,11 @@ mod tests {
         assert_eq!(stmts.len(), 2, "{stmts:?}");
         assert_eq!(
             stmts[0],
-            "ALTER TABLE notes ADD COLUMN IF NOT EXISTS body TEXT NOT NULL"
+            "ALTER TABLE \"notes\" ADD COLUMN IF NOT EXISTS \"body\" TEXT NOT NULL"
         );
         assert_eq!(
             stmts[1],
-            "CREATE INDEX IF NOT EXISTS notes_title_idx ON notes (title)"
+            "CREATE INDEX IF NOT EXISTS \"notes_title_idx\" ON \"notes\" (\"title\")"
         );
     }
 
@@ -985,9 +985,9 @@ mod tests {
         assert_eq!(
             stmts,
             vec![
-                "DROP INDEX IF EXISTS notes_title_idx".to_string(),
-                "ALTER TABLE notes DROP COLUMN IF EXISTS body".to_string(),
-                "DROP TABLE IF EXISTS tags".to_string(),
+                "DROP INDEX IF EXISTS \"notes_title_idx\"".to_string(),
+                "ALTER TABLE \"notes\" DROP COLUMN IF EXISTS \"body\"".to_string(),
+                "DROP TABLE IF EXISTS \"tags\"".to_string(),
             ],
             "{stmts:?}"
         );
@@ -998,7 +998,7 @@ mod tests {
         let prev = Snapshot::from_models(&[&NOTE_V1_META]);
         let stmts = autodetect(&prev, &[&NOTE_V2_META], Backend::Sqlite).unwrap();
         assert_eq!(
-            stmts[0], "ALTER TABLE notes ADD COLUMN body TEXT NOT NULL",
+            stmts[0], "ALTER TABLE \"notes\" ADD COLUMN \"body\" TEXT NOT NULL",
             "SQLite ADD COLUMN takes no IF NOT EXISTS: {stmts:?}"
         );
     }
@@ -1039,7 +1039,7 @@ mod tests {
         let stmts = autodetect(&prev, &[&RETYPED_META], Backend::Sqlite).unwrap();
         // Create the new shape, copy the shared columns, drop, rename.
         assert!(
-            stmts[0].starts_with("CREATE TABLE IF NOT EXISTS notes__dorm_new"),
+            stmts[0].starts_with("CREATE TABLE IF NOT EXISTS \"notes__dorm_new"),
             "{stmts:?}"
         );
         assert_eq!(
@@ -1233,7 +1233,7 @@ mod tests {
         let v2 = autodetect(&prev, &[&NOTE_V2_NULLABLE_META], Backend::Sqlite).unwrap();
         assert_eq!(
             v2,
-            vec!["ALTER TABLE notes ADD COLUMN body TEXT".to_string()]
+            vec!["ALTER TABLE \"notes\" ADD COLUMN \"body\" TEXT".to_string()]
         );
         for s in &v2 {
             conn.execute_batch(s)
@@ -1351,7 +1351,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             stmts,
-            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"],
+            vec!["ALTER TABLE \"notes\" RENAME COLUMN \"title\" TO \"headline\""],
             "a pure rename is exactly one RENAME COLUMN, no drop, no add"
         );
     }
@@ -1369,7 +1369,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             stmts,
-            vec!["ALTER TABLE notes RENAME COLUMN title TO headline"]
+            vec!["ALTER TABLE \"notes\" RENAME COLUMN \"title\" TO \"headline\""]
         );
     }
 
@@ -1413,7 +1413,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            stmts[0].contains("RENAME COLUMN title TO headline"),
+            stmts[0].contains("RENAME COLUMN \"title\" TO \"headline\""),
             "{stmts:?}"
         );
         assert!(
