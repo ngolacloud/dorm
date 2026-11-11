@@ -1435,7 +1435,6 @@ dependencies = [
  "dorm-migrations",
  "dorm-schema",
  "dorm-studio",
- "rand_core 0.6.4",
  "rpassword",
  "serde_json",
  "tokio",
