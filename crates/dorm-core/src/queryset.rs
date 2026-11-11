@@ -511,6 +511,39 @@ impl<T: Model> QuerySet<T> {
         Ok(out)
     }
 
+    /// Streams every matching row with **~constant memory** (C-F1), instead of
+    /// materialising the whole result set like [`all`](Self::all).
+    ///
+    /// Returns a `Stream` of `Result<T>`: consume it with `tokio_stream::StreamExt`
+    /// (`while let Some(row) = s.next().await { … }`) or compose it with `.map()`,
+    /// `.filter()`, etc. Backpressure from a bounded channel means a 10-million-row
+    /// table is read a window at a time, never allocated whole (see
+    /// [`db::stream_rows`]). PostgreSQL only; a non-PG backend is refused.
+    ///
+    /// First cut: whole base-model rows only — `values()` projections and
+    /// `select_related()` joins are rejected (the per-row join-offset decoding of
+    /// [`all`](Self::all) is not yet wired into the stream).
+    pub async fn stream(self) -> Result<impl tokio_stream::Stream<Item = Result<T>>> {
+        if !self.plan.values.is_empty() {
+            return Err(Error::Config(
+                "stream() yields whole model rows; a values() projection is not supported — use rows()".into(),
+            ));
+        }
+        if !self.plan.select_related.is_empty() {
+            return Err(Error::Config(
+                "stream() does not yet support select_related(); use all() for joined rows".into(),
+            ));
+        }
+        let sql = scope::compile_select(&self.plan)?;
+        let rows = db::stream_rows(&sql.text, sql.params).await?;
+        // Decode each row to `T` as it arrives — the mapping is lazy, so a row is
+        // built only when the consumer pulls it, preserving the constant-memory
+        // profile end to end.
+        Ok(tokio_stream::StreamExt::map(rows, |row| {
+            row.and_then(|row| T::from_row(&row, 0))
+        }))
+    }
+
     /// The first matching row, respecting the ordering.
     pub async fn first(self) -> Result<Option<T>> {
         let qs = self.limit(1);

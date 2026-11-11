@@ -1541,6 +1541,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1643,6 +1644,7 @@ dependencies = [
  "rust_decimal",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]

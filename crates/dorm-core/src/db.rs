@@ -1555,6 +1555,70 @@ pub async fn query_read(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec
     query_routed(sql, params, Route::ReadReplica).await
 }
 
+/// How many rows the streaming channel buffers. A small, bounded window: the
+/// producer task blocks on `send` when the consumer lags, so the result set is
+/// never materialised — memory is O(this), not O(rows) (C-F1).
+const STREAM_BUFFER: usize = 128;
+
+/// Streams the rows of a read `SELECT` with ~constant memory (C-F1).
+///
+/// The materialising terminals ([`fetch`]/[`query`]) collect the whole result set
+/// into a `Vec` — a table-sized read is a table-sized allocation (OOM on large
+/// tables). This instead drives `tokio_postgres`'s `query_raw` → `RowStream` and
+/// forwards each row over a BOUNDED channel, so backpressure keeps only a small
+/// window resident. PostgreSQL only: SQLite/MySQL have no server-side row stream
+/// here, so a non-PG backend is refused rather than silently buffering.
+///
+/// The connection is acquired in the CALLER's session context (`with_session` and
+/// the read route apply) and then MOVED into a forwarding task that owns it — and
+/// thus the pool — for the stream's lifetime. Streaming reads a committed snapshot
+/// over its own connection; it is a read-path operation, not tied to an open
+/// `atomic` transaction.
+pub async fn stream_rows(
+    sql: &str,
+    params: Vec<crate::value::Value>,
+) -> Result<tokio_stream::wrappers::ReceiverStream<Result<crate::row::Row>>> {
+    if backend()? != Backend::Postgres {
+        return Err(Error::Db(
+            "stream() is only supported on PostgreSQL (no server-side row stream on this backend); \
+             use all()/rows() for other backends"
+                .into(),
+        ));
+    }
+    // Acquire HERE, in the caller's session/task-local context, then move the
+    // connection into the task (task-locals do not cross `spawn`).
+    let conn = acquire(Route::ReadReplica).await?;
+    let sql = sql.to_string();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<crate::row::Row>>(STREAM_BUFFER);
+
+    tokio::spawn(async move {
+        use tokio_stream::StreamExt as _;
+        // `params` (owned by the task) backs the borrowed `ToSql` refs; both outlive
+        // the `query_raw` await that consumes them when binding the portal.
+        let borrowed: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+        let row_stream = match conn.query_raw(sql.as_str(), borrowed).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(from_pg(e))).await;
+                return;
+            }
+        };
+        tokio::pin!(row_stream);
+        while let Some(item) = row_stream.next().await {
+            let terminal = item.is_err();
+            let msg = item.map(crate::row::Row::Pg).map_err(from_pg);
+            // Stop on a dropped consumer, or after forwarding a terminal error.
+            if tx.send(msg).await.is_err() || terminal {
+                break;
+            }
+        }
+        // `conn` drops here, returning to the pool.
+    });
+
+    Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 async fn query_routed(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
