@@ -537,6 +537,7 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
     let name = match v.as_str() {
         "int" | "integer" | "i32" => "I32",
         "bigint" | "i64" => "I64",
+        "double precision" | "double" | "float8" | "f64" => "F64",
         "text" | "string" => "Text",
         "bool" | "boolean" => "Bool",
         "decimal" | "numeric" => "Decimal",
@@ -552,8 +553,8 @@ fn column_type_ident(s: &LitStr) -> Result<Ident> {
             return Err(Error::new(
                 s.span(),
                 format!(
-                    "unknown column_type `{other}`; known: int, bigint, text, bool, decimal, \
-                     timestamp, uuid, json, inet, cidr, macaddr, text[], bigint[]"
+                    "unknown column_type `{other}`; known: int, bigint, double precision, text, \
+                     bool, decimal, timestamp, uuid, json, inet, cidr, macaddr, text[], bigint[]"
                 ),
             ))
         }
@@ -609,6 +610,8 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
     let mapped = match name.as_str() {
         "i32" => "I32",
         "i64" => "I64",
+        // `DOUBLE PRECISION`. For money use `Decimal`: a float loses cents (ADR 0016).
+        "f64" => "F64",
         "String" => "Text",
         "bool" => "Bool",
         "Decimal" => "Decimal",
@@ -625,8 +628,8 @@ fn infer_field_type(ty: &Type) -> Result<Ident> {
             return Err(Error::new_spanned(
                 ty,
                 format!(
-                    "`{other}` is not a column type the ORM knows. Supported: i32, i64, String, \
-                     bool, rust_decimal::Decimal, chrono::DateTime<Utc>, uuid::Uuid, \
+                    "`{other}` is not a column type the ORM knows. Supported: i32, i64, f64, \
+                     String, bool, rust_decimal::Decimal, chrono::DateTime<Utc>, uuid::Uuid, \
                      serde_json::Value, Option<T> of any of those, and ForeignKey<T>. \
                      State it explicitly with `#[field(column_type = \"...\")]` if the type is \
                      an alias."

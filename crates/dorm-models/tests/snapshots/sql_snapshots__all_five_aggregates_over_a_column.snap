@@ -14,7 +14,7 @@ SELECT SUM("deployments"."replicas") AS "value" FROM "deployments"
 
 -- no parameters
 -- result columns:
---   value : I64
+--   value : Decimal
 
 ### Avg
 SELECT AVG("deployments"."replicas") AS "value" FROM "deployments"

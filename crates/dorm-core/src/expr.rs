@@ -282,15 +282,36 @@ impl AggKind {
         })
     }
 
-    /// The field type the result comes back as.
+    /// The field type the result decodes as, given the SOURCE column's type.
     ///
-    /// `COUNT` is always `BIGINT`; `AVG` over any numeric is `NUMERIC`; the rest
-    /// keep the column's own type, which the compiler fills in.
-    pub fn result_type(self) -> Option<crate::value::FieldType> {
+    /// PostgreSQL **promotes** aggregate results, so the decoder must expect the
+    /// promoted type, not the column's own — otherwise `read_column` fails at
+    /// runtime (A-F1). The rules this mirrors:
+    ///
+    /// - `COUNT` → `BIGINT` always (the `column` is irrelevant);
+    /// - `MIN`/`MAX` → the column's own type (no promotion);
+    /// - `SUM`: `int → bigint`, `bigint → numeric`, `numeric → numeric`,
+    ///   `real`/`double → double` (DORM models both floats as [`F64`]);
+    /// - `AVG`: `int`/`bigint`/`numeric → numeric`, `real`/`double → double`.
+    ///
+    /// A non-numeric column under `SUM`/`AVG` is passed through unchanged — such a
+    /// query is a PostgreSQL error the server rejects, not something to decode.
+    ///
+    /// [`F64`]: crate::value::FieldType::F64
+    pub fn result_type_over(self, column: crate::value::FieldType) -> crate::value::FieldType {
+        use crate::value::FieldType;
         match self {
-            AggKind::Count => Some(crate::value::FieldType::I64),
-            AggKind::Avg => Some(crate::value::FieldType::Decimal),
-            _ => None,
+            AggKind::Count => FieldType::I64,
+            AggKind::Min | AggKind::Max => column,
+            AggKind::Sum => match column {
+                FieldType::I32 => FieldType::I64,
+                FieldType::I64 => FieldType::Decimal,
+                other => other,
+            },
+            AggKind::Avg => match column {
+                FieldType::I32 | FieldType::I64 => FieldType::Decimal,
+                other => other,
+            },
         }
     }
 }
@@ -394,11 +415,51 @@ mod tests {
     }
 
     #[test]
-    fn count_always_comes_back_as_a_bigint_and_min_keeps_the_column_type() {
+    fn aggregate_result_types_follow_postgres_promotion() {
+        use crate::value::FieldType;
+        // COUNT is always BIGINT, whatever the column.
         assert_eq!(
-            AggKind::Count.result_type(),
-            Some(crate::value::FieldType::I64)
+            AggKind::Count.result_type_over(FieldType::I32),
+            FieldType::I64
         );
-        assert_eq!(AggKind::Min.result_type(), None);
+        // MIN/MAX keep the column's own type.
+        assert_eq!(
+            AggKind::Min.result_type_over(FieldType::I32),
+            FieldType::I32
+        );
+        assert_eq!(
+            AggKind::Max.result_type_over(FieldType::Text),
+            FieldType::Text
+        );
+        // SUM promotes: int → bigint, bigint → numeric, numeric/float unchanged.
+        assert_eq!(
+            AggKind::Sum.result_type_over(FieldType::I32),
+            FieldType::I64
+        );
+        assert_eq!(
+            AggKind::Sum.result_type_over(FieldType::I64),
+            FieldType::Decimal
+        );
+        assert_eq!(
+            AggKind::Sum.result_type_over(FieldType::Decimal),
+            FieldType::Decimal
+        );
+        assert_eq!(
+            AggKind::Sum.result_type_over(FieldType::F64),
+            FieldType::F64
+        );
+        // AVG: int/bigint/numeric → numeric; float → double.
+        assert_eq!(
+            AggKind::Avg.result_type_over(FieldType::I32),
+            FieldType::Decimal
+        );
+        assert_eq!(
+            AggKind::Avg.result_type_over(FieldType::I64),
+            FieldType::Decimal
+        );
+        assert_eq!(
+            AggKind::Avg.result_type_over(FieldType::F64),
+            FieldType::F64
+        );
     }
 }

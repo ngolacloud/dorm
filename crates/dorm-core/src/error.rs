@@ -62,6 +62,14 @@ pub enum Error {
     #[error("connection pool: {0}")]
     Pool(String),
 
+    /// The pool is **saturated**: every connection is checked out and none came
+    /// free within `wait_timeout`. This is backpressure, not a transient fault —
+    /// `acquire` must NOT retry it (retrying only multiplies the wait and amplifies
+    /// contention, B-1), so it is a variant distinct from [`Pool`](Self::Pool),
+    /// which covers a connect/backend failure that IS worth a bounded retry.
+    #[error("connection pool exhausted: {0}")]
+    PoolExhausted(String),
+
     /// Missing or unusable configuration, e.g. no DSN in the environment.
     #[error("{0}")]
     Config(String),
