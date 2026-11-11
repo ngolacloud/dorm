@@ -378,7 +378,7 @@ impl LocalEmbedder {
     /// Load a named model. Known aliases map onto `fastembed`'s model set; an
     /// unknown name is an explicit error listing what is supported.
     pub fn load(name: &str) -> Result<Self> {
-        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
         let (model, model_id) = match name {
             "all-minilm" | "all-MiniLM-L6-v2" | "AllMiniLML6V2" => {
                 (EmbeddingModel::AllMiniLML6V2, "all-MiniLM-L6-v2")
@@ -392,8 +392,9 @@ impl LocalEmbedder {
                 )))
             }
         };
-        let te = TextEmbedding::try_new(InitOptions::new(model).with_show_download_progress(false))
-            .map_err(|e| Error::Config(format!("loading local embedder `{model_id}`: {e}")))?;
+        let mut te =
+            TextEmbedding::try_new(TextInitOptions::new(model).with_show_download_progress(false))
+                .map_err(|e| Error::Config(format!("loading local embedder `{model_id}`: {e}")))?;
         // Probe the dimension with one embedding.
         let probe = te
             .embed(vec!["dimension probe"], None)
@@ -428,7 +429,7 @@ impl Embedder for LocalEmbedder {
             // ONNX inference is synchronous and CPU-bound: run it on a blocking
             // thread so it does not stall the async executor.
             tokio::task::spawn_blocking(move || {
-                let guard = model
+                let mut guard = model
                     .lock()
                     .map_err(|_| Error::Db("embedder mutex poisoned".into()))?;
                 guard
