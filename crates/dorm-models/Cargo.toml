@@ -28,6 +28,8 @@ insta = { workspace = true }
 cidr = { workspace = true }
 eui48 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+# The streaming live test consumes `QuerySet::stream()` with `StreamExt::next`.
+tokio-stream = "0.1"
 # The prefetch live test installs a capturing subscriber to count statements
 # (the N+1 witness). Test-only — the library never installs a subscriber.
 tracing = { workspace = true }

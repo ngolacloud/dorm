@@ -44,6 +44,10 @@ rust_decimal = { workspace = true }
 cidr = { workspace = true }
 eui48 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# Streaming de resultados (C-F1): `ReceiverStream`/`StreamExt` sobre um canal, para
+# `QuerySet::stream()` devolver um `impl Stream` com memória ~constante. JÁ está na
+# árvore (transitivo via tokio-postgres) — promover a dep directa não adiciona crate.
+tokio-stream = "0.1"
 # The `with-*` features are not cosmetic: without them `Decimal`, `DateTime`,
 # `Uuid`, `IpCidr`, `MacAddress` and `Value` have no wire representation and every
 # such column would have to travel as text.
