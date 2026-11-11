@@ -123,8 +123,9 @@ pub fn create_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec
             format!(
                 "DO $$ BEGIN \
                  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{name}') THEN \
-                 CREATE TYPE {name} AS ENUM ({labels}); \
-                 END IF; END $$"
+                 CREATE TYPE {} AS ENUM ({labels}); \
+                 END IF; END $$",
+                q(backend, name)
             )
         })
         .collect()
@@ -147,7 +148,8 @@ pub fn alter_enum_types(models: &[&'static ModelMeta], backend: Backend) -> Vec<
         for v in variants {
             let label = v.replace('\'', "''");
             out.push(format!(
-                "ALTER TYPE {name} ADD VALUE IF NOT EXISTS '{label}'"
+                "ALTER TYPE {} ADD VALUE IF NOT EXISTS '{label}'",
+                q(backend, name)
             ));
         }
     }
@@ -580,7 +582,13 @@ fn column_type(f: &FieldMeta, backend: Backend) -> Result<String> {
 /// mapping; SQLite collapses onto its storage classes (ADR 0002).
 fn sql_type(ty: FieldType, backend: Backend) -> String {
     match backend {
-        Backend::Postgres => ty.sql_type().to_string(),
+        // A native enum column's type is the enum type's name, which is itself an
+        // identifier — quote it so a reserved type name resolves (E-A-3), matching
+        // the quoted `CREATE TYPE`. Every other PostgreSQL type is a keyword.
+        Backend::Postgres => match ty {
+            FieldType::Enum(name) => q(backend, name),
+            _ => ty.sql_type().to_string(),
+        },
         Backend::Sqlite => match ty {
             FieldType::I32 | FieldType::I64 | FieldType::Bool => "INTEGER",
             FieldType::Text | FieldType::Timestamp | FieldType::Uuid | FieldType::Json => "TEXT",

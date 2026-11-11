@@ -99,7 +99,7 @@ fn a_versioned_migration_creates_then_grows_a_native_enum() {
         assert!(
             m1.statements
                 .iter()
-                .any(|s| s.contains("CREATE TYPE mig_status AS ENUM")),
+                .any(|s| s.contains("CREATE TYPE \"mig_status\" AS ENUM")),
             "m1 creates the type: {:?}",
             m1.statements
         );

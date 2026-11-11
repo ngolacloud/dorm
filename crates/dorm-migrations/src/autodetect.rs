@@ -322,7 +322,8 @@ fn enum_type_ddl(previous: &Snapshot, current: &Snapshot, backend: Backend) -> V
                      IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN \
                      CREATE TYPE {} AS ENUM ({labels}); \
                      END IF; END $$",
-                    e.name, e.name
+                    e.name,
+                    ddl::qp(&e.name)
                 ));
             }
             Some(old) => {
@@ -331,7 +332,7 @@ fn enum_type_ddl(previous: &Snapshot, current: &Snapshot, backend: Backend) -> V
                         let label = v.replace('\'', "''");
                         out.push(format!(
                             "ALTER TYPE {} ADD VALUE IF NOT EXISTS '{label}'",
-                            e.name
+                            ddl::qp(&e.name)
                         ));
                     }
                 }
@@ -440,7 +441,7 @@ pub fn down_for(
             .enum_types
             .iter()
             .filter(|e| !prev_enums.contains_key(e.name.as_str()))
-            .map(|e| format!("DROP TYPE IF EXISTS {}", e.name))
+            .map(|e| format!("DROP TYPE IF EXISTS {}", ddl::qp(&e.name)))
             .collect()
     } else {
         Vec::new()
@@ -1487,7 +1488,7 @@ mod tests {
         let create_type = stmts
             .iter()
             .position(|s| {
-                s.contains("CREATE TYPE ticket_status AS ENUM ('open', 'closed', 'archived')")
+                s.contains("CREATE TYPE \"ticket_status\" AS ENUM ('open', 'closed', 'archived')")
             })
             .expect("a CREATE TYPE is emitted");
         let create_table = stmts
@@ -1508,7 +1509,7 @@ mod tests {
         assert!(
             stmts
                 .iter()
-                .any(|s| s == "ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'archived'"),
+                .any(|s| s == "ALTER TYPE \"ticket_status\" ADD VALUE IF NOT EXISTS 'archived'"),
             "the added label is emitted: {stmts:?}"
         );
         assert!(
@@ -1528,7 +1529,7 @@ mod tests {
             .position(|s| s.contains("DROP TABLE") && s.contains("tickets"));
         let drop_type = down
             .iter()
-            .position(|s| s == "DROP TYPE IF EXISTS ticket_status");
+            .position(|s| s == "DROP TYPE IF EXISTS \"ticket_status\"");
         assert!(
             drop_table.is_some() && drop_type.is_some(),
             "both drops present: {down:?}"
