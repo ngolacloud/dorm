@@ -166,6 +166,10 @@ dorm> Tenant apps__name__icontains=api      # a reverse relation, by related_nam
 and the test suite — and it is exactly what CI runs. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
+By participating you agree to our [Code of Conduct](CODE_OF_CONDUCT.md). If you
+find a security vulnerability (SQL injection, tenant-isolation bypass, credential
+or data leakage), please report it privately — see [SECURITY.md](SECURITY.md).
+
 ## License
 
 Open-sourced per ADR 0073 and **dual-licensed** under either of
